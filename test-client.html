@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Analytics Platform Test</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f5f5f5;
+      }
+      .container {
+        background: white;
+        padding: 30px;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      h1 {
+        color: #333;
+        border-bottom: 2px solid #007bff;
+        padding-bottom: 10px;
+      }
+      .section {
+        margin: 30px 0;
+        padding: 20px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        background: #fafafa;
+      }
+      button {
+        background-color: #007bff;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 4px;
+        cursor: pointer;
+        margin: 5px;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+      .output {
+        background: #f8f9fa;
+        border: 1px solid #e9ecef;
+        border-radius: 4px;
+        padding: 15px;
+        margin: 10px 0;
+        white-space: pre-wrap;
+        font-family: monospace;
+        max-height: 200px;
+        overflow-y: auto;
+      }
+      .success {
+        color: #28a745;
+      }
+      .error {
+        color: #dc3545;
+      }
+      input[type="text"],
+      textarea {
+        width: 100%;
+        padding: 8px;
+        margin: 5px 0;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        box-sizing: border-box;
+      }
+      label {
+        font-weight: bold;
+        display: block;
+        margin-top: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Analytics Platform Test Client</h1>
+
+      <div class="section">
+        <h3>Configuration</h3>
+        <label for="apiUrl">API Base URL:</label>
+        <input
+          type="text"
+          id="apiUrl"
+          value="http://localhost:8080"
+          placeholder="http://localhost:8080"
+        />
+      </div>
+
+      <div class="section">
+        <h3>Health Check</h3>
+        <button onclick="checkHealth()">Check Health</button>
+        <div id="healthOutput" class="output"></div>
+      </div>
+
+      <div class="section">
+        <h3>Single Event Test</h3>
+        <label for="eventType">Event Type:</label>
+        <input
+          type="text"
+          id="eventType"
+          value="page_view"
+          placeholder="page_view"
+        />
+
+        <label for="userId">User ID:</label>
+        <input
+          type="text"
+          id="userId"
+          value="test_user_123"
+          placeholder="user_123"
+        />
+
+        <label for="sessionId">Session ID:</label>
+        <input
+          type="text"
+          id="sessionId"
+          value="test_session_456"
+          placeholder="session_456"
+        />
+
+        <label for="customProperties">Custom Properties (JSON):</label>
+        <textarea
+          id="customProperties"
+          rows="3"
+          placeholder='{"page": "/test", "title": "Test Page"}'
+        >
+{
+  "page": "/test-page",
+  "title": "Test Page",
+  "referrer": "https://example.com"
+}</textarea
+        >
+
+        <br /><br />
+        <button onclick="sendSingleEvent()">Send Single Event</button>
+        <div id="singleEventOutput" class="output"></div>
+      </div>
+
+      <div class="section">
+        <h3>Batch Events Test</h3>
+        <p>This will send multiple events at once:</p>
+        <button onclick="sendBatchEvents()">Send Batch Events</button>
+        <div id="batchEventOutput" class="output"></div>
+      </div>
+
+      <div class="section">
+        <h3>Auto Event Generator</h3>
+        <p>Automatically generate and send random events:</p>
+        <button onclick="startAutoGeneration()" id="autoBtn">
+          Start Auto Generation
+        </button>
+        <button onclick="stopAutoGeneration()">Stop Auto Generation</button>
+        <div id="autoOutput" class="output"></div>
+      </div>
+    </div>
+
+    <script>
+      let autoInterval = null;
+      let autoRunning = false;
+
+      function getApiUrl() {
+        return document.getElementById("apiUrl").value.trim();
+      }
+
+      function log(elementId, message, isError = false) {
+        const element = document.getElementById(elementId);
+        const timestamp = new Date().toLocaleTimeString();
+        const className = isError ? "error" : "success";
+        element.innerHTML += `<span class="${className}">[${timestamp}] ${message}</span>\n`;
+        element.scrollTop = element.scrollHeight;
+      }
+
+      async function checkHealth() {
+        try {
+          const response = await fetch(`${getApiUrl()}/health`);
+          const data = await response.json();
+          log(
+            "healthOutput",
+            `Health check successful: ${JSON.stringify(data, null, 2)}`
+          );
+        } catch (error) {
+          log("healthOutput", `Health check failed: ${error.message}`, true);
+        }
+      }
+
+      async function sendSingleEvent() {
+        try {
+          const eventType = document.getElementById("eventType").value;
+          const userId = document.getElementById("userId").value;
+          const sessionId = document.getElementById("sessionId").value;
+          const customPropsText =
+            document.getElementById("customProperties").value;
+
+          let customProps = {};
+          if (customPropsText.trim()) {
+            customProps = JSON.parse(customPropsText);
+          }
+
+          const event = {
+            event_type: eventType,
+            user_id: userId || undefined,
+            session_id: sessionId || undefined,
+            properties: customProps,
+          };
+
+          const response = await fetch(`${getApiUrl()}/api/v1/events`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(event),
+          });
+
+          const data = await response.json();
+
+          if (response.ok) {
+            log(
+              "singleEventOutput",
+              `Event sent successfully: ${JSON.stringify(data, null, 2)}`
+            );
+          } else {
+            log(
+              "singleEventOutput",
+              `Error sending event: ${JSON.stringify(data, null, 2)}`,
+              true
+            );
+          }
+        } catch (error) {
+          log("singleEventOutput", `Error: ${error.message}`, true);
+        }
+      }
+
+      async function sendBatchEvents() {
+        try {
+          const events = [
+            {
+              event_type: "page_view",
+              user_id: "batch_user_1",
+              session_id: "batch_session_1",
+              properties: {
+                page: "/home",
+                title: "Home Page",
+              },
+            },
+            {
+              event_type: "click",
+              user_id: "batch_user_1",
+              session_id: "batch_session_1",
+              properties: {
+                element: "button",
+                text: "Sign Up",
+                position: "header",
+              },
+            },
+            {
+              event_type: "form_submit",
+              user_id: "batch_user_2",
+              session_id: "batch_session_2",
+              properties: {
+                form: "contact",
+                fields: ["name", "email", "message"],
+              },
+            },
+          ];
+
+          const response = await fetch(`${getApiUrl()}/api/v1/events/batch`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(events),
+          });
+
+          const data = await response.json();
+
+          if (response.ok) {
+            log(
+              "batchEventOutput",
+              `Batch events sent: ${JSON.stringify(data, null, 2)}`
+            );
+          } else {
+            log(
+              "batchEventOutput",
+              `Error sending batch: ${JSON.stringify(data, null, 2)}`,
+              true
+            );
+          }
+        } catch (error) {
+          log("batchEventOutput", `Error: ${error.message}`, true);
+        }
+      }
+
+      function generateRandomEvent() {
+        const eventTypes = [
+          "page_view",
+          "click",
+          "form_submit",
+          "scroll",
+          "hover",
+          "video_play",
+          "download",
+        ];
+        const pages = [
+          "/home",
+          "/about",
+          "/products",
+          "/contact",
+          "/blog",
+          "/pricing",
+        ];
+        const users = ["user_1", "user_2", "user_3", "user_4", "user_5"];
+
+        return {
+          event_type: eventTypes[Math.floor(Math.random() * eventTypes.length)],
+          user_id: users[Math.floor(Math.random() * users.length)],
+          session_id: `session_${Math.floor(Math.random() * 100)}`,
+          properties: {
+            page: pages[Math.floor(Math.random() * pages.length)],
+            timestamp: new Date().toISOString(),
+            random_value: Math.floor(Math.random() * 1000),
+          },
+        };
+      }
+
+      async function sendRandomEvent() {
+        try {
+          const event = generateRandomEvent();
+          const response = await fetch(`${getApiUrl()}/api/v1/events`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(event),
+          });
+
+          const data = await response.json();
+
+          if (response.ok) {
+            log(
+              "autoOutput",
+              `Auto event sent: ${event.event_type} for ${event.user_id}`
+            );
+          } else {
+            log(
+              "autoOutput",
+              `Auto event failed: ${JSON.stringify(data)}`,
+              true
+            );
+          }
+        } catch (error) {
+          log("autoOutput", `Auto event error: ${error.message}`, true);
+        }
+      }
+
+      function startAutoGeneration() {
+        if (autoRunning) return;
+
+        autoRunning = true;
+        document.getElementById("autoBtn").textContent = "Running...";
+        document.getElementById("autoBtn").disabled = true;
+
+        log("autoOutput", "Starting auto event generation...");
+
+        autoInterval = setInterval(() => {
+          sendRandomEvent();
+        }, 2000); // Send event every 2 seconds
+      }
+
+      function stopAutoGeneration() {
+        if (!autoRunning) return;
+
+        autoRunning = false;
+        document.getElementById("autoBtn").textContent =
+          "Start Auto Generation";
+        document.getElementById("autoBtn").disabled = false;
+
+        if (autoInterval) {
+          clearInterval(autoInterval);
+          autoInterval = null;
+        }
+
+        log("autoOutput", "Stopped auto event generation.");
+      }
+
+      // Initial health check
+      window.onload = function () {
+        checkHealth();
+      };
+    </script>
+  </body>
+</html>
