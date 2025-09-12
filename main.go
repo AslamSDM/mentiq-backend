@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/gorilla/mux"
-	"github.com/rs/cors"
+	"github.com/joho/godotenv"
 )
 
 type Event struct {
@@ -34,11 +36,30 @@ type AnalyticsService struct {
 }
 
 func NewAnalyticsService(bucketName string) (*AnalyticsService, error) {
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(os.Getenv("AWS_REGION")),
-	})
+	// Configuration for Cloudflare R2
+	config := &aws.Config{
+		Region:           aws.String("auto"), // R2 uses "auto" as region
+		Endpoint:         aws.String("https://820b251b57951011c6bcc9add6ca5ca4.r2.cloudflarestorage.com"),
+		S3ForcePathStyle: aws.Bool(true), // Required for R2
+	}
+
+	// Set credentials from environment variables
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+
+	if accessKey != "" && secretKey != "" {
+		config.Credentials = credentials.NewStaticCredentials(
+			accessKey,
+			secretKey,
+			"", // token (empty for R2)
+		)
+	} else {
+		log.Printf("Warning: AWS credentials not found in environment variables")
+	}
+
+	sess, err := session.NewSession(config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create AWS session: %v", err)
+		return nil, fmt.Errorf("failed to create R2 session: %v", err)
 	}
 
 	return &AnalyticsService{
@@ -76,16 +97,11 @@ func (as *AnalyticsService) storeEventToS3(event Event) error {
 	return nil
 }
 
-func (as *AnalyticsService) ingestEventHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func (as *AnalyticsService) ingestEventHandler(c *gin.Context) {
 	var event Event
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+	if err := c.ShouldBindJSON(&event); err != nil {
 		log.Printf("Failed to decode event: %v", err)
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
 		return
 	}
 
@@ -100,43 +116,35 @@ func (as *AnalyticsService) ingestEventHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// Extract client info
-	event.UserAgent = r.Header.Get("User-Agent")
-	event.IPAddress = getClientIP(r)
+	event.UserAgent = c.GetHeader("User-Agent")
+	event.IPAddress = getClientIPFromGin(c)
 
 	// Validate required fields
 	if event.EventType == "" {
-		http.Error(w, "event_type is required", http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "event_type is required"})
 		return
 	}
 
 	// Store event to S3
 	if err := as.storeEventToS3(event); err != nil {
 		log.Printf("Failed to store event: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 		return
 	}
 
 	// Return success response
-	response := map[string]interface{}{
+	c.JSON(http.StatusOK, gin.H{
 		"status":   "success",
 		"event_id": event.EventID,
 		"message":  "Event ingested successfully",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	})
 }
 
-func (as *AnalyticsService) batchIngestHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func (as *AnalyticsService) batchIngestHandler(c *gin.Context) {
 	var events []Event
-	if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+	if err := c.ShouldBindJSON(&events); err != nil {
 		log.Printf("Failed to decode events: %v", err)
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
 		return
 	}
 
@@ -155,8 +163,8 @@ func (as *AnalyticsService) batchIngestHandler(w http.ResponseWriter, r *http.Re
 		}
 
 		// Extract client info
-		event.UserAgent = r.Header.Get("User-Agent")
-		event.IPAddress = getClientIP(r)
+		event.UserAgent = c.GetHeader("User-Agent")
+		event.IPAddress = getClientIPFromGin(c)
 
 		// Validate required fields
 		if event.EventType == "" {
@@ -175,7 +183,7 @@ func (as *AnalyticsService) batchIngestHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// Return response
-	response := map[string]interface{}{
+	response := gin.H{
 		"status":        "completed",
 		"total_events":  len(events),
 		"success_count": successCount,
@@ -186,19 +194,15 @@ func (as *AnalyticsService) batchIngestHandler(w http.ResponseWriter, r *http.Re
 		response["errors"] = errors
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	c.JSON(http.StatusOK, response)
 }
 
-func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	response := map[string]interface{}{
+func healthCheckHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
 		"status":    "healthy",
 		"timestamp": time.Now().UTC(),
 		"service":   "analytics-platform",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	})
 }
 
 func getClientIP(r *http.Request) string {
@@ -223,7 +227,35 @@ func getClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+func getClientIPFromGin(c *gin.Context) string {
+	// Check for X-Forwarded-For header (common in load balancers)
+	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
+		// Take the first IP from the comma-separated list
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+
+	// Check for X-Real-IP header
+	if xri := c.GetHeader("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// Use Gin's ClientIP method as fallback
+	return c.ClientIP()
+}
+
 func main() {
+	// Load environment variables from .env.local file
+	if err := godotenv.Load(".env.local"); err != nil {
+		log.Printf("Warning: Could not load .env.local file: %v", err)
+		// Try loading from .env as fallback
+		if err := godotenv.Load(".env"); err != nil {
+			log.Printf("Warning: Could not load .env file: %v", err)
+		}
+	}
+
 	// Get configuration from environment variables
 	bucketName := os.Getenv("S3_BUCKET_NAME")
 	if bucketName == "" {
@@ -241,28 +273,36 @@ func main() {
 		log.Fatalf("Failed to initialize analytics service: %v", err)
 	}
 
-	// Setup router
-	router := mux.NewRouter()
+	// Setup Gin router
+	router := gin.Default()
 
-	// API routes
-	router.HandleFunc("/health", healthCheckHandler).Methods("GET")
-	router.HandleFunc("/api/v1/events", analyticsService.ingestEventHandler).Methods("POST")
-	router.HandleFunc("/api/v1/events/batch", analyticsService.batchIngestHandler).Methods("POST")
+	// Setup CORS middleware
+	config := cors.DefaultConfig()
+	config.AllowAllOrigins = true
+	config.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
+	config.AllowHeaders = []string{"*"}
+	config.AllowCredentials = true
 
-	// Setup CORS
-	c := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"}, // Configure this for production
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"*"},
-		AllowCredentials: true,
-		Debug:            os.Getenv("CORS_DEBUG") == "true",
+	router.Use(cors.New(config))
+
+	// Serve static dashboard
+	router.Static("/static", "./")
+	router.GET("/", func(c *gin.Context) {
+		c.File("./dashboard.html")
 	})
 
-	// Wrap router with CORS middleware
-	handler := c.Handler(router)
+	// API routes
+	router.GET("/health", healthCheckHandler)
+	router.POST("/api/v1/events", analyticsService.ingestEventHandler)
+	router.POST("/api/v1/events/batch", analyticsService.batchIngestHandler)
+
+	// Analytics endpoints
+	router.GET("/api/v1/analytics", analyticsService.GetAnalyticsHandler)
+	router.GET("/api/v1/dashboard", analyticsService.GetDashboardHandler)
+	router.GET("/api/v1/realtime", analyticsService.GetRealTimeHandler)
 
 	// Start server
 	log.Printf("Analytics platform server starting on port %s", port)
 	log.Printf("S3 bucket: %s", bucketName)
-	log.Fatal(http.ListenAndServe(":"+port, handler))
+	log.Fatal(router.Run(":" + port))
 }

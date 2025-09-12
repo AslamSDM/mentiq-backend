@@ -4,6 +4,7 @@ mentiq-backend
 
 # Environment files
 .env
+.env.local
 
 # Logs
 *.log
