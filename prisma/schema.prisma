@@ -1,0 +1,31 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+generator client {
+    provider = "go run github.com/steebchen/prisma-client-go"
+    output   = "./db"
+}
+
+model Account {
+    id        String    @id @default(cuid())
+    name      String
+    email     String    @unique
+    password  String
+    createdAt DateTime  @default(now())
+    updatedAt DateTime  @updatedAt
+    projects  Project[]
+}
+
+model Project {
+    id        String   @id @default(cuid())
+    name      String
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+    account   Account  @relation(fields: [accountId], references: [id])
+    accountId String
+}

@@ -57,6 +57,14 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 		return
 	}
 
+	// Get account and project from context
+	accountID, _ := c.Get("account_id")
+	projectID, _ := c.Get("project_id")
+	if accountID == "" || projectID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Set default values
 	if query.StartDate == "" {
 		query.StartDate = time.Now().AddDate(0, 0, -7).Format("2006-01-02")
@@ -72,7 +80,7 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 	}
 
 	// Fetch and process events
-	events, err := as.fetchEventsForDateRange(query.StartDate, query.EndDate)
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), query.StartDate, query.EndDate)
 	if err != nil {
 		log.Printf("Error fetching events: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
@@ -96,7 +104,7 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func (as *AnalyticsService) fetchEventsForDateRange(startDate, endDate string) ([]Event, error) {
+func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startDate, endDate string) ([]Event, error) {
 	start, err := time.Parse("2006-01-02", startDate)
 	if err != nil {
 		return nil, err
@@ -110,7 +118,9 @@ func (as *AnalyticsService) fetchEventsForDateRange(startDate, endDate string) (
 
 	// Iterate through each day in the range
 	for d := start; d.Before(end.AddDate(0, 0, 1)); d = d.AddDate(0, 0, 1) {
-		prefix := fmt.Sprintf("events/year=%d/month=%02d/day=%02d/",
+		prefix := fmt.Sprintf("events/account_id=%s/project_id=%s/year=%d/month=%02d/day=%02d/",
+			accountID,
+			projectID,
 			d.Year(), d.Month(), d.Day())
 
 		events, err := as.fetchEventsFromS3(prefix)
@@ -370,6 +380,14 @@ func convertMapToInterface(m map[string]int) map[string]interface{} {
 
 // Dashboard endpoints
 func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
+	// Get account and project from context
+	accountID, _ := c.Get("account_id")
+	projectID, _ := c.Get("project_id")
+	if accountID == "" || projectID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Return pre-computed dashboard metrics
 	dashboardData := map[string]interface{}{
 		"overview": map[string]interface{}{
@@ -397,6 +415,14 @@ func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
 
 // Real-time analytics endpoint
 func (as *AnalyticsService) GetRealTimeHandler(c *gin.Context) {
+	// Get account and project from context
+	accountID, _ := c.Get("account_id")
+	projectID, _ := c.Get("project_id")
+	if accountID == "" || projectID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Get events from last hour for real-time view
 	now := time.Now()
 
