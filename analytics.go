@@ -205,7 +205,7 @@ func (as *AnalyticsService) fetchEventsInParallel(keys []string, maxConcurrency 
 
 	// Create channels for coordination
 	keyChan := make(chan string, len(keys))
-	resultChan := make(chan Event, len(keys))
+	resultChan := make(chan []Event, len(keys))
 	errorChan := make(chan error, len(keys))
 
 	// Send all keys to the channel
@@ -221,12 +221,12 @@ func (as *AnalyticsService) fetchEventsInParallel(keys []string, maxConcurrency 
 		go func() {
 			defer wg.Done()
 			for key := range keyChan {
-				event, err := as.fetchSingleEventOptimized(key)
+				events, err := as.fetchSingleEventOptimized(key)
 				if err != nil {
 					errorChan <- fmt.Errorf("failed to fetch %s: %v", key, err)
 					continue
 				}
-				resultChan <- event
+				resultChan <- events
 			}
 		}()
 	}
@@ -239,16 +239,16 @@ func (as *AnalyticsService) fetchEventsInParallel(keys []string, maxConcurrency 
 	}()
 
 	// Collect results
-	var events []Event
+	var allEvents []Event
 	var errors []string
 
 	for {
 		select {
-		case event, ok := <-resultChan:
+		case events, ok := <-resultChan:
 			if !ok {
 				resultChan = nil
 			} else {
-				events = append(events, event)
+				allEvents = append(allEvents, events...)
 			}
 		case err, ok := <-errorChan:
 			if !ok {
@@ -268,12 +268,12 @@ func (as *AnalyticsService) fetchEventsInParallel(keys []string, maxConcurrency 
 		log.Printf("Warning: %d events failed to fetch: %v", len(errors), errors[:min(5, len(errors))])
 	}
 
-	log.Printf("Successfully fetched %d events", len(events))
-	return events, nil
+	log.Printf("Successfully fetched %d events", len(allEvents))
+	return allEvents, nil
 }
 
-// fetchSingleEventOptimized fetches a single event with better error handling
-func (as *AnalyticsService) fetchSingleEventOptimized(key string) (Event, error) {
+// fetchSingleEventOptimized fetches a single event or batch with better error handling
+func (as *AnalyticsService) fetchSingleEventOptimized(key string) ([]Event, error) {
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(as.bucketName),
 		Key:    aws.String(key),
@@ -281,14 +281,38 @@ func (as *AnalyticsService) fetchSingleEventOptimized(key string) (Event, error)
 
 	result, err := as.s3Client.GetObject(input)
 	if err != nil {
-		return Event{}, err
+		return nil, err
 	}
 	defer result.Body.Close()
 
-	var event Event
-	err = json.NewDecoder(result.Body).Decode(&event)
-	return event, err
+	// Check if this is a batch file
+	if strings.Contains(key, "batch_") {
+		// Handle batch file
+		var batchPayload struct {
+			BatchID    string  `json:"batch_id"`
+			BatchSize  int     `json:"batch_size"`
+			UploadedAt string  `json:"uploaded_at"`
+			Events     []Event `json:"events"`
+		}
+		
+		err = json.NewDecoder(result.Body).Decode(&batchPayload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode batch file: %v", err)
+		}
+		
+		return batchPayload.Events, nil
+	} else {
+		// Handle single event file
+		var event Event
+		err = json.NewDecoder(result.Body).Decode(&event)
+		if err != nil {
+			return nil, err
+		}
+		
+		return []Event{event}, nil
+	}
 }
+
 
 // Helper function for min
 func min(a, b int) int {
@@ -308,12 +332,12 @@ func (as *AnalyticsService) fetchEventsFromS3(prefix string) ([]Event, error) {
 
 	err := as.s3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		for _, obj := range page.Contents {
-			event, err := as.fetchSingleEventOptimized(*obj.Key)
+			eventsBatch, err := as.fetchSingleEventOptimized(*obj.Key)
 			if err != nil {
 				log.Printf("Warning: Could not fetch event %s: %v", *obj.Key, err)
 				continue
 			}
-			events = append(events, event)
+			events = append(events, eventsBatch...)
 		}
 		return true
 	})
@@ -322,8 +346,15 @@ func (as *AnalyticsService) fetchEventsFromS3(prefix string) ([]Event, error) {
 }
 
 func (as *AnalyticsService) fetchSingleEvent(key string) (Event, error) {
-	// Use the optimized version
-	return as.fetchSingleEventOptimized(key)
+	// Use the optimized version and return the first event
+	events, err := as.fetchSingleEventOptimized(key)
+	if err != nil {
+		return Event{}, err
+	}
+	if len(events) == 0 {
+		return Event{}, fmt.Errorf("no events found in file %s", key)
+	}
+	return events[0], nil
 }
 
 func (as *AnalyticsService) filterEvents(events []Event, query AnalyticsQuery) []Event {

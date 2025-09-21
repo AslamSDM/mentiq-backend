@@ -137,7 +137,7 @@ func (as *AnalyticsService) addEventToCache(event Event) {
 	log.Printf("Event %s added to cache. Cache size: %d", event.EventID, len(as.eventCache))
 }
 
-// flushEventCache processes all cached events and uploads them to S3
+// flushEventCache processes all cached events and uploads them to S3 in batches
 func (as *AnalyticsService) flushEventCache() {
 	as.cacheMutex.Lock()
 	if len(as.eventCache) == 0 {
@@ -150,18 +150,98 @@ func (as *AnalyticsService) flushEventCache() {
 	as.eventCache = as.eventCache[:0] // Clear the cache
 	as.cacheMutex.Unlock()
 
-	log.Printf("Flushing %d events from cache to S3", len(eventsToFlush))
+	log.Printf("Flushing %d events from cache to S3 in batches", len(eventsToFlush))
 
-	successCount := 0
+	// Group events by account/project/date for efficient batching
+	eventGroups := make(map[string][]Event)
 	for _, event := range eventsToFlush {
-		if err := as.storeEventToS3(event); err != nil {
-			log.Printf("Failed to store cached event %s: %v", event.EventID, err)
-		} else {
-			successCount++
-		}
+		key := fmt.Sprintf("%s/%s/%s", 
+			event.AccountID, 
+			event.ProjectID, 
+			event.Timestamp.Format("2006-01-02"))
+		eventGroups[key] = append(eventGroups[key], event)
 	}
 
-	log.Printf("Successfully flushed %d/%d events to S3", successCount, len(eventsToFlush))
+	var totalSuccess, totalFailed int
+	var wg sync.WaitGroup
+
+	// Process each group in parallel
+	for groupKey, events := range eventGroups {
+		wg.Add(1)
+		go func(key string, eventBatch []Event) {
+			defer wg.Done()
+			success, failed := as.storeBatchToS3(eventBatch)
+			totalSuccess += success
+			totalFailed += failed
+			log.Printf("Batch %s: %d success, %d failed", key, success, failed)
+		}(groupKey, events)
+	}
+
+	wg.Wait()
+	log.Printf("Batch flush completed: %d successful, %d failed out of %d total events", 
+		totalSuccess, totalFailed, len(eventsToFlush))
+}
+
+// storeBatchToS3 stores a batch of events as a single JSON array file in S3
+func (as *AnalyticsService) storeBatchToS3(events []Event) (int, int) {
+	if len(events) == 0 {
+		return 0, 0
+	}
+
+	// Use the first event to determine the S3 path
+	firstEvent := events[0]
+	
+	// Create a batch file with timestamp
+	batchID := uuid.New().String()
+	timestamp := time.Now().UTC()
+	
+	// Create S3 key for the batch file
+	key := fmt.Sprintf("events/account_id=%s/project_id=%s/year=%d/month=%02d/day=%02d/batch_%s_%d_events.json",
+		firstEvent.AccountID,
+		firstEvent.ProjectID,
+		firstEvent.Timestamp.Year(),
+		firstEvent.Timestamp.Month(),
+		firstEvent.Timestamp.Day(),
+		batchID,
+		len(events),
+	)
+
+	// Create batch payload
+	batchPayload := map[string]interface{}{
+		"batch_id":     batchID,
+		"batch_size":   len(events),
+		"uploaded_at":  timestamp,
+		"events":       events,
+	}
+
+	// Marshal to JSON
+	batchJSON, err := json.Marshal(batchPayload)
+	if err != nil {
+		log.Printf("Failed to marshal batch: %v", err)
+		return 0, len(events)
+	}
+
+	// Upload to S3
+	_, err = as.s3Client.PutObject(&s3.PutObjectInput{
+		Bucket:      aws.String(as.bucketName),
+		Key:         aws.String(key),
+		Body:        aws.ReadSeekCloser(strings.NewReader(string(batchJSON))),
+		ContentType: aws.String("application/json"),
+		Metadata: map[string]*string{
+			"batch-id":    aws.String(batchID),
+			"event-count": aws.String(fmt.Sprintf("%d", len(events))),
+			"account-id":  aws.String(firstEvent.AccountID),
+			"project-id":  aws.String(firstEvent.ProjectID),
+		},
+	})
+
+	if err != nil {
+		log.Printf("Failed to store batch to S3: %v", err)
+		return 0, len(events)
+	}
+
+	log.Printf("Batch %s with %d events stored to S3 with key: %s", batchID, len(events), key)
+	return len(events), 0
 }
 
 // getCacheSize returns the current size of the event cache (thread-safe)
