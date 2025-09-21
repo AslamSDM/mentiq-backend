@@ -312,12 +312,24 @@ func (as *AnalyticsService) flushCacheHandler(c *gin.Context) {
 		return
 	}
 
-	as.flushEventCache()
+	// Use a goroutine to flush cache asynchronously for large caches
+	if cacheSize > 100 {
+		go as.flushEventCache()
+		c.JSON(http.StatusOK, gin.H{
+			"message":           "Cache flush started asynchronously",
+			"events_to_process": cacheSize,
+			"status":           "processing",
+		})
+		return
+	}
 
+	// For smaller caches, flush synchronously
+	as.flushEventCache()
+	
 	c.JSON(http.StatusOK, gin.H{
-		"message":          "Cache flushed successfully",
-		"events_processed": cacheSize,
-		"new_cache_size":   as.getCacheSize(),
+		"message":           "Cache flushed successfully",
+		"events_processed":  cacheSize,
+		"new_cache_size":    as.getCacheSize(),
 	})
 }
 
@@ -364,7 +376,7 @@ func getClientIPFromGin(c *gin.Context) string {
 
 func main() {
 	// Load environment variables from .env.local file
-	if err := godotenv.Load(".env.local"); err != nil {
+	if err := godotenv.Load(".env"); err != nil {
 		log.Printf("Warning: Could not load .env.local file: %v", err)
 		// Try loading from .env as fallback
 		if err := godotenv.Load(".env"); err != nil {
@@ -421,6 +433,7 @@ func main() {
 		apiV1.GET("/analytics", analyticsService.GetAnalyticsHandler)
 		apiV1.GET("/dashboard", analyticsService.GetDashboardHandler)
 		apiV1.GET("/realtime", analyticsService.GetRealTimeHandler)
+		apiV1.GET("/user-metrics", analyticsService.GetUserMetricsHandler) // New endpoint for DAU/WAU/MAU
 		apiV1.POST("/flush-cache", analyticsService.flushCacheHandler) // Manual cache flush endpoint
 	}
 

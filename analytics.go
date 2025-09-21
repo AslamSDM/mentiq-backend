@@ -73,7 +73,7 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 		query.EndDate = time.Now().Format("2006-01-02")
 	}
 	if len(query.Metrics) == 0 {
-		query.Metrics = []string{"total_events", "unique_users", "top_events"}
+		query.Metrics = []string{"total_events", "unique_users", "top_events", "dau", "wau", "mau", "page_views"}
 	}
 	if query.GroupBy == "" {
 		query.GroupBy = "day"
@@ -308,6 +308,87 @@ func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuer
 				Metric: "avg_session_duration",
 				Value:  avgDuration.String(),
 			})
+
+		case "dau":
+			// Daily Active Users - unique users in the current day
+			today := time.Now().UTC().Format("2006-01-02")
+			todayUsers := make(map[string]bool)
+			
+			for _, event := range events {
+				eventDate := event.Timestamp.Format("2006-01-02")
+				if eventDate == today && event.UserID != "" {
+					todayUsers[event.UserID] = true
+				}
+			}
+
+			results = append(results, MetricResult{
+				Metric: "dau",
+				Value:  len(todayUsers),
+				TimeSeries: as.getDAUTimeSeries(events, query.GroupBy),
+			})
+
+		case "wau":
+			// Weekly Active Users - unique users in the last 7 days
+			sevenDaysAgo := time.Now().UTC().AddDate(0, 0, -7)
+			weeklyUsers := make(map[string]bool)
+			
+			for _, event := range events {
+				if event.Timestamp.After(sevenDaysAgo) && event.UserID != "" {
+					weeklyUsers[event.UserID] = true
+				}
+			}
+
+			results = append(results, MetricResult{
+				Metric: "wau",
+				Value:  len(weeklyUsers),
+				TimeSeries: as.getWAUTimeSeries(events, query.GroupBy),
+			})
+
+		case "mau":
+			// Monthly Active Users - unique users in the last 30 days
+			thirtyDaysAgo := time.Now().UTC().AddDate(0, 0, -30)
+			monthlyUsers := make(map[string]bool)
+			
+			for _, event := range events {
+				if event.Timestamp.After(thirtyDaysAgo) && event.UserID != "" {
+					monthlyUsers[event.UserID] = true
+				}
+			}
+
+			results = append(results, MetricResult{
+				Metric: "mau",
+				Value:  len(monthlyUsers),
+				TimeSeries: as.getMAUTimeSeries(events, query.GroupBy),
+			})
+
+		case "page_views":
+			// Count page view events
+			pageViews := 0
+			pageViewsByPath := make(map[string]int)
+			
+			for _, event := range events {
+				if event.EventType == "page_view" || event.EventType == "pageview" {
+					pageViews++
+					
+					// Extract path from properties if available
+					if event.Properties != nil {
+						if path, ok := event.Properties["path"].(string); ok {
+							pageViewsByPath[path]++
+						} else if url, ok := event.Properties["url"].(string); ok {
+							pageViewsByPath[url]++
+						} else if page, ok := event.Properties["page"].(string); ok {
+							pageViewsByPath[page]++
+						}
+					}
+				}
+			}
+
+			results = append(results, MetricResult{
+				Metric: "page_views",
+				Value:  pageViews,
+				Breakdown: convertMapToInterface(pageViewsByPath),
+				TimeSeries: as.getPageViewTimeSeries(events, query.GroupBy),
+			})
 		}
 	}
 
@@ -378,8 +459,319 @@ func convertMapToInterface(m map[string]int) map[string]interface{} {
 	return result
 }
 
+// getDAUTimeSeries calculates daily active users over time
+func (as *AnalyticsService) getDAUTimeSeries(events []Event, groupBy string) []TimeSeriesPoint {
+	groupedUsers := make(map[string]map[string]bool)
+
+	for _, event := range events {
+		if event.UserID == "" {
+			continue
+		}
+
+		var key string
+		switch groupBy {
+		case "hour":
+			key = event.Timestamp.Format("2006-01-02 15")
+		case "day":
+			key = event.Timestamp.Format("2006-01-02")
+		case "week":
+			year, week := event.Timestamp.ISOWeek()
+			key = fmt.Sprintf("%d-W%02d", year, week)
+		case "month":
+			key = event.Timestamp.Format("2006-01")
+		default:
+			key = event.Timestamp.Format("2006-01-02")
+		}
+
+		if groupedUsers[key] == nil {
+			groupedUsers[key] = make(map[string]bool)
+		}
+		groupedUsers[key][event.UserID] = true
+	}
+
+	var timeSeries []TimeSeriesPoint
+	for key, users := range groupedUsers {
+		timestamp, _ := parseTimeByGroupBy(key, groupBy)
+		timeSeries = append(timeSeries, TimeSeriesPoint{
+			Timestamp: timestamp,
+			Value:     len(users),
+		})
+	}
+
+	sort.Slice(timeSeries, func(i, j int) bool {
+		return timeSeries[i].Timestamp.Before(timeSeries[j].Timestamp)
+	})
+
+	return timeSeries
+}
+
+// getWAUTimeSeries calculates weekly active users over time
+func (as *AnalyticsService) getWAUTimeSeries(events []Event, groupBy string) []TimeSeriesPoint {
+	groupedData := make(map[string][]Event)
+
+	for _, event := range events {
+		var key string
+		switch groupBy {
+		case "week":
+			year, week := event.Timestamp.ISOWeek()
+			key = fmt.Sprintf("%d-W%02d", year, week)
+		case "month":
+			key = event.Timestamp.Format("2006-01")
+		default:
+			key = event.Timestamp.Format("2006-01-02")
+		}
+		groupedData[key] = append(groupedData[key], event)
+	}
+
+	var timeSeries []TimeSeriesPoint
+	for key := range groupedData {
+		timestamp, _ := parseTimeByGroupBy(key, groupBy)
+		
+		// For each time period, get unique users from the last 7 days
+		weekStart := timestamp.AddDate(0, 0, -7)
+		weeklyUsers := make(map[string]bool)
+		
+		for _, event := range events {
+			if event.Timestamp.After(weekStart) && event.Timestamp.Before(timestamp.AddDate(0, 0, 1)) && event.UserID != "" {
+				weeklyUsers[event.UserID] = true
+			}
+		}
+		
+		timeSeries = append(timeSeries, TimeSeriesPoint{
+			Timestamp: timestamp,
+			Value:     len(weeklyUsers),
+		})
+	}
+
+	sort.Slice(timeSeries, func(i, j int) bool {
+		return timeSeries[i].Timestamp.Before(timeSeries[j].Timestamp)
+	})
+
+	return timeSeries
+}
+
+// getMAUTimeSeries calculates monthly active users over time
+func (as *AnalyticsService) getMAUTimeSeries(events []Event, groupBy string) []TimeSeriesPoint {
+	groupedData := make(map[string][]Event)
+
+	for _, event := range events {
+		var key string
+		switch groupBy {
+		case "month":
+			key = event.Timestamp.Format("2006-01")
+		default:
+			key = event.Timestamp.Format("2006-01-02")
+		}
+		groupedData[key] = append(groupedData[key], event)
+	}
+
+	var timeSeries []TimeSeriesPoint
+	for key := range groupedData {
+		timestamp, _ := parseTimeByGroupBy(key, groupBy)
+		
+		// For each time period, get unique users from the last 30 days
+		monthStart := timestamp.AddDate(0, 0, -30)
+		monthlyUsers := make(map[string]bool)
+		
+		for _, event := range events {
+			if event.Timestamp.After(monthStart) && event.Timestamp.Before(timestamp.AddDate(0, 0, 1)) && event.UserID != "" {
+				monthlyUsers[event.UserID] = true
+			}
+		}
+		
+		timeSeries = append(timeSeries, TimeSeriesPoint{
+			Timestamp: timestamp,
+			Value:     len(monthlyUsers),
+		})
+	}
+
+	sort.Slice(timeSeries, func(i, j int) bool {
+		return timeSeries[i].Timestamp.Before(timeSeries[j].Timestamp)
+	})
+
+	return timeSeries
+}
+
+// getPageViewTimeSeries calculates page views over time
+func (as *AnalyticsService) getPageViewTimeSeries(events []Event, groupBy string) []TimeSeriesPoint {
+	groupedPageViews := make(map[string]int)
+
+	for _, event := range events {
+		if event.EventType != "page_view" && event.EventType != "pageview" {
+			continue
+		}
+
+		var key string
+		switch groupBy {
+		case "hour":
+			key = event.Timestamp.Format("2006-01-02 15")
+		case "day":
+			key = event.Timestamp.Format("2006-01-02")
+		case "week":
+			year, week := event.Timestamp.ISOWeek()
+			key = fmt.Sprintf("%d-W%02d", year, week)
+		case "month":
+			key = event.Timestamp.Format("2006-01")
+		default:
+			key = event.Timestamp.Format("2006-01-02")
+		}
+
+		groupedPageViews[key]++
+	}
+
+	var timeSeries []TimeSeriesPoint
+	for key, count := range groupedPageViews {
+		timestamp, _ := parseTimeByGroupBy(key, groupBy)
+		timeSeries = append(timeSeries, TimeSeriesPoint{
+			Timestamp: timestamp,
+			Value:     count,
+		})
+	}
+
+	sort.Slice(timeSeries, func(i, j int) bool {
+		return timeSeries[i].Timestamp.Before(timeSeries[j].Timestamp)
+	})
+
+	return timeSeries
+}
+
 // Dashboard endpoints
 func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
+	// Get account and project from context
+	accountID, _ := c.Get("account_id")
+	projectID, _ := c.Get("project_id")
+	log.Printf("AccountID: %v, ProjectID: %v", accountID, projectID)
+	if accountID == "" || projectID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Get recent events for dashboard calculations
+	endDate := time.Now().Format("2006-01-02")
+	startDate := time.Now().AddDate(0, 0, -30).Format("2006-01-02") // Last 30 days
+	
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), startDate, endDate)
+	log.Printf("Fetched %d events for dashboard", len(events))
+	if err != nil {
+		log.Printf("Error fetching events for dashboard: %v", err)
+		// Return empty dashboard if we can't fetch events
+		events = []Event{}
+	}
+
+	// Calculate metrics
+	today := time.Now().UTC()
+	yesterday := today.AddDate(0, 0, -1)
+	sevenDaysAgo := today.AddDate(0, 0, -7)
+	thirtyDaysAgo := today.AddDate(0, 0, -30)
+	log.Printf("Calculating dashboard metrics from %s to %s", startDate, endDate)
+	// Calculate DAU, WAU, MAU
+	todayUsers := make(map[string]bool)
+	yesterdayUsers := make(map[string]bool)
+	weeklyUsers := make(map[string]bool)
+	monthlyUsers := make(map[string]bool)
+	
+	// Page views
+	pageViewsToday := 0
+	pageViewsYesterday := 0
+	totalPageViews := 0
+	
+	// Event counts
+	eventsToday := 0
+	eventsYesterday := 0
+
+	for _, event := range events {
+		eventDate := event.Timestamp.Format("2006-01-02")
+		todayDate := today.Format("2006-01-02")
+		yesterdayDate := yesterday.Format("2006-01-02")
+
+		// Count events
+		if eventDate == todayDate {
+			eventsToday++
+		} else if eventDate == yesterdayDate {
+			eventsYesterday++
+		}
+
+		// Count page views
+		if event.EventType == "page_view" || event.EventType == "pageview" {
+			totalPageViews++
+			if eventDate == todayDate {
+				pageViewsToday++
+			} else if eventDate == yesterdayDate {
+				pageViewsYesterday++
+			}
+		}
+
+		// Count unique users
+		if event.UserID != "" {
+			if eventDate == todayDate {
+				todayUsers[event.UserID] = true
+			} else if eventDate == yesterdayDate {
+				yesterdayUsers[event.UserID] = true
+			}
+			
+			if event.Timestamp.After(sevenDaysAgo) {
+				weeklyUsers[event.UserID] = true
+			}
+			
+			if event.Timestamp.After(thirtyDaysAgo) {
+				monthlyUsers[event.UserID] = true
+			}
+		}
+	}
+
+	// Calculate growth rates
+	var eventGrowthRate string
+	if eventsYesterday > 0 {
+		growth := ((float64(eventsToday) - float64(eventsYesterday)) / float64(eventsYesterday)) * 100
+		eventGrowthRate = fmt.Sprintf("%.1f%%", growth)
+	} else {
+		eventGrowthRate = "N/A"
+	}
+
+	var userGrowthRate string
+	if len(yesterdayUsers) > 0 {
+		growth := ((float64(len(todayUsers)) - float64(len(yesterdayUsers))) / float64(len(yesterdayUsers))) * 100
+		userGrowthRate = fmt.Sprintf("%.1f%%", growth)
+	} else {
+		userGrowthRate = "N/A"
+	}
+
+	dashboardData := map[string]interface{}{
+		"overview": map[string]interface{}{
+			"total_events_today":     eventsToday,
+			"total_events_yesterday": eventsYesterday,
+			"unique_users_today":     len(todayUsers),
+			"unique_users_yesterday": len(yesterdayUsers),
+			"event_growth_rate":      eventGrowthRate,
+			"user_growth_rate":       userGrowthRate,
+		},
+		"user_metrics": map[string]interface{}{
+			"dau": len(todayUsers),
+			"wau": len(weeklyUsers),
+			"mau": len(monthlyUsers),
+		},
+		"page_metrics": map[string]interface{}{
+			"page_views_today":     pageViewsToday,
+			"page_views_yesterday": pageViewsYesterday,
+			"total_page_views":     totalPageViews,
+		},
+		"user_activity": map[string]interface{}{
+			"active_users_last_7_days":  len(weeklyUsers),
+			"active_users_last_30_days": len(monthlyUsers),
+			"new_users_today":           len(todayUsers),
+		},
+		"performance": map[string]interface{}{
+			"avg_session_duration": "0s", // Would need session calculation
+			"bounce_rate":          "0%", // Would need session calculation
+			"pages_per_session":    0,    // Would need session calculation
+		},
+	}
+
+	c.JSON(http.StatusOK, dashboardData)
+}
+
+// GetUserMetricsHandler provides detailed user metrics (DAU, WAU, MAU)
+func (as *AnalyticsService) GetUserMetricsHandler(c *gin.Context) {
 	// Get account and project from context
 	accountID, _ := c.Get("account_id")
 	projectID, _ := c.Get("project_id")
@@ -388,29 +780,72 @@ func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
 		return
 	}
 
-	// Return pre-computed dashboard metrics
-	dashboardData := map[string]interface{}{
-		"overview": map[string]interface{}{
-			"total_events_today":     0,
-			"total_events_yesterday": 0,
-			"unique_users_today":     0,
-			"unique_users_yesterday": 0,
-			"growth_rate":            "0%",
+	// Get date range from query parameters
+	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -30).Format("2006-01-02"))
+	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+	groupBy := c.DefaultQuery("group_by", "day")
+
+	// Fetch events for the specified date range
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), startDate, endDate)
+	if err != nil {
+		log.Printf("Error fetching events for user metrics: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
+		return
+	}
+
+	// Calculate current metrics
+	now := time.Now().UTC()
+	today := now.Format("2006-01-02")
+	sevenDaysAgo := now.AddDate(0, 0, -7)
+	thirtyDaysAgo := now.AddDate(0, 0, -30)
+
+	dauUsers := make(map[string]bool)
+	wauUsers := make(map[string]bool)
+	mauUsers := make(map[string]bool)
+
+	for _, event := range events {
+		if event.UserID == "" {
+			continue
+		}
+
+		eventDate := event.Timestamp.Format("2006-01-02")
+		if eventDate == today {
+			dauUsers[event.UserID] = true
+		}
+
+		if event.Timestamp.After(sevenDaysAgo) {
+			wauUsers[event.UserID] = true
+		}
+
+		if event.Timestamp.After(thirtyDaysAgo) {
+			mauUsers[event.UserID] = true
+		}
+	}
+
+	// Generate time series data
+	dauTimeSeries := as.getDAUTimeSeries(events, groupBy)
+	wauTimeSeries := as.getWAUTimeSeries(events, groupBy)
+	mauTimeSeries := as.getMAUTimeSeries(events, groupBy)
+
+	response := map[string]interface{}{
+		"current_metrics": map[string]interface{}{
+			"dau": len(dauUsers),
+			"wau": len(wauUsers),
+			"mau": len(mauUsers),
 		},
-		"top_events": []map[string]interface{}{},
-		"user_activity": map[string]interface{}{
-			"active_users_last_7_days":  0,
-			"active_users_last_30_days": 0,
-			"new_users_today":           0,
+		"time_series": map[string]interface{}{
+			"dau": dauTimeSeries,
+			"wau": wauTimeSeries,
+			"mau": mauTimeSeries,
 		},
-		"performance": map[string]interface{}{
-			"avg_session_duration": "0s",
-			"bounce_rate":          "0%",
-			"pages_per_session":    0,
+		"date_range": map[string]string{
+			"start_date": startDate,
+			"end_date":   endDate,
+			"group_by":   groupBy,
 		},
 	}
 
-	c.JSON(http.StatusOK, dashboardData)
+	c.JSON(http.StatusOK, response)
 }
 
 // Real-time analytics endpoint

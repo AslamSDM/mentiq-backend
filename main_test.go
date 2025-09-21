@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -269,6 +270,7 @@ func TestAnalyticsAndDashboardHandlers(t *testing.T) {
 		apiV1.GET("/analytics", analyticsService.GetAnalyticsHandler)
 		apiV1.GET("/dashboard", analyticsService.GetDashboardHandler)
 		apiV1.GET("/realtime", analyticsService.GetRealTimeHandler)
+		apiV1.GET("/user-metrics", analyticsService.GetUserMetricsHandler)
 	}
 
 	// For now, these tests just check if the endpoints return OK,
@@ -291,6 +293,8 @@ func TestAnalyticsAndDashboardHandlers(t *testing.T) {
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), "user_metrics")
+		assert.Contains(t, w.Body.String(), "page_metrics")
 	})
 
 	t.Run("GetRealTimeHandler", func(t *testing.T) {
@@ -302,4 +306,117 @@ func TestAnalyticsAndDashboardHandlers(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code)
 	})
+
+	t.Run("GetUserMetricsHandler", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/user-metrics", nil)
+		req.Header.Set("Authorization", "ApiKey "+account.ID)
+		req.Header.Set("X-Project-ID", project.ID)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), "current_metrics")
+		assert.Contains(t, w.Body.String(), "time_series")
+		assert.Contains(t, w.Body.String(), "dau")
+		assert.Contains(t, w.Body.String(), "wau")
+		assert.Contains(t, w.Body.String(), "mau")
+	})
+}
+
+func TestUserMetricsCalculation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router, dbClient := setupRouter()
+	defer dbClient.Disconnect()
+
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+	analyticsService, err := NewAnalyticsService(bucketName, dbClient)
+	assert.NoError(t, err)
+
+	// Mock account and project
+	account, _ := dbClient.Account.CreateOne(
+		db.Account.Name.Set("test-metrics-account"),
+		db.Account.Email.Set("metrics@test.com"),
+		db.Account.Password.Set("password"),
+	).Exec(context.Background())
+	project, _ := dbClient.Project.CreateOne(
+		db.Project.Name.Set("test-metrics-project"),
+		db.Project.Account.Link(
+			db.Account.ID.Equals(account.ID),
+		),
+	).Exec(context.Background())
+
+	defer func() {
+		dbClient.Project.FindMany(db.Project.ID.Equals(project.ID)).Delete().Exec(context.Background())
+		dbClient.Account.FindMany(db.Account.ID.Equals(account.ID)).Delete().Exec(context.Background())
+	}()
+
+	// Create test events with different event types
+	testEvents := []Event{
+		{
+			EventID:   "test-1",
+			EventType: "page_view",
+			UserID:    "user1",
+			AccountID: account.ID,
+			ProjectID: project.ID,
+			Timestamp: time.Now().UTC(),
+			Properties: map[string]interface{}{"path": "/home"},
+		},
+		{
+			EventID:   "test-2", 
+			EventType: "page_view",
+			UserID:    "user2",
+			AccountID: account.ID,
+			ProjectID: project.ID,
+			Timestamp: time.Now().UTC(),
+			Properties: map[string]interface{}{"path": "/about"},
+		},
+		{
+			EventID:   "test-3",
+			EventType: "click",
+			UserID:    "user1",
+			AccountID: account.ID,
+			ProjectID: project.ID,
+			Timestamp: time.Now().UTC(),
+			Properties: map[string]interface{}{"button": "signup"},
+		},
+	}
+
+	// Add events to cache (simulating ingestion)
+	for _, event := range testEvents {
+		analyticsService.addEventToCache(event)
+	}
+
+	// Test analytics endpoint with new metrics
+	apiV1 := router.Group("/api/v1")
+	apiV1.Use(AuthMiddleware(dbClient))
+	{
+		apiV1.GET("/analytics", analyticsService.GetAnalyticsHandler)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/analytics?metrics=dau,wau,mau,page_views", nil)
+	req.Header.Set("Authorization", "ApiKey "+account.ID)
+	req.Header.Set("X-Project-ID", project.ID)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	
+	var response map[string]interface{}
+	err = json.Unmarshal(w.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	
+	results := response["results"].([]interface{})
+	assert.True(t, len(results) >= 4) // Should have at least dau, wau, mau, page_views
+
+	// Verify that metrics are present in the response
+	metricNames := make(map[string]bool)
+	for _, result := range results {
+		resultMap := result.(map[string]interface{})
+		metricNames[resultMap["metric"].(string)] = true
+	}
+	
+	assert.True(t, metricNames["dau"])
+	assert.True(t, metricNames["wau"])
+	assert.True(t, metricNames["mau"])
+	assert.True(t, metricNames["page_views"])
 }
