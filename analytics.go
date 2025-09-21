@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -114,50 +115,153 @@ func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startD
 		return nil, err
 	}
 
-	var allEvents []Event
-
-	// Iterate through each day in the range
-	for d := start; d.Before(end.AddDate(0, 0, 1)); d = d.AddDate(0, 0, 1) {
-		prefix := fmt.Sprintf("events/account_id=%s/project_id=%s/year=%d/month=%02d/day=%02d/",
-			accountID,
-			projectID,
-			d.Year(), d.Month(), d.Day())
-
-		events, err := as.fetchEventsFromS3(prefix)
-		if err != nil {
-			log.Printf("Warning: Could not fetch events for %s: %v", d.Format("2006-01-02"), err)
-			continue
-		}
-		allEvents = append(allEvents, events...)
+	log.Printf("Fetching events for account=%s, project=%s, from %s to %s", accountID, projectID, startDate, endDate)
+	
+	// Use a single prefix to get all events for the account/project
+	prefix := fmt.Sprintf("events/account_id=%s/project_id=%s/", accountID, projectID)
+	
+	// Get all events at once with optimized fetching
+	allEvents, err := as.fetchEventsFromS3Optimized(prefix, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch events: %v", err)
 	}
 
+	log.Printf("Found %d events in date range", len(allEvents))
 	return allEvents, nil
 }
 
-func (as *AnalyticsService) fetchEventsFromS3(prefix string) ([]Event, error) {
+// fetchEventsFromS3Optimized fetches all events with parallel processing and date filtering
+func (as *AnalyticsService) fetchEventsFromS3Optimized(prefix string, startDate, endDate time.Time) ([]Event, error) {
 	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(as.bucketName),
-		Prefix: aws.String(prefix),
+		Bucket:  aws.String(as.bucketName),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int64(1000), // Limit to avoid memory issues
 	}
 
-	var events []Event
-
+	var allObjectKeys []string
+	
+	// First, get all object keys
 	err := as.s3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		for _, obj := range page.Contents {
-			event, err := as.fetchSingleEvent(*obj.Key)
-			if err != nil {
-				log.Printf("Warning: Could not fetch event %s: %v", *obj.Key, err)
-				continue
+			// Quick date filter based on object key
+			if as.isObjectInDateRange(*obj.Key, startDate, endDate) {
+				allObjectKeys = append(allObjectKeys, *obj.Key)
 			}
-			events = append(events, event)
 		}
-		return true
+		return true // Continue to next page
 	})
 
-	return events, err
+	if err != nil {
+		return nil, fmt.Errorf("failed to list objects: %v", err)
+	}
+
+	log.Printf("Found %d relevant objects to fetch", len(allObjectKeys))
+
+	// Fetch events in parallel batches
+	return as.fetchEventsInParallel(allObjectKeys, 50) // Process 50 events concurrently
 }
 
-func (as *AnalyticsService) fetchSingleEvent(key string) (Event, error) {
+// isObjectInDateRange quickly checks if an S3 object is in the date range based on its key
+func (as *AnalyticsService) isObjectInDateRange(key string, startDate, endDate time.Time) bool {
+	// Extract date from key: events/account_id=xxx/project_id=xxx/year=2025/month=09/day=22/event.json
+	parts := strings.Split(key, "/")
+	
+	var year, month, day int
+	for _, part := range parts {
+		if strings.HasPrefix(part, "year=") {
+			year, _ = strconv.Atoi(strings.TrimPrefix(part, "year="))
+		} else if strings.HasPrefix(part, "month=") {
+			month, _ = strconv.Atoi(strings.TrimPrefix(part, "month="))
+		} else if strings.HasPrefix(part, "day=") {
+			day, _ = strconv.Atoi(strings.TrimPrefix(part, "day="))
+		}
+	}
+	
+	if year == 0 || month == 0 || day == 0 {
+		return true // If we can't parse date, include it
+	}
+	
+	eventDate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+	return !eventDate.Before(startDate) && !eventDate.After(endDate)
+}
+
+// fetchEventsInParallel fetches multiple events concurrently
+func (as *AnalyticsService) fetchEventsInParallel(keys []string, maxConcurrency int) ([]Event, error) {
+	if len(keys) == 0 {
+		return []Event{}, nil
+	}
+
+	// Create channels for coordination
+	keyChan := make(chan string, len(keys))
+	resultChan := make(chan Event, len(keys))
+	errorChan := make(chan error, len(keys))
+
+	// Send all keys to the channel
+	for _, key := range keys {
+		keyChan <- key
+	}
+	close(keyChan)
+
+	// Start worker goroutines
+	var wg sync.WaitGroup
+	for i := 0; i < maxConcurrency && i < len(keys); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for key := range keyChan {
+				event, err := as.fetchSingleEventOptimized(key)
+				if err != nil {
+					errorChan <- fmt.Errorf("failed to fetch %s: %v", key, err)
+					continue
+				}
+				resultChan <- event
+			}
+		}()
+	}
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+		close(errorChan)
+	}()
+
+	// Collect results
+	var events []Event
+	var errors []string
+
+	for {
+		select {
+		case event, ok := <-resultChan:
+			if !ok {
+				resultChan = nil
+			} else {
+				events = append(events, event)
+			}
+		case err, ok := <-errorChan:
+			if !ok {
+				errorChan = nil
+			} else {
+				errors = append(errors, err.Error())
+			}
+		}
+
+		if resultChan == nil && errorChan == nil {
+			break
+		}
+	}
+
+	// Log errors but don't fail the entire operation
+	if len(errors) > 0 {
+		log.Printf("Warning: %d events failed to fetch: %v", len(errors), errors[:min(5, len(errors))])
+	}
+
+	log.Printf("Successfully fetched %d events", len(events))
+	return events, nil
+}
+
+// fetchSingleEventOptimized fetches a single event with better error handling
+func (as *AnalyticsService) fetchSingleEventOptimized(key string) (Event, error) {
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(as.bucketName),
 		Key:    aws.String(key),
@@ -172,6 +276,42 @@ func (as *AnalyticsService) fetchSingleEvent(key string) (Event, error) {
 	var event Event
 	err = json.NewDecoder(result.Body).Decode(&event)
 	return event, err
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (as *AnalyticsService) fetchEventsFromS3(prefix string) ([]Event, error) {
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(as.bucketName),
+		Prefix: aws.String(prefix),
+	}
+
+	var events []Event
+
+	err := as.s3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+		for _, obj := range page.Contents {
+			event, err := as.fetchSingleEventOptimized(*obj.Key)
+			if err != nil {
+				log.Printf("Warning: Could not fetch event %s: %v", *obj.Key, err)
+				continue
+			}
+			events = append(events, event)
+		}
+		return true
+	})
+
+	return events, err
+}
+
+func (as *AnalyticsService) fetchSingleEvent(key string) (Event, error) {
+	// Use the optimized version
+	return as.fetchSingleEventOptimized(key)
 }
 
 func (as *AnalyticsService) filterEvents(events []Event, query AnalyticsQuery) []Event {
