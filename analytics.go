@@ -106,6 +106,16 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 }
 
 func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startDate, endDate string) ([]Event, error) {
+	// Check cache first
+	if cachedEvents, found := as.getCachedEvents(accountID, projectID, startDate, endDate); found {
+		log.Printf("Cache HIT: Found %d events for account=%s, project=%s, from %s to %s", 
+			len(cachedEvents), accountID, projectID, startDate, endDate)
+		return cachedEvents, nil
+	}
+
+	log.Printf("Cache MISS: Fetching events for account=%s, project=%s, from %s to %s", 
+		accountID, projectID, startDate, endDate)
+
 	start, err := time.Parse("2006-01-02", startDate)
 	if err != nil {
 		return nil, err
@@ -114,8 +124,6 @@ func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startD
 	if err != nil {
 		return nil, err
 	}
-
-	log.Printf("Fetching events for account=%s, project=%s, from %s to %s", accountID, projectID, startDate, endDate)
 	
 	// Use a single prefix to get all events for the account/project
 	prefix := fmt.Sprintf("events/account_id=%s/project_id=%s/", accountID, projectID)
@@ -126,7 +134,11 @@ func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startD
 		return nil, fmt.Errorf("failed to fetch events: %v", err)
 	}
 
-	log.Printf("Found %d events in date range", len(allEvents))
+	log.Printf("Found %d events in date range, caching for future requests", len(allEvents))
+	
+	// Cache the results for future requests
+	as.setCachedEvents(accountID, projectID, startDate, endDate, allEvents)
+
 	return allEvents, nil
 }
 
@@ -786,6 +798,15 @@ func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
 		return
 	}
 
+	// Check cache first
+	if cachedDashboard, found := as.getCachedDashboard(accountID.(string), projectID.(string)); found {
+		log.Printf("Cache HIT: Returning cached dashboard data")
+		c.JSON(http.StatusOK, cachedDashboard)
+		return
+	}
+
+	log.Printf("Cache MISS: Calculating dashboard data")
+
 	// Get recent events for dashboard calculations
 	endDate := time.Now().Format("2006-01-02")
 	startDate := time.Now().AddDate(0, 0, -30).Format("2006-01-02") // Last 30 days
@@ -798,12 +819,26 @@ func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
 		events = []Event{}
 	}
 
+	// Calculate dashboard data
+	dashboardData := as.calculateDashboardData(events)
+	
+	// Cache the results
+	as.setCachedDashboard(accountID.(string), projectID.(string), dashboardData)
+	
+	log.Printf("Dashboard data calculated and cached")
+	c.JSON(http.StatusOK, dashboardData)
+}
+
+// calculateDashboardData extracts dashboard calculation logic for reuse
+func (as *AnalyticsService) calculateDashboardData(events []Event) map[string]interface{} {
 	// Calculate metrics
 	today := time.Now().UTC()
 	yesterday := today.AddDate(0, 0, -1)
 	sevenDaysAgo := today.AddDate(0, 0, -7)
 	thirtyDaysAgo := today.AddDate(0, 0, -30)
-	log.Printf("Calculating dashboard metrics from %s to %s", startDate, endDate)
+	
+	log.Printf("Calculating dashboard metrics for %d events", len(events))
+	
 	// Calculate DAU, WAU, MAU
 	todayUsers := make(map[string]bool)
 	yesterdayUsers := make(map[string]bool)
@@ -907,7 +942,7 @@ func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
 		},
 	}
 
-	c.JSON(http.StatusOK, dashboardData)
+	return dashboardData
 }
 
 // GetUserMetricsHandler provides detailed user metrics (DAU, WAU, MAU)

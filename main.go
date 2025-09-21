@@ -38,6 +38,12 @@ type Event struct {
 	ProjectID  string                 `json:"project_id"`
 }
 
+// CacheEntry represents a cached item with TTL
+type CacheEntry struct {
+	Data      interface{}
+	ExpiresAt time.Time
+}
+
 type AnalyticsService struct {
 	s3Client   *s3.S3
 	bucketName string
@@ -46,6 +52,12 @@ type AnalyticsService struct {
 	// Memory cache for events
 	eventCache []Event
 	cacheMutex sync.RWMutex
+
+	// Data caches with TTL
+	eventsCache    map[string]*CacheEntry // Key: accountID:projectID:startDate:endDate
+	dashboardCache map[string]*CacheEntry // Key: accountID:projectID:date
+	metricsCache   map[string]*CacheEntry // Key: accountID:projectID:metric:date
+	dataCacheMutex sync.RWMutex
 
 	// Flush ticker for periodic batch uploads
 	flushTicker *time.Ticker
@@ -80,16 +92,20 @@ func NewAnalyticsService(bucketName string, dbClient *db.PrismaClient) (*Analyti
 	}
 
 	service := &AnalyticsService{
-		s3Client:    s3.New(sess),
-		bucketName:  bucketName,
-		dbClient:    dbClient,
-		eventCache:  make([]Event, 0),
-		flushTicker: time.NewTicker(30 * time.Minute),
-		stopChan:    make(chan bool),
+		s3Client:       s3.New(sess),
+		bucketName:     bucketName,
+		dbClient:       dbClient,
+		eventCache:     make([]Event, 0),
+		eventsCache:    make(map[string]*CacheEntry),
+		dashboardCache: make(map[string]*CacheEntry),
+		metricsCache:   make(map[string]*CacheEntry),
+		flushTicker:    time.NewTicker(30 * time.Minute),
+		stopChan:       make(chan bool),
 	}
 
-	// Start the background worker for periodic batch uploads
+	// Start the background workers
 	go service.startBatchProcessor()
+	go service.startCacheCleanup() // New cache cleanup worker
 
 	return service, nil
 }
@@ -153,6 +169,142 @@ func (as *AnalyticsService) getCacheSize() int {
 	as.cacheMutex.RLock()
 	defer as.cacheMutex.RUnlock()
 	return len(as.eventCache)
+}
+
+// Cache helper functions
+
+// generateCacheKey creates a cache key for the given parameters
+func (as *AnalyticsService) generateCacheKey(cacheType, accountID, projectID string, params ...string) string {
+	key := fmt.Sprintf("%s:%s:%s", cacheType, accountID, projectID)
+	for _, param := range params {
+		key += ":" + param
+	}
+	return key
+}
+
+// getCachedData retrieves data from cache if it exists and hasn't expired
+func (as *AnalyticsService) getCachedData(cacheKey string, cacheMap map[string]*CacheEntry) (interface{}, bool) {
+	as.dataCacheMutex.RLock()
+	defer as.dataCacheMutex.RUnlock()
+
+	entry, exists := cacheMap[cacheKey]
+	if !exists {
+		return nil, false
+	}
+
+	// Check if cache entry has expired
+	if time.Now().After(entry.ExpiresAt) {
+		return nil, false
+	}
+
+	return entry.Data, true
+}
+
+// setCachedData stores data in cache with TTL
+func (as *AnalyticsService) setCachedData(cacheKey string, data interface{}, ttl time.Duration, cacheMap map[string]*CacheEntry) {
+	as.dataCacheMutex.Lock()
+	defer as.dataCacheMutex.Unlock()
+
+	cacheMap[cacheKey] = &CacheEntry{
+		Data:      data,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+}
+
+// getCachedEvents retrieves events from cache
+func (as *AnalyticsService) getCachedEvents(accountID, projectID, startDate, endDate string) ([]Event, bool) {
+	cacheKey := as.generateCacheKey("events", accountID, projectID, startDate, endDate)
+	data, found := as.getCachedData(cacheKey, as.eventsCache)
+	if !found {
+		return nil, false
+	}
+	return data.([]Event), true
+}
+
+// setCachedEvents stores events in cache (30 minutes TTL)
+func (as *AnalyticsService) setCachedEvents(accountID, projectID, startDate, endDate string, events []Event) {
+	cacheKey := as.generateCacheKey("events", accountID, projectID, startDate, endDate)
+	as.setCachedData(cacheKey, events, 30*time.Minute, as.eventsCache)
+}
+
+// getCachedDashboard retrieves dashboard data from cache
+func (as *AnalyticsService) getCachedDashboard(accountID, projectID string) (map[string]interface{}, bool) {
+	cacheKey := as.generateCacheKey("dashboard", accountID, projectID, time.Now().Format("2006-01-02"))
+	data, found := as.getCachedData(cacheKey, as.dashboardCache)
+	if !found {
+		return nil, false
+	}
+	return data.(map[string]interface{}), true
+}
+
+// setCachedDashboard stores dashboard data in cache (10 minutes TTL)
+func (as *AnalyticsService) setCachedDashboard(accountID, projectID string, dashboard map[string]interface{}) {
+	cacheKey := as.generateCacheKey("dashboard", accountID, projectID, time.Now().Format("2006-01-02"))
+	as.setCachedData(cacheKey, dashboard, 10*time.Minute, as.dashboardCache)
+}
+
+// getCachedMetrics retrieves metrics from cache
+func (as *AnalyticsService) getCachedMetrics(accountID, projectID, metric, date string) (interface{}, bool) {
+	cacheKey := as.generateCacheKey("metrics", accountID, projectID, metric, date)
+	return as.getCachedData(cacheKey, as.metricsCache)
+}
+
+// setCachedMetrics stores metrics in cache (15 minutes TTL)
+func (as *AnalyticsService) setCachedMetrics(accountID, projectID, metric, date string, data interface{}) {
+	cacheKey := as.generateCacheKey("metrics", accountID, projectID, metric, date)
+	as.setCachedData(cacheKey, data, 15*time.Minute, as.metricsCache)
+}
+
+// startCacheCleanup runs a background goroutine that periodically removes expired cache entries
+func (as *AnalyticsService) startCacheCleanup() {
+	cleanupTicker := time.NewTicker(10 * time.Minute) // Clean every 10 minutes
+	defer cleanupTicker.Stop()
+
+	for {
+		select {
+		case <-cleanupTicker.C:
+			as.cleanExpiredCache()
+		case <-as.stopChan:
+			return
+		}
+	}
+}
+
+// cleanExpiredCache removes expired entries from all caches
+func (as *AnalyticsService) cleanExpiredCache() {
+	as.dataCacheMutex.Lock()
+	defer as.dataCacheMutex.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+
+	// Clean events cache
+	for key, entry := range as.eventsCache {
+		if now.After(entry.ExpiresAt) {
+			delete(as.eventsCache, key)
+			cleaned++
+		}
+	}
+
+	// Clean dashboard cache
+	for key, entry := range as.dashboardCache {
+		if now.After(entry.ExpiresAt) {
+			delete(as.dashboardCache, key)
+			cleaned++
+		}
+	}
+
+	// Clean metrics cache
+	for key, entry := range as.metricsCache {
+		if now.After(entry.ExpiresAt) {
+			delete(as.metricsCache, key)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("Cache cleanup: removed %d expired entries", cleaned)
+	}
 }
 
 func (as *AnalyticsService) storeEventToS3(event Event) error {
@@ -333,6 +485,32 @@ func (as *AnalyticsService) flushCacheHandler(c *gin.Context) {
 	})
 }
 
+// clearDataCacheHandler allows manual clearing of data caches (for testing/admin purposes)
+func (as *AnalyticsService) clearDataCacheHandler(c *gin.Context) {
+	as.dataCacheMutex.Lock()
+	
+	eventsCount := len(as.eventsCache)
+	dashboardCount := len(as.dashboardCache)
+	metricsCount := len(as.metricsCache)
+	
+	// Clear all caches
+	as.eventsCache = make(map[string]*CacheEntry)
+	as.dashboardCache = make(map[string]*CacheEntry)
+	as.metricsCache = make(map[string]*CacheEntry)
+	
+	as.dataCacheMutex.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "All data caches cleared successfully",
+		"cleared": gin.H{
+			"events_cache":    eventsCount,
+			"dashboard_cache": dashboardCount,
+			"metrics_cache":   metricsCount,
+			"total":          eventsCount + dashboardCount + metricsCount,
+		},
+	})
+}
+
 func getClientIP(r *http.Request) string {
 	// Check for X-Forwarded-For header (common in load balancers)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
@@ -435,6 +613,7 @@ func main() {
 		apiV1.GET("/realtime", analyticsService.GetRealTimeHandler)
 		apiV1.GET("/user-metrics", analyticsService.GetUserMetricsHandler) // New endpoint for DAU/WAU/MAU
 		apiV1.POST("/flush-cache", analyticsService.flushCacheHandler) // Manual cache flush endpoint
+		apiV1.POST("/clear-cache", analyticsService.clearDataCacheHandler) // Manual data cache clear endpoint
 	}
 
 	// Public routes
