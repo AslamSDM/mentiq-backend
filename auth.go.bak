@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strings"
 
@@ -13,9 +14,6 @@ import (
 // AuthMiddleware validates the API key and project ID.
 func AuthMiddleware(dbClient *db.PrismaClient) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// In a real app, you'd validate a JWT or session token.
-		// For now, we'll use a static API key from the Authorization header
-		// and a project ID from the X-Project-ID header.
 		authHeader := c.GetHeader("Authorization")
 		projectID := c.GetHeader("X-Project-ID")
 
@@ -24,45 +22,41 @@ func AuthMiddleware(dbClient *db.PrismaClient) gin.HandlerFunc {
 			return
 		}
 
-		apiKey := authHeader
-		if strings.HasPrefix(apiKey, "Bearer ") {
-			apiKey = strings.TrimPrefix(apiKey, "Bearer ")
-		} else if strings.HasPrefix(apiKey, "ApiKey ") {
-			apiKey = strings.TrimPrefix(apiKey, "ApiKey ")
+		apiKeyStr := authHeader
+		if strings.HasPrefix(apiKeyStr, "Bearer ") {
+			apiKeyStr = strings.TrimPrefix(apiKeyStr, "Bearer ")
+		} else if strings.HasPrefix(apiKeyStr, "ApiKey ") {
+			apiKeyStr = strings.TrimPrefix(apiKeyStr, "ApiKey ")
 		}
 
-		// The API key is treated as the account ID for this example.
-		account, err := dbClient.Account.FindFirst(
-			db.Account.ID.Equals(apiKey),
+		// Find the API key in the database.
+		apiKey, err := dbClient.APIKey.FindFirst(
+			db.APIKey.Key.Equals(apiKeyStr),
+			db.APIKey.IsActive.Equals(true),
+		).With(
+			db.APIKey.Project.Fetch().With(
+				db.Project.Account.Fetch(),
+			),
 		).Exec(context.Background())
 
 		if err != nil {
 			if err == db.ErrNotFound {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API Key"})
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid or inactive API Key"})
 				return
 			}
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Could not verify account"})
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Could not verify API key"})
 			return
 		}
 
-		// Verify the project belongs to the account.
-		project, err := dbClient.Project.FindFirst(
-			db.Project.ID.Equals(projectID),
-			db.Project.AccountID.Equals(account.ID),
-		).Exec(context.Background())
-
-		if err != nil {
-			if err == db.ErrNotFound {
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Invalid Project ID for this account"})
-				return
-			}
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Could not verify project"})
+		// Verify the API key is for the correct project.
+		if apiKey.ProjectID != projectID {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "API Key does not match project ID"})
 			return
 		}
 
 		// Set account and project info in the context for handlers to use.
-		c.Set("account_id", account.ID)
-		c.Set("project_id", project.ID)
+		c.Set("account_id", apiKey.Project().Account().ID)
+		c.Set("project_id", apiKey.ProjectID)
 
 		c.Next()
 	}
@@ -91,6 +85,7 @@ func signupHandler(dbClient *db.PrismaClient) gin.HandlerFunc {
 		).Exec(context.Background())
 
 		if err != nil {
+			log.Printf("Error creating account: %v", err)
 			// Basic check for duplicate email
 			if strings.Contains(err.Error(), "UniqueConstraintViolation") {
 				c.JSON(http.StatusConflict, gin.H{"error": "Email already in use"})

@@ -22,10 +22,113 @@ model Account {
 }
 
 model Project {
-    id        String   @id @default(cuid())
-    name      String
-    createdAt DateTime @default(now())
-    updatedAt DateTime @updatedAt
-    account   Account  @relation(fields: [accountId], references: [id])
-    accountId String
+    id           String       @id @default(cuid())
+    name         String
+    stripeApiKey String?
+    createdAt    DateTime     @default(now())
+    updatedAt    DateTime     @updatedAt
+    account      Account      @relation(fields: [accountId], references: [id])
+    accountId    String
+    apiKeys      ApiKey[]
+    experiments  Experiment[]
+}
+
+model ApiKey {
+    id          String    @id @default(cuid())
+    name        String
+    key         String    @unique
+    permissions String[]  @default([])
+    isActive    Boolean   @default(true)
+    lastUsedAt  DateTime?
+    createdAt   DateTime  @default(now())
+    updatedAt   DateTime  @updatedAt
+    project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    projectId   String
+
+    @@index([key])
+}
+
+model Experiment {
+    id           String                 @id @default(cuid())
+    name         String
+    description  String?
+    key          String // Unique identifier for the experiment
+    status       ExperimentStatus       @default(DRAFT)
+    trafficSplit Float // Percentage of traffic to include (0-1)
+    startDate    DateTime?
+    endDate      DateTime?
+    createdAt    DateTime               @default(now())
+    updatedAt    DateTime               @updatedAt
+    project      Project                @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    projectId    String
+    variants     Variant[]
+    assignments  ExperimentAssignment[]
+    conversions  ConversionEvent[]
+
+    @@unique([projectId, key])
+    @@index([status])
+    @@index([startDate, endDate])
+}
+
+model Variant {
+    id           String                 @id @default(cuid())
+    name         String
+    key          String // Unique identifier for the variant
+    description  String?
+    isControl    Boolean                @default(false)
+    trafficSplit Float // Percentage of traffic for this variant (0-1)
+    createdAt    DateTime               @default(now())
+    updatedAt    DateTime               @updatedAt
+    experiment   Experiment             @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+    experimentId String
+    assignments  ExperimentAssignment[]
+    conversions  ConversionEvent[]
+
+    @@unique([experimentId, key])
+}
+
+model ExperimentAssignment {
+    id           String    @id @default(cuid())
+    userId       String? // User ID if available
+    anonymousId  String? // Anonymous ID for non-logged in users
+    variantId    String
+    experimentId String
+    assignedAt   DateTime  @default(now())
+    converted    Boolean   @default(false)
+    convertedAt  DateTime?
+
+    variant    Variant    @relation(fields: [variantId], references: [id])
+    experiment Experiment @relation(fields: [experimentId], references: [id])
+
+    @@unique([userId, experimentId])
+    @@unique([anonymousId, experimentId])
+    @@index([variantId])
+    @@index([experimentId, converted])
+}
+
+model ConversionEvent {
+    id           String     @id @default(cuid())
+    experimentId String
+    variantId    String
+    userId       String?
+    anonymousId  String?
+    eventName    String
+    eventValue   Float? // Optional value for the conversion (e.g., revenue)
+    properties   Json? // Additional event properties
+    createdAt    DateTime   @default(now())
+    experiment   Experiment @relation(fields: [experimentId], references: [id])
+    variant      Variant    @relation(fields: [variantId], references: [id])
+
+    @@index([experimentId, variantId])
+    @@index([userId])
+    @@index([anonymousId])
+    @@index([eventName])
+}
+
+enum ExperimentStatus {
+    DRAFT
+    RUNNING
+    PAUSED
+    COMPLETED
+    ARCHIVED
 }

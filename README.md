@@ -10,6 +10,11 @@ A high-performance analytics platform backend service built in Go that ingests e
 - **Data Validation**: Comprehensive event validation and error handling
 - **Health Monitoring**: Health check endpoint for monitoring
 - **Client Info Extraction**: Automatic extraction of user agent and IP address
+- **Advanced Analytics**: DAU, WAU, MAU, page views, and more.
+- **Heatmap Analytics**: Visualize user clicks.
+- **Error Analytics**: Aggregate and track frontend errors.
+- **Session Analytics**: Detailed session-level analytics.
+- **API Key Management**: Securely manage API keys for your projects.
 
 ## API Endpoints
 

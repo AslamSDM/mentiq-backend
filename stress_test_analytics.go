@@ -3,9 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"log"
 	"math/rand"
 	"net/http"
 	"sync"
@@ -61,103 +59,7 @@ type StressTestEvent struct {
 	Properties map[string]interface{} `json:"properties"`
 }
 
-func main() {
-	// Command line flags
-	serverURL := flag.String("server", "http://localhost:8080", "Server URL")
-	numEventIngestors := flag.Int("event-ingestors", 10, "Number of event ingestion workers")
-	numDashboardCallers := flag.Int("dashboard-callers", 5, "Number of dashboard calling workers")
-	testDurationMinutes := flag.Int("duration", 5, "Test duration in minutes")
-	eventsPerSecond := flag.Int("events-per-second", 20, "Events per second per worker")
-	dashboardCallsPerMinute := flag.Int("dashboard-calls-per-minute", 30, "Dashboard calls per minute per worker")
-	apiKey := flag.String("api-key", "cmfu4slqu00009kc5am5gcns9", "API key for authentication (account ID)")
-	projectID := flag.String("project-id", "cmfu4sm1y00019kc5j74httyf", "Project ID")
-	useUniqueAccounts := flag.Bool("unique-accounts", false, "Generate unique account/project pairs for each simulated user")
-	createTestAccounts := flag.Bool("create-test-accounts", false, "Create test accounts in database (requires database write access)")
-	
-	flag.Parse()
 
-	config := StressTestConfig{
-		ServerURL:           *serverURL,
-		NumEventIngestors:   *numEventIngestors,
-		NumDashboardCallers: *numDashboardCallers,
-		TestDurationMinutes: *testDurationMinutes,
-		EventsPerSecond:     *eventsPerSecond,
-		DashboardCallsPerMinute: *dashboardCallsPerMinute,
-		ApiKey:              *apiKey,
-		ProjectID:           *projectID,
-		UseUniqueAccounts:   *useUniqueAccounts && *createTestAccounts, // Only use unique accounts if we can create them
-	}
-
-	fmt.Printf("🚀 Starting Analytics Backend Stress Test\n")
-	fmt.Printf("📊 Configuration:\n")
-	fmt.Printf("   - Server: %s\n", config.ServerURL)
-	fmt.Printf("   - Event Ingestors: %d\n", config.NumEventIngestors)
-	fmt.Printf("   - Dashboard Callers: %d\n", config.NumDashboardCallers)
-	fmt.Printf("   - Test Duration: %d minutes\n", config.TestDurationMinutes)
-	fmt.Printf("   - Events/second: %d\n", config.EventsPerSecond)
-	fmt.Printf("   - Dashboard calls/minute: %d\n", config.DashboardCallsPerMinute)
-	fmt.Printf("   - Unique Accounts: %t\n", config.UseUniqueAccounts)
-	fmt.Printf("\n")
-
-	// Warning about unique accounts
-	if *useUniqueAccounts && !*createTestAccounts {
-		fmt.Printf("⚠️  WARNING: Unique accounts requested but test account creation disabled.\n")
-		fmt.Printf("   Using single account for all requests to avoid 401 errors.\n")
-		fmt.Printf("   Use --create-test-accounts to enable unique account testing.\n\n")
-	}
-
-	// Check server health first
-	if !checkServerHealth(config.ServerURL) {
-		log.Fatal("❌ Server health check failed. Make sure the server is running.")
-	}
-	fmt.Printf("✅ Server health check passed\n\n")
-
-	// Initialize statistics
-	eventStats := &EventIngesterStats{}
-	dashboardStats := &DashboardCallerStats{}
-
-	// Start the stress test
-	var wg sync.WaitGroup
-	stopChan := make(chan bool)
-
-	// Start event ingestors
-	for i := 0; i < config.NumEventIngestors; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			runEventIngester(workerID, config, eventStats, stopChan)
-		}(i)
-	}
-
-	// Start dashboard callers
-	for i := 0; i < config.NumDashboardCallers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			runDashboardCaller(workerID, config, dashboardStats, stopChan)
-		}(i)
-	}
-
-	// Start statistics reporter
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runStatsReporter(eventStats, dashboardStats, stopChan)
-	}()
-
-	// Run for specified duration
-	time.Sleep(time.Duration(config.TestDurationMinutes) * time.Minute)
-
-	// Stop all workers
-	close(stopChan)
-	fmt.Printf("\n🛑 Stopping stress test...\n")
-
-	// Wait for all workers to finish
-	wg.Wait()
-
-	// Print final results
-	printFinalResults(eventStats, dashboardStats, config)
-}
 
 func checkServerHealth(serverURL string) bool {
 	resp, err := http.Get(serverURL + "/health")

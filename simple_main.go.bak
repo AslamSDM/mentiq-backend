@@ -1,0 +1,314 @@
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+)
+
+type User struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+type Project struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	AccountID string `json:"accountId"`
+	CreatedAt string `json:"createdAt"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+type ApiKey struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Key         string   `json:"key"`
+	Permissions []string `json:"permissions"`
+	IsActive    bool     `json:"isActive"`
+	ProjectID   string   `json:"projectId"`
+	CreatedAt   string   `json:"createdAt"`
+}
+
+// In-memory storage
+var users = make(map[string]User)
+var projects = make(map[string]Project)
+var apiKeys = make(map[string]ApiKey)
+
+func main() {
+	// Load environment variables
+	if err := godotenv.Load(".env"); err != nil {
+		log.Printf("Warning: Could not load .env file: %v", err)
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// Setup Gin router
+	router := gin.Default()
+
+	// Setup CORS
+	config := cors.DefaultConfig()
+	config.AllowAllOrigins = true
+	config.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
+	config.AllowHeaders = []string{"*"}
+	config.AllowCredentials = true
+	router.Use(cors.New(config))
+
+	// Health check
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "healthy",
+			"timestamp": time.Now().UTC(),
+			"service":   "analytics-platform",
+		})
+	})
+
+	// Auth routes
+	router.POST("/signup", signupHandler)
+	router.POST("/login", loginHandler)
+
+	// API routes with auth middleware
+	api := router.Group("/api/v1")
+	api.Use(authMiddleware)
+	{
+		api.GET("/projects", listProjectsHandler)
+		api.POST("/projects", createProjectHandler)
+		api.POST("/projects/:project_id/apikeys", createApiKeyHandler)
+		api.GET("/analytics", analyticsHandler)
+		api.GET("/dashboard", dashboardHandler)
+		api.GET("/realtime", realtimeHandler)
+	}
+
+	log.Printf("Server starting on port %s", port)
+	if err := router.Run(":" + port); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+func signupHandler(c *gin.Context) {
+	var req struct {
+		Name     string `json:"name" binding:"required"`
+		Email    string `json:"email" binding:"required,email"`
+		Password string `json:"password" binding:"required,min=8"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Check if user already exists
+	for _, user := range users {
+		if user.Email == req.Email {
+			c.JSON(http.StatusConflict, gin.H{"error": "Email already in use"})
+			return
+		}
+	}
+
+	user := User{
+		ID:    uuid.New().String(),
+		Name:  req.Name,
+		Email: req.Email,
+	}
+
+	users[user.ID] = user
+
+	c.JSON(http.StatusCreated, gin.H{
+		"message": "Account created successfully",
+		"account": user,
+	})
+}
+
+func loginHandler(c *gin.Context) {
+	var req struct {
+		Email    string `json:"email" binding:"required,email"`
+		Password string `json:"password" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Find user by email
+	var user *User
+	for _, u := range users {
+		if u.Email == req.Email {
+			user = &u
+			break
+		}
+	}
+
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	// For demo purposes, we'll use the email as the token
+	c.JSON(http.StatusOK, gin.H{
+		"token": user.Email,
+		"user":  user,
+	})
+}
+
+func authMiddleware(c *gin.Context) {
+	authHeader := c.GetHeader("Authorization")
+	projectID := c.GetHeader("X-Project-ID")
+
+	if authHeader == "" {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+		return
+	}
+
+	// Extract token (for demo, we'll use email as token)
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	token = strings.TrimPrefix(token, "ApiKey ")
+
+	// Find user by token (email)
+	var accountID string
+	for id, user := range users {
+		if user.Email == token {
+			accountID = id
+			break
+		}
+	}
+
+	if accountID == "" {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		return
+	}
+
+	// Set context values
+	c.Set("account_id", accountID)
+	c.Set("project_id", projectID)
+	c.Next()
+}
+
+func listProjectsHandler(c *gin.Context) {
+	accountID, _ := c.Get("account_id")
+
+	var userProjects []Project
+	for _, project := range projects {
+		if project.AccountID == accountID.(string) {
+			userProjects = append(userProjects, project)
+		}
+	}
+
+	c.JSON(http.StatusOK, userProjects)
+}
+
+func createProjectHandler(c *gin.Context) {
+	var req struct {
+		Name string `json:"name" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	accountID, _ := c.Get("account_id")
+
+	project := Project{
+		ID:        uuid.New().String(),
+		Name:      req.Name,
+		AccountID: accountID.(string),
+		CreatedAt: time.Now().Format(time.RFC3339),
+		UpdatedAt: time.Now().Format(time.RFC3339),
+	}
+
+	projects[project.ID] = project
+
+	c.JSON(http.StatusCreated, project)
+}
+
+func createApiKeyHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req struct {
+		Name        string   `json:"name" binding:"required"`
+		Permissions []string `json:"permissions"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify project exists and belongs to user
+	accountID, _ := c.Get("account_id")
+	project, exists := projects[projectID]
+	if !exists || project.AccountID != accountID.(string) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	apiKey := ApiKey{
+		ID:          uuid.New().String(),
+		Name:        req.Name,
+		Key:         "mentiq_live_" + uuid.New().String(),
+		Permissions: req.Permissions,
+		IsActive:    true,
+		ProjectID:   projectID,
+		CreatedAt:   time.Now().Format(time.RFC3339),
+	}
+
+	apiKeys[apiKey.ID] = apiKey
+
+	c.JSON(http.StatusCreated, apiKey)
+}
+
+func analyticsHandler(c *gin.Context) {
+	// Mock analytics data
+	c.JSON(http.StatusOK, gin.H{
+		"totalEvents":        15420,
+		"uniqueUsers":        3284,
+		"sessions":           8921,
+		"bounceRate":         32.5,
+		"avgSessionDuration": 245,
+		"topPages": []map[string]interface{}{
+			{"page": "/dashboard", "views": 3421},
+			{"page": "/projects", "views": 2156},
+			{"page": "/analytics", "views": 1876},
+		},
+		"eventsOverTime": []map[string]interface{}{
+			{"date": "2024-01-20", "count": 1200},
+			{"date": "2024-01-21", "count": 1450},
+			{"date": "2024-01-22", "count": 1680},
+		},
+	})
+}
+
+func dashboardHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"overview": gin.H{
+			"totalEvents": 15420,
+			"activeUsers": 234,
+		},
+	})
+}
+
+func realtimeHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"activeUsers": 42,
+		"recentEvents": []map[string]interface{}{
+			{
+				"id":        uuid.New().String(),
+				"type":      "page_view",
+				"timestamp": time.Now().Format(time.RFC3339),
+				"userId":    "user_123",
+				"page":      "/dashboard",
+			},
+		},
+	})
+}

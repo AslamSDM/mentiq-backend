@@ -151,7 +151,3 @@ func ViewAnalyticsData() {
 		}
 	}
 }
-
-func main() {
-	ViewAnalyticsData()
-}

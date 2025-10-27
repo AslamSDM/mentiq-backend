@@ -420,3 +420,257 @@ func TestUserMetricsCalculation(t *testing.T) {
 	assert.True(t, metricNames["mau"])
 	assert.True(t, metricNames["page_views"])
 }
+
+func TestProjectAndApiKeyHandlers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router, dbClient := setupRouter()
+	defer dbClient.Disconnect()
+
+	// Mock account
+	account, _ := dbClient.Account.CreateOne(
+		db.Account.Name.Set("test-project-account"),
+		db.Account.Email.Set("project@test.com"),
+		db.Account.Password.Set("password"),
+	).Exec(context.Background())
+
+	defer func() {
+		dbClient.Account.FindMany(db.Account.ID.Equals(account.ID)).Delete().Exec(context.Background())
+	}()
+
+	apiV1 := router.Group("/api/v1")
+	apiV1.Use(AuthMiddleware(dbClient))
+	{
+		apiV1.POST("/projects", createProjectHandler(dbClient))
+		apiV1.GET("/projects", listProjectsHandler(dbClient))
+		apiV1.POST("/projects/:project_id/apikeys", createApiKeyHandler(dbClient))
+	}
+
+	var projectID string
+
+	t.Run("Create Project", func(t *testing.T) {
+		projectReq := CreateProjectRequest{
+			Name: "Test Project",
+		}
+		body, _ := json.Marshal(projectReq)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "ApiKey "+account.ID)
+		req.Header.Set("X-Project-ID", "some-project-id") // This is not used for project creation
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusCreated, w.Code)
+		var project db.ProjectModel
+		json.Unmarshal(w.Body.Bytes(), &project)
+		projectID = project.ID
+		assert.NotEmpty(t, projectID)
+	})
+
+	t.Run("List Projects", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+		req.Header.Set("Authorization", "ApiKey "+account.ID)
+		req.Header.Set("X-Project-ID", projectID)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var projects []db.ProjectModel
+		json.Unmarshal(w.Body.Bytes(), &projects)
+		assert.NotEmpty(t, projects)
+	})
+
+	t.Run("Create API Key", func(t *testing.T) {
+		apiKeyReq := CreateApiKeyRequest{
+			Name: "Test API Key",
+		}
+		body, _ := json.Marshal(apiKeyReq)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/projects/"+projectID+"/apikeys", bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "ApiKey "+account.ID)
+		req.Header.Set("X-Project-ID", projectID)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusCreated, w.Code)
+		var apiKey db.APIKeyModel
+		json.Unmarshal(w.Body.Bytes(), &apiKey)
+		assert.NotEmpty(t, apiKey.Key)
+	})
+}
+
+func TestHeatmapHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router, dbClient := setupRouter()
+	defer dbClient.Disconnect()
+
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+	analyticsService, err := NewAnalyticsService(bucketName, dbClient)
+	assert.NoError(t, err)
+
+	// Mock account and project
+	account, _ := dbClient.Account.CreateOne(
+		db.Account.Name.Set("test-heatmap-account"),
+		db.Account.Email.Set("heatmap@test.com"),
+		db.Account.Password.Set("password"),
+	).Exec(context.Background())
+	project, _ := dbClient.Project.CreateOne(
+		db.Project.Name.Set("test-heatmap-project"),
+		db.Project.Account.Link(
+			db.Account.ID.Equals(account.ID),
+		),
+	).Exec(context.Background())
+
+	defer func() {
+		dbClient.Project.FindMany(db.Project.ID.Equals(project.ID)).Delete().Exec(context.Background())
+		dbClient.Account.FindMany(db.Account.ID.Equals(account.ID)).Delete().Exec(context.Background())
+	}()
+
+	// Create a test event
+	event := Event{
+		EventType: "heatmap_click",
+		AccountID: account.ID,
+		ProjectID: project.ID,
+		Properties: map[string]interface{}{
+			"x": 100,
+			"y": 200,
+		},
+	}
+	analyticsService.addEventToCache(event)
+	analyticsService.flushEventCache()
+
+	apiV1 := router.Group("/api/v1")
+	apiV1.Use(AuthMiddleware(dbClient))
+	{
+		apiV1.GET("/analytics/heatmaps", analyticsService.GetHeatmapHandler)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/analytics/heatmaps", nil)
+	req.Header.Set("Authorization", "ApiKey "+account.ID)
+	req.Header.Set("X-Project-ID", project.ID)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestErrorAnalyticsHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router, dbClient := setupRouter()
+	defer dbClient.Disconnect()
+
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+	analyticsService, err := NewAnalyticsService(bucketName, dbClient)
+	assert.NoError(t, err)
+
+	// Mock account and project
+	account, _ := dbClient.Account.CreateOne(
+		db.Account.Name.Set("test-error-account"),
+		db.Account.Email.Set("error@test.com"),
+		db.Account.Password.Set("password"),
+	).Exec(context.Background())
+	project, _ := dbClient.Project.CreateOne(
+		db.Project.Name.Set("test-error-project"),
+		db.Project.Account.Link(
+			db.Account.ID.Equals(account.ID),
+		),
+	).Exec(context.Background())
+
+	defer func() {
+		dbClient.Project.FindMany(db.Project.ID.Equals(project.ID)).Delete().Exec(context.Background())
+		dbClient.Account.FindMany(db.Account.ID.Equals(account.ID)).Delete().Exec(context.Background())
+	}()
+
+	// Create a test event
+	errorData, _ := json.Marshal(map[string]interface{}{
+		"message": "Test error",
+		"type":    "custom",
+	})
+	event := Event{
+		EventType: "error_event",
+		AccountID: account.ID,
+		ProjectID: project.ID,
+		Properties: map[string]interface{}{
+			"error": string(errorData),
+		},
+	}
+	analyticsService.addEventToCache(event)
+	analyticsService.flushEventCache()
+
+	apiV1 := router.Group("/api/v1")
+	apiV1.Use(AuthMiddleware(dbClient))
+	{
+		apiV1.GET("/analytics/errors", analyticsService.GetErrorAnalyticsHandler)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/analytics/errors", nil)
+	req.Header.Set("Authorization", "ApiKey "+account.ID)
+	req.Header.Set("X-Project-ID", project.ID)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestSessionAnalyticsHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router, dbClient := setupRouter()
+	defer dbClient.Disconnect()
+
+	bucketName := os.Getenv("S3_BUCKET_NAME")
+	analyticsService, err := NewAnalyticsService(bucketName, dbClient)
+	assert.NoError(t, err)
+
+	// Mock account and project
+	account, _ := dbClient.Account.CreateOne(
+		db.Account.Name.Set("test-session-account"),
+		db.Account.Email.Set("session@test.com"),
+		db.Account.Password.Set("password"),
+	).Exec(context.Background())
+	project, _ := dbClient.Project.CreateOne(
+		db.Project.Name.Set("test-session-project"),
+		db.Project.Account.Link(
+			db.Account.ID.Equals(account.ID),
+		),
+	).Exec(context.Background())
+
+	defer func() {
+		dbClient.Project.FindMany(db.Project.ID.Equals(project.ID)).Delete().Exec(context.Background())
+		dbClient.Account.FindMany(db.Account.ID.Equals(account.ID)).Delete().Exec(context.Background())
+	}()
+
+	// Create test events
+	sessionID := "test-session-123"
+	event1 := Event{
+		EventType: "page_view",
+		SessionID: sessionID,
+		AccountID: account.ID,
+		ProjectID: project.ID,
+		Timestamp: time.Now().Add(-1 * time.Minute),
+	}
+	event2 := Event{
+		EventType: "click",
+		SessionID: sessionID,
+		AccountID: account.ID,
+		ProjectID: project.ID,
+		Timestamp: time.Now(),
+	}
+	analyticsService.addEventToCache(event1)
+	analyticsService.addEventToCache(event2)
+	analyticsService.flushEventCache()
+
+	apiV1 := router.Group("/api/v1")
+	apiV1.Use(AuthMiddleware(dbClient))
+	{
+		apiV1.GET("/sessions/:session_id", analyticsService.GetSessionAnalyticsHandler)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/sessions/"+sessionID, nil)
+	req.Header.Set("Authorization", "ApiKey "+account.ID)
+	req.Header.Set("X-Project-ID", project.ID)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}

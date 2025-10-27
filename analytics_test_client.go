@@ -276,7 +276,3 @@ func TestAnalyticsEndpoints() {
 	
 	fmt.Println("\n✅ Analytics testing completed!")
 }
-
-func main() {
-	TestAnalyticsEndpoints()
-}

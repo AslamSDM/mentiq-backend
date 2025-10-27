@@ -5,13 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/joho/godotenv"
 	"mentiq-backend/prisma/db"
 )
 
@@ -35,60 +33,7 @@ type TestEvent struct {
 	Timestamp  time.Time              `json:"timestamp,omitempty"`
 }
 
-func main() {
-	// Load environment variables
-	if err := godotenv.Load(".env.local"); err != nil {
-		if err := godotenv.Load(".env"); err != nil {
-			log.Printf("Warning: Could not load environment files: %v", err)
-		}
-	}
 
-	// Initialize database client
-	dbClient := db.NewClient()
-	if err := dbClient.Connect(); err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
-	defer dbClient.Disconnect()
-
-	fmt.Println("🚀 Starting Analytics Test Script")
-	fmt.Println("================================")
-
-	// Step 1: Create test account
-	fmt.Println("\n📝 Step 1: Creating test account...")
-	account, err := createTestAccount(dbClient)
-	if err != nil {
-		log.Fatalf("Failed to create test account: %v", err)
-	}
-	fmt.Printf("✅ Created account: %s (ID: %s)\n", account.Name, account.ID)
-
-	// Step 2: Create test project
-	fmt.Println("\n📁 Step 2: Creating test project...")
-	project, err := createTestProject(dbClient, account.ID)
-	if err != nil {
-		log.Fatalf("Failed to create test project: %v", err)
-	}
-	fmt.Printf("✅ Created project: %s (ID: %s)\n", project.Name, project.ID)
-
-	// Step 3: Generate and send test events
-	fmt.Println("\n📊 Step 3: Generating test events...")
-	if err := generateTestEvents(account.ID, project.ID); err != nil {
-		log.Fatalf("Failed to generate test events: %v", err)
-	}
-
-	// Step 4: Test analytics endpoints
-	fmt.Println("\n🔍 Step 4: Testing analytics endpoints...")
-	if err := testAnalyticsEndpoints(account.ID, project.ID); err != nil {
-		log.Fatalf("Failed to test analytics: %v", err)
-	}
-
-	// Step 5: Cleanup (optional)
-	fmt.Println("\n🧹 Step 5: Cleanup...")
-	if err := cleanup(dbClient, account.ID, project.ID); err != nil {
-		log.Printf("Warning: Cleanup failed: %v", err)
-	}
-
-	fmt.Println("\n🎉 Analytics test completed successfully!")
-}
 
 func createTestAccount(dbClient *db.PrismaClient) (*TestAccount, error) {
 	timestamp := time.Now().Unix()
