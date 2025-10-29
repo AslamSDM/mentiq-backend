@@ -1,48 +1,64 @@
 package main
 
 import (
-	"crypto/md5"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
-	"math/rand"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"mentiq-backend/prisma/db"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
-// A/B Testing Request/Response Structures
 type CreateExperimentRequest struct {
-	Name         string                 `json:"name" binding:"required"`
-	Description  string                 `json:"description"`
-	Key          string                 `json:"key" binding:"required"`
-	TrafficSplit float64                `json:"trafficSplit" binding:"required,min=0,max=1"`
-	StartDate    string                 `json:"startDate"`
-	EndDate      string                 `json:"endDate"`
-	Variants     []CreateVariantRequest `json:"variants" binding:"required,min=2"`
-}
-
-type CreateVariantRequest struct {
 	Name         string  `json:"name" binding:"required"`
 	Key          string  `json:"key" binding:"required"`
-	Description  string  `json:"description"`
-	IsControl    bool    `json:"isControl"`
-	TrafficSplit float64 `json:"trafficSplit" binding:"required,min=0,max=1"`
+	Status       string  `json:"status" binding:"required"`
+	TrafficSplit float64 `json:"trafficSplit" binding:"required"`
+	ProjectID    string  `json:"projectId" binding:"required"`
+
+	Description *string            `json:"description"`
+	StartDate   *time.Time         `json:"startDate"`
+	EndDate     *time.Time         `json:"endDate"`
+	Variants    []CreateVariantReq `json:"variants" binding:"required,min=1"`
+}
+type CreateVariantReq struct {
+	Name string `json:"name" binding:"required"`
+	Key  string `json:"key" binding
+:"required"`
+
+	Description  *string `json:"description"`
+	IsControl    bool    `json:"isControl" binding:"required"`
+	TrafficSplit float64 `json:"trafficSplit" binding:"required"`
 }
 
 type GetExperimentRequest struct {
-	UserId      string `json:"userId"`
-	AnonymousId string `json:"anonymousId"`
+	ExperimentKey string `form:"experimentKey" binding:"required"`
+	ProjectID     string `form:"projectId" binding:"required"`
+}
+type GetAssignmentRequest struct {
+	ExperimentKey string `form:"experimentKey" binding:"required"`
+	ProjectID     string `form:"projectId" binding:"required"`
+	UserID        string `form:"userId"`
+	AnonymousID   string `form:"anonymousId"`
 }
 
 type TrackConversionRequest struct {
-	ExperimentId string                 `json:"experimentId" binding:"required"`
-	UserId       string                 `json:"userId"`
-	AnonymousId  string                 `json:"anonymousId"`
+	ExperimentID string                 `json:"experimentId" binding:"required"`
 	EventName    string                 `json:"eventName" binding:"required"`
-	EventValue   float64                `json:"eventValue"`
+	Value        *float64               `json:"value"`
+	UserID       string                 `json:"userId"`
+	AnonymousID  string                 `json:"anonymousId"`
 	Properties   map[string]interface{} `json:"properties"`
 }
+
+// This file has been deprecated.
+// All A/B testing functionality is now in ab_testing.go
+// This file can be safely deleted.
 
 type ExperimentResponse struct {
 	Id           string            `json:"id"`
@@ -87,83 +103,65 @@ func (s *Server) CreateExperiment(c *gin.Context) {
 		return
 	}
 
-	projectId, _ := c.Get("project_id")
-
-	// Validate traffic split sums to 1.0
-	totalSplit := 0.0
-	for _, variant := range req.Variants {
-		totalSplit += variant.TrafficSplit
-	}
-	if totalSplit < 0.99 || totalSplit > 1.01 { // Allow small floating point errors
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Variant traffic splits must sum to 1.0"})
-		return
-	}
-
-	// Parse dates
-	var startDate, endDate *time.Time
-	if req.StartDate != "" {
-		parsed, err := time.Parse(time.RFC3339, req.StartDate)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid startDate format"})
-			return
+	// Create experiment and variants within a transaction
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		// Create the Experiment
+		experiment := Experiment{
+			ID:           uuid.New().String(),
+			Name:         req.Name,
+			Key:          req.Key,
+			Status:       req.Status,
+			TrafficSplit: req.TrafficSplit,
+			ProjectID:    req.ProjectID,
+			Description:  req.Description,
+			StartDate:    req.StartDate,
+			EndDate:      req.EndDate,
 		}
-		startDate = &parsed
-	}
-	if req.EndDate != "" {
-		parsed, err := time.Parse(time.RFC3339, req.EndDate)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid endDate format"})
-			return
-		}
-		endDate = &parsed
-	}
 
-	// Create experiment
-	experiment, err := s.client.Experiment.CreateOne(
-		db.Experiment.Name.Set(req.Name),
-		db.Experiment.Description.Set(req.Description),
-		db.Experiment.Key.Set(req.Key),
-		db.Experiment.TrafficSplit.Set(req.TrafficSplit),
-		db.Experiment.StartDate.Set(*startDate),
-		db.Experiment.EndDate.Set(*endDate),
-		db.Experiment.Project.Link(db.Project.ID.Equals(projectId.(string))),
-	).Exec(c.Request.Context())
+		if err := tx.Create(&experiment).Error; err != nil {
+			return fmt.Errorf("failed to create experiment: %w", err)
+		}
+
+		// Create the Variants and link them to the Experiment
+		for _, v := range req.Variants {
+			variant := Variant{
+				ID:           uuid.New().String(),
+				Name:         v.Name,
+				Key:          v.Key,
+				Description:  v.Description,
+				IsControl:    v.IsControl,
+				TrafficSplit: v.TrafficSplit,
+				ExperimentID: experiment.ID,
+			}
+
+			if err := tx.Create(&variant).Error; err != nil {
+				return fmt.Errorf("failed to create variant %s: %w", v.Name, err)
+			}
+		}
+
+		return nil
+	})
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create experiment"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Create variants
-	for _, variantReq := range req.Variants {
-		_, err := s.client.Variant.CreateOne(
-			db.Variant.Name.Set(variantReq.Name),
-			db.Variant.Key.Set(variantReq.Key),
-			db.Variant.Description.Set(variantReq.Description),
-			db.Variant.IsControl.Set(variantReq.IsControl),
-			db.Variant.TrafficSplit.Set(variantReq.TrafficSplit),
-			db.Variant.Experiment.Link(db.Experiment.ID.Equals(experiment.ID)),
-		).Exec(c.Request.Context())
-
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create variant"})
-			return
-		}
+	// Fetch the created experiment with its variants
+	var experiment Experiment
+	if err := s.db.Preload("Variants").Where("project_id = ?", req.ProjectID).Order("created_at DESC").First(&experiment).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch created experiment"})
+		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"experimentId": experiment.ID})
+	c.JSON(http.StatusOK, experiment)
 }
 
 func (s *Server) GetExperiments(c *gin.Context) {
-	projectId, _ := c.Get("project_id")
+	projectID, _ := c.Get("project_id")
 
-	experiments, err := s.client.Experiment.FindMany(
-		db.Experiment.Project.Where(db.Project.ID.Equals(projectId.(string))),
-	).With(
-		db.Experiment.Variants.Fetch(),
-	).Exec(c.Request.Context())
-
-	if err != nil {
+	var experiments []Experiment
+	if err := s.db.Preload("Variants").Where("project_id = ?", projectID.(string)).Find(&experiments).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch experiments"})
 		return
 	}
@@ -171,12 +169,16 @@ func (s *Server) GetExperiments(c *gin.Context) {
 	var responses []ExperimentResponse
 	for _, exp := range experiments {
 		var variants []VariantResponse
-		for _, variant := range exp.Variants() {
+		for _, variant := range exp.Variants {
+			description := ""
+			if variant.Description != nil {
+				description = *variant.Description
+			}
 			variants = append(variants, VariantResponse{
 				Id:           variant.ID,
 				Name:         variant.Name,
 				Key:          variant.Key,
-				Description:  variant.Description,
+				Description:  description,
 				IsControl:    variant.IsControl,
 				TrafficSplit: variant.TrafficSplit,
 				CreatedAt:    variant.CreatedAt,
@@ -184,15 +186,20 @@ func (s *Server) GetExperiments(c *gin.Context) {
 			})
 		}
 
+		description := ""
+		if exp.Description != nil {
+			description = *exp.Description
+		}
+
 		responses = append(responses, ExperimentResponse{
 			Id:           exp.ID,
 			Name:         exp.Name,
-			Description:  exp.Description,
+			Description:  description,
 			Key:          exp.Key,
-			Status:       string(exp.Status),
+			Status:       exp.Status,
 			TrafficSplit: exp.TrafficSplit,
-			StartDate:    &exp.StartDate,
-			EndDate:      &exp.EndDate,
+			StartDate:    exp.StartDate,
+			EndDate:      exp.EndDate,
 			CreatedAt:    exp.CreatedAt,
 			UpdatedAt:    exp.UpdatedAt,
 			Variants:     variants,
@@ -203,32 +210,35 @@ func (s *Server) GetExperiments(c *gin.Context) {
 }
 
 func (s *Server) GetExperiment(c *gin.Context) {
-	experimentId := c.Param("id")
-	projectId, _ := c.Get("project_id")
-
-	experiment, err := s.client.Experiment.FindUnique(
-		db.Experiment.ID.Equals(experimentId),
-	).With(
-		db.Experiment.Variants.Fetch(),
-	).Exec(c.Request.Context())
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
+	var req GetExperimentRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if experiment.ProjectID != projectId.(string) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+	var experiment Experiment
+	if err := s.db.Preload("Variants").
+		Where("key = ? AND project_id = ?", req.ExperimentKey, req.ProjectID).
+		First(&experiment).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get experiment"})
 		return
 	}
 
 	var variants []VariantResponse
-	for _, variant := range experiment.Variants() {
+	for _, variant := range experiment.Variants {
+		description := ""
+		if variant.Description != nil {
+			description = *variant.Description
+		}
 		variants = append(variants, VariantResponse{
 			Id:           variant.ID,
 			Name:         variant.Name,
 			Key:          variant.Key,
-			Description:  variant.Description,
+			Description:  description,
 			IsControl:    variant.IsControl,
 			TrafficSplit: variant.TrafficSplit,
 			CreatedAt:    variant.CreatedAt,
@@ -236,15 +246,20 @@ func (s *Server) GetExperiment(c *gin.Context) {
 		})
 	}
 
+	description := ""
+	if experiment.Description != nil {
+		description = *experiment.Description
+	}
+
 	response := ExperimentResponse{
 		Id:           experiment.ID,
 		Name:         experiment.Name,
-		Description:  experiment.Description,
+		Description:  description,
 		Key:          experiment.Key,
-		Status:       string(experiment.Status),
+		Status:       experiment.Status,
 		TrafficSplit: experiment.TrafficSplit,
-		StartDate:    &experiment.StartDate,
-		EndDate:      &experiment.EndDate,
+		StartDate:    experiment.StartDate,
+		EndDate:      experiment.EndDate,
 		CreatedAt:    experiment.CreatedAt,
 		UpdatedAt:    experiment.UpdatedAt,
 		Variants:     variants,
@@ -254,109 +269,79 @@ func (s *Server) GetExperiment(c *gin.Context) {
 }
 
 func (s *Server) GetAssignment(c *gin.Context) {
-	var req GetExperimentRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var req GetAssignmentRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	experimentKey := c.Param("experimentKey")
-	projectId, _ := c.Get("project_id")
-
-	// Find experiment
-	experiment, err := s.client.Experiment.FindFirst(
-		db.Experiment.Key.Equals(experimentKey),
-		db.Experiment.Project.Where(db.Project.ID.Equals(projectId.(string))),
-		db.Experiment.Status.Equals(db.ExperimentStatusRUNNING),
-	).With(
-		db.Experiment.Variants.Fetch(),
-	).Exec(c.Request.Context())
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found or not running"})
+	if req.UserID == "" && req.AnonymousID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id or anonymous_id is required"})
 		return
 	}
 
-	// Check if user already has an assignment
-	var existingAssignment *db.ExperimentAssignmentModel
-	if req.UserId != "" {
-		assignment, err := s.client.ExperimentAssignment.FindUnique(
-			db.ExperimentAssignment.UserIDExperimentID(
-				db.ExperimentAssignment.UserID.Equals(req.UserId),
-				db.ExperimentAssignment.ExperimentID.Equals(experiment.ID),
-			),
-		).With(
-			db.ExperimentAssignment.Variant.Fetch(),
-		).Exec(c.Request.Context())
-		if err == nil {
-			existingAssignment = assignment
+	// Fetch experiment and variants
+	var experiment Experiment
+	if err := s.db.Preload("Variants").
+		Where("key = ? AND project_id = ? AND status = ?", req.ExperimentKey, req.ProjectID, "RUNNING").
+		First(&experiment).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
+			return
 		}
-	} else if req.AnonymousId != "" {
-		assignment, err := s.client.ExperimentAssignment.FindUnique(
-			db.ExperimentAssignment.AnonymousIDExperimentID(
-				db.ExperimentAssignment.AnonymousID.Equals(req.AnonymousId),
-				db.ExperimentAssignment.ExperimentID.Equals(experiment.ID),
-			),
-		).With(
-			db.ExperimentAssignment.Variant.Fetch(),
-		).Exec(c.Request.Context())
-		if err == nil {
-			existingAssignment = assignment
-		}
-	}
-
-	// Return existing assignment if found
-	if existingAssignment != nil {
-		variant := existingAssignment.Variant()
-		response := AssignmentResponse{
-			ExperimentId: existingAssignment.ExperimentID,
-			VariantId:    existingAssignment.VariantID,
-			VariantKey:   variant.Key,
-			VariantName:  variant.Name,
-			IsControl:    variant.IsControl,
-			AssignedAt:   existingAssignment.AssignedAt,
-		}
-		c.JSON(http.StatusOK, response)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get experiment"})
 		return
 	}
 
-	// Check if user should be included in experiment
-	userHash := md5.Sum([]byte(req.UserId + req.AnonymousId + experiment.ID))
-	hashFloat := float64(userHash[0]) / 255.0
+	// Check if user is already assigned
+	var assignment ExperimentAssignment
+	query := s.db.Where("experiment_id = ?", experiment.ID)
+	if req.UserID != "" {
+		query = query.Where("user_id = ?", req.UserID)
+	} else {
+		query = query.Where("anonymous_id = ?", req.AnonymousID)
+	}
 
-	if hashFloat > experiment.TrafficSplit {
-		// User not included in experiment
-		c.JSON(http.StatusOK, gin.H{"included": false})
+	err := query.First(&assignment).Error
+	if err == nil {
+		// Found existing assignment
+		var variant Variant
+		if err := s.db.Where("id = ?", assignment.VariantID).First(&variant).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get assigned variant"})
+			return
+		}
+		c.JSON(http.StatusOK, variant)
 		return
 	}
 
-	// Assign to variant based on traffic split
-	variants := experiment.Variants()
-	selectedVariant := s.selectVariant(variants, req.UserId+req.AnonymousId+experiment.ID)
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check for existing assignment"})
+		return
+	}
+
+	// Assign user to a variant
+	selectedVariant := assignVariant(req.UserID, req.AnonymousID, experiment.Variants)
 
 	// Create assignment
-	assignment, err := s.client.ExperimentAssignment.CreateOne(
-		db.ExperimentAssignment.UserID.Set(req.UserId),
-		db.ExperimentAssignment.AnonymousID.Set(req.AnonymousId),
-		db.ExperimentAssignment.Variant.Link(db.Variant.ID.Equals(selectedVariant.ID)),
-		db.ExperimentAssignment.Experiment.Link(db.Experiment.ID.Equals(experiment.ID)),
-	).Exec(c.Request.Context())
+	newAssignment := ExperimentAssignment{
+		ID:           uuid.New().String(),
+		ExperimentID: experiment.ID,
+		VariantID:    selectedVariant.ID,
+	}
 
-	if err != nil {
+	if req.UserID != "" {
+		newAssignment.UserID = &req.UserID
+	}
+	if req.AnonymousID != "" {
+		newAssignment.AnonymousID = &req.AnonymousID
+	}
+
+	if err := s.db.Create(&newAssignment).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create assignment"})
 		return
 	}
 
-	response := AssignmentResponse{
-		ExperimentId: assignment.ExperimentID,
-		VariantId:    assignment.VariantID,
-		VariantKey:   selectedVariant.Key,
-		VariantName:  selectedVariant.Name,
-		IsControl:    selectedVariant.IsControl,
-		AssignedAt:   assignment.AssignedAt,
-	}
-
-	c.JSON(http.StatusOK, response)
+	c.JSON(http.StatusOK, selectedVariant)
 }
 
 func (s *Server) TrackConversion(c *gin.Context) {
@@ -366,162 +351,113 @@ func (s *Server) TrackConversion(c *gin.Context) {
 		return
 	}
 
-	// Find user's assignment
-	var assignment *db.ExperimentAssignmentModel
+	if req.UserID == "" && req.AnonymousID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id or anonymous_id is required"})
+		return
+	}
+
+	// Find assignment
+	var assignment ExperimentAssignment
+	query := s.db.Where("experiment_id = ?", req.ExperimentID)
+	if req.UserID != "" {
+		query = query.Where("user_id = ?", req.UserID)
+	} else {
+		query = query.Where("anonymous_id = ?", req.AnonymousID)
+	}
+
+	if err := query.First(&assignment).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Assignment not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find assignment"})
+		return
+	}
+
+	// Marshal properties to JSON
+	var propertiesJSON []byte
 	var err error
-	if req.UserId != "" {
-		assignment, err = s.client.ExperimentAssignment.FindUnique(
-			db.ExperimentAssignment.UserIDExperimentID(
-				db.ExperimentAssignment.UserID.Equals(req.UserId),
-				db.ExperimentAssignment.ExperimentID.Equals(req.ExperimentId),
-			),
-		).Exec(c.Request.Context())
-	} else if req.AnonymousId != "" {
-		assignment, err = s.client.ExperimentAssignment.FindUnique(
-			db.ExperimentAssignment.AnonymousIDExperimentID(
-				db.ExperimentAssignment.AnonymousID.Equals(req.AnonymousId),
-				db.ExperimentAssignment.ExperimentID.Equals(req.ExperimentId),
-			),
-		).Exec(c.Request.Context())
-	}
-
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No assignment found for user"})
-		return
-	}
-
-	// Create conversion event
-	propertiesJson, _ := json.Marshal(req.Properties)
-	_, err = s.client.ConversionEvent.CreateOne(
-		db.ConversionEvent.Experiment.Link(db.Experiment.ID.Equals(req.ExperimentId)),
-		db.ConversionEvent.Variant.Link(db.Variant.ID.Equals(assignment.VariantID)),
-		db.ConversionEvent.UserID.Set(req.UserId),
-		db.ConversionEvent.AnonymousID.Set(req.AnonymousId),
-		db.ConversionEvent.EventName.Set(req.EventName),
-		db.ConversionEvent.EventValue.Set(req.EventValue),
-		db.ConversionEvent.Properties.Set(propertiesJson),
-	).Exec(c.Request.Context())
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to track conversion"})
-		return
-	}
-
-	// Mark assignment as converted if this is the first conversion
-	if !assignment.Converted {
-		now := time.Now()
-		_, err = s.client.ExperimentAssignment.FindUnique(
-			db.ExperimentAssignment.ID.Equals(assignment.ID),
-		).Update(
-			db.ExperimentAssignment.Converted.Set(true),
-			db.ExperimentAssignment.ConvertedAt.Set(now),
-		).Exec(c.Request.Context())
-
+	if req.Properties != nil {
+		propertiesJSON, err = json.Marshal(req.Properties)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update assignment"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid properties format"})
 			return
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "success"})
-}
+	// Create conversion event
+	conversionEvent := ConversionEvent{
+		ID:           uuid.New().String(),
+		EventName:    req.EventName,
+		EventValue:   req.Value,
+		ExperimentID: req.ExperimentID,
+		VariantID:    assignment.VariantID,
+		Properties:   propertiesJSON,
+	}
 
-func (s *Server) GetExperimentResults(c *gin.Context) {
-	experimentId := c.Param("id")
+	if req.UserID != "" {
+		conversionEvent.UserID = &req.UserID
+	}
+	if req.AnonymousID != "" {
+		conversionEvent.AnonymousID = &req.AnonymousID
+	}
 
-	// Get assignments grouped by variant
-	assignments, err := s.client.ExperimentAssignment.FindMany(
-		db.ExperimentAssignment.Experiment.Where(db.Experiment.ID.Equals(experimentId)),
-	).With(
-		db.ExperimentAssignment.Variant.Fetch(),
-	).Exec(c.Request.Context())
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch assignments"})
+	if err := s.db.Create(&conversionEvent).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to track conversion"})
 		return
 	}
 
-	// Get conversion events
-	conversions, err := s.client.ConversionEvent.FindMany(
-		db.ConversionEvent.ExperimentID.Equals(experimentId),
-	).Exec(c.Request.Context())
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
 
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch conversions"})
+func (s *Server) GetExperimentResults(c *gin.Context) {
+	experimentID := c.Param("id")
+
+	// Fetch conversions
+	var conversions []ConversionEvent
+	if err := s.db.Where("experiment_id = ?", experimentID).Find(&conversions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get conversions"})
 		return
 	}
 
 	// Calculate results
-	results := make(map[string]interface{})
-	variantStats := make(map[string]map[string]interface{})
-
-	// Initialize variant stats
-	for _, assignment := range assignments {
-		variantId := assignment.VariantID
-		variant := assignment.Variant()
-		if _, exists := variantStats[variantId]; !exists {
-			variantStats[variantId] = map[string]interface{}{
-				"variantId":      variantId,
-				"variantName":    variant.Name,
-				"variantKey":     variant.Key,
-				"isControl":      variant.IsControl,
-				"assignments":    0,
-				"conversions":    0,
-				"conversionRate": 0.0,
-				"totalValue":     0.0,
+	stats := make(map[string]map[string]interface{})
+	for _, conversion := range conversions {
+		variantID := conversion.VariantID
+		if _, ok := stats[variantID]; !ok {
+			stats[variantID] = map[string]interface{}{
+				"totalConversions": 0,
+				"totalValue":       0.0,
+				"uniqueUsers":      make(map[string]bool),
 			}
 		}
-		variantStats[variantId]["assignments"] = variantStats[variantId]["assignments"].(int) + 1
-	}
-
-	// Count conversions
-	for _, conversion := range conversions {
-		variantId := conversion.VariantID
-		if stats, exists := variantStats[variantId]; exists {
-			stats["conversions"] = stats["conversions"].(int) + 1
-			stats["totalValue"] = stats["totalValue"].(float64) + conversion.EventValue
+		stats[variantID]["totalConversions"] = stats[variantID]["totalConversions"].(int) + 1
+		if conversion.EventValue != nil {
+			stats[variantID]["totalValue"] = stats[variantID]["totalValue"].(float64) + *conversion.EventValue
+		}
+		if conversion.UserID != nil {
+			stats[variantID]["uniqueUsers"].(map[string]bool)[*conversion.UserID] = true
+		} else if conversion.AnonymousID != nil {
+			stats[variantID]["uniqueUsers"].(map[string]bool)[*conversion.AnonymousID] = true
 		}
 	}
 
-	// Calculate conversion rates
-	for _, stats := range variantStats {
-		assignments := stats["assignments"].(int)
-		conversions := stats["conversions"].(int)
-		if assignments > 0 {
-			stats["conversionRate"] = float64(conversions) / float64(assignments)
-		}
+	// Format results
+	var results []gin.H
+	for variantID, data := range stats {
+		results = append(results, gin.H{
+			"variantId":        variantID,
+			"totalConversions": data["totalConversions"],
+			"totalValue":       data["totalValue"],
+			"uniqueUsers":      len(data["uniqueUsers"].(map[string]bool)),
+		})
 	}
-
-	results["variants"] = variantStats
-	results["totalAssignments"] = len(assignments)
-	results["totalConversions"] = len(conversions)
 
 	c.JSON(http.StatusOK, results)
 }
 
-// Helper function to select variant based on traffic split
-func (s *Server) selectVariant(variants []db.VariantModel, seed string) db.VariantModel {
-	// Create deterministic random based on seed
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	hash := md5.Sum([]byte(seed))
-	r.Seed(int64(hash[0])<<24 | int64(hash[1])<<16 | int64(hash[2])<<8 | int64(hash[3]))
-
-	random := r.Float64()
-	cumulative := 0.0
-
-	for _, variant := range variants {
-		cumulative += variant.TrafficSplit
-		if random <= cumulative {
-			return variant
-		}
-	}
-
-	// Fallback to last variant
-	return variants[len(variants)-1]
-}
-
 func (s *Server) UpdateExperimentStatus(c *gin.Context) {
-	experimentId := c.Param("id")
+	experimentID := c.Param("id")
 	newStatus := c.PostForm("status")
 
 	// Validate status
@@ -539,16 +475,70 @@ func (s *Server) UpdateExperimentStatus(c *gin.Context) {
 	}
 
 	// Update experiment status
-	_, err := s.client.Experiment.FindUnique(
-		db.Experiment.ID.Equals(experimentId),
-	).Update(
-		db.Experiment.Status.Set(db.ExperimentStatus(newStatus)),
-	).Exec(c.Request.Context())
-
-	if err != nil {
+	if err := s.db.Model(&Experiment{}).Where("id = ?", experimentID).Update("status", newStatus).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update experiment status"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
+}
+
+func assignVariant(userID, anonymousID string, variants []Variant) Variant {
+	if len(variants) == 0 {
+		return Variant{}
+	}
+
+	identifier := userID
+	if identifier == "" {
+		identifier = anonymousID
+	}
+
+	// Simple hash-based assignment
+	hash := sha1.New()
+	hash.Write([]byte(identifier))
+	hashBytes := hash.Sum(nil)
+	hashString := hex.EncodeToString(hashBytes)
+
+	// Use the first 8 characters of the hash as a number
+	hashValue := int64(0)
+	for i := 0; i < 8 && i < len(hashString); i++ {
+		hashValue = hashValue*16 + int64(hexCharToInt(rune(hashString[i])))
+	}
+
+	// Calculate cumulative traffic split
+	totalSplit := 0.0
+	for _, v := range variants {
+		totalSplit += v.TrafficSplit
+	}
+
+	// Normalize hash value to 0-1 range
+	roll := float64(hashValue%10000) / 10000.0
+	if totalSplit > 0 {
+		roll = roll * totalSplit
+	}
+
+	// Select variant based on roll
+	cumulativeSplit := 0.0
+	for _, v := range variants {
+		cumulativeSplit += v.TrafficSplit
+		if roll < cumulativeSplit {
+			return v
+		}
+	}
+
+	// Fallback to last variant
+	return variants[len(variants)-1]
+}
+
+func hexCharToInt(c rune) int {
+	if c >= '0' && c <= '9' {
+		return int(c - '0')
+	}
+	if c >= 'a' && c <= 'f' {
+		return int(c - 'a' + 10)
+	}
+	if c >= 'A' && c <= 'F' {
+		return int(c - 'A' + 10)
+	}
+	return 0
 }

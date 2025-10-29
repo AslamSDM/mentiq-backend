@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -10,7 +9,8 @@ import (
 	"os"
 	"time"
 
-	"mentiq-backend/prisma/db"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type TestAccount struct {
@@ -33,18 +33,17 @@ type TestEvent struct {
 	Timestamp  time.Time              `json:"timestamp,omitempty"`
 }
 
-
-
-func createTestAccount(dbClient *db.PrismaClient) (*TestAccount, error) {
+func createTestAccount(dbConn *gorm.DB) (*TestAccount, error) {
 	timestamp := time.Now().Unix()
-	
-	account, err := dbClient.Account.CreateOne(
-		db.Account.Name.Set(fmt.Sprintf("Test Account %d", timestamp)),
-		db.Account.Email.Set(fmt.Sprintf("test-%d@analytics.com", timestamp)),
-		db.Account.Password.Set("test-password"),
-	).Exec(context.Background())
 
-	if err != nil {
+	account := &Account{
+		ID:       uuid.New().String(),
+		Name:     fmt.Sprintf("Test Account %d", timestamp),
+		Email:    fmt.Sprintf("test-%d@analytics.com", timestamp),
+		Password: "test-password",
+	}
+
+	if err := dbConn.Create(account).Error; err != nil {
 		return nil, err
 	}
 
@@ -55,15 +54,16 @@ func createTestAccount(dbClient *db.PrismaClient) (*TestAccount, error) {
 	}, nil
 }
 
-func createTestProject(dbClient *db.PrismaClient, accountID string) (*TestProject, error) {
+func createTestProject(dbConn *gorm.DB, accountID string) (*TestProject, error) {
 	timestamp := time.Now().Unix()
-	
-	project, err := dbClient.Project.CreateOne(
-		db.Project.Name.Set(fmt.Sprintf("Test Project %d", timestamp)),
-		db.Project.Account.Link(db.Account.ID.Equals(accountID)),
-	).Exec(context.Background())
 
-	if err != nil {
+	project := &Project{
+		ID:        uuid.New().String(),
+		Name:      fmt.Sprintf("Test Project %d", timestamp),
+		AccountID: accountID,
+	}
+
+	if err := dbConn.Create(project).Error; err != nil {
 		return nil, err
 	}
 
@@ -76,41 +76,41 @@ func createTestProject(dbClient *db.PrismaClient, accountID string) (*TestProjec
 
 func generateTestEvents(accountID, projectID string) error {
 	baseURL := getServerURL()
-	
+
 	// Define test users
 	users := []string{"user1", "user2", "user3", "user4", "user5"}
 	sessions := []string{"session1", "session2", "session3", "session4", "session5"}
 	pages := []string{"/", "/home", "/about", "/products", "/contact", "/pricing", "/features"}
-	
+
 	// Generate events for the last 30 days
 	now := time.Now()
 	events := make([]TestEvent, 0)
-	
+
 	for days := 30; days >= 0; days-- {
 		eventDate := now.AddDate(0, 0, -days)
-		
+
 		// Generate 10-50 events per day
 		eventsPerDay := rand.Intn(40) + 10
-		
+
 		for i := 0; i < eventsPerDay; i++ {
 			user := users[rand.Intn(len(users))]
 			session := sessions[rand.Intn(len(sessions))]
-			
+
 			// Random time during the day
 			eventTime := eventDate.Add(time.Duration(rand.Intn(24)) * time.Hour).
 				Add(time.Duration(rand.Intn(60)) * time.Minute)
-			
+
 			// Generate different types of events
 			eventTypes := []string{"page_view", "click", "form_submit", "purchase", "signup"}
 			eventType := eventTypes[rand.Intn(len(eventTypes))]
-			
+
 			event := TestEvent{
 				EventType: eventType,
 				UserID:    user,
 				SessionID: session,
 				Timestamp: eventTime,
 			}
-			
+
 			// Add properties based on event type
 			switch eventType {
 			case "page_view":
@@ -136,8 +136,8 @@ func generateTestEvents(accountID, projectID string) error {
 			case "purchase":
 				products := []string{"pro-plan", "enterprise-plan", "basic-plan"}
 				event.Properties = map[string]interface{}{
-					"product": products[rand.Intn(len(products))],
-					"amount":  rand.Intn(1000) + 10,
+					"product":  products[rand.Intn(len(products))],
+					"amount":   rand.Intn(1000) + 10,
 					"currency": "USD",
 				}
 			case "signup":
@@ -146,13 +146,13 @@ func generateTestEvents(accountID, projectID string) error {
 					"source": "organic",
 				}
 			}
-			
+
 			events = append(events, event)
 		}
 	}
-	
+
 	fmt.Printf("Generated %d test events\n", len(events))
-	
+
 	// Send events in batches
 	batchSize := 50
 	for i := 0; i < len(events); i += batchSize {
@@ -160,55 +160,55 @@ func generateTestEvents(accountID, projectID string) error {
 		if end > len(events) {
 			end = len(events)
 		}
-		
+
 		batch := events[i:end]
 		if err := sendEventBatch(baseURL, accountID, projectID, batch); err != nil {
 			return fmt.Errorf("failed to send batch %d: %v", i/batchSize, err)
 		}
-		
-		fmt.Printf("✅ Sent batch %d/%d (%d events)\n", 
-			(i/batchSize)+1, 
-			(len(events)+batchSize-1)/batchSize, 
+
+		fmt.Printf("✅ Sent batch %d/%d (%d events)\n",
+			(i/batchSize)+1,
+			(len(events)+batchSize-1)/batchSize,
 			len(batch))
 	}
-	
+
 	return nil
 }
 
 func sendEventBatch(baseURL, accountID, projectID string, events []TestEvent) error {
 	url := fmt.Sprintf("%s/api/v1/events/batch", baseURL)
-	
+
 	jsonData, err := json.Marshal(events)
 	if err != nil {
 		return err
 	}
-	
+
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
-	
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("ApiKey %s", accountID))
 	req.Header.Set("X-Project-ID", projectID)
-	
+
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("batch request failed with status: %d", resp.StatusCode)
 	}
-	
+
 	return nil
 }
 
 func testAnalyticsEndpoints(accountID, projectID string) error {
 	baseURL := getServerURL()
-	
+
 	tests := []struct {
 		name     string
 		endpoint string
@@ -224,38 +224,38 @@ func testAnalyticsEndpoints(accountID, projectID string) error {
 		{"Real-time", "/api/v1/realtime", "GET"},
 		{"Flush Cache", "/api/v1/flush-cache", "POST"},
 	}
-	
+
 	for _, test := range tests {
 		fmt.Printf("🔍 Testing %s...\n", test.name)
-		
+
 		url := fmt.Sprintf("%s%s", baseURL, test.endpoint)
 		req, err := http.NewRequest(test.method, url, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create request for %s: %v", test.name, err)
 		}
-		
+
 		// Add auth headers for protected endpoints
 		if test.endpoint != "/health" {
 			req.Header.Set("Authorization", fmt.Sprintf("ApiKey %s", accountID))
 			req.Header.Set("X-Project-ID", projectID)
 		}
-		
+
 		client := &http.Client{Timeout: 30 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed for %s: %v", test.name, err)
 		}
 		defer resp.Body.Close()
-		
+
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("%s failed with status: %d", test.name, resp.StatusCode)
 		}
-		
+
 		// Parse and display some results
 		var result map[string]interface{}
 		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
 			fmt.Printf("   ✅ %s - Status: %d\n", test.name, resp.StatusCode)
-			
+
 			// Show some key metrics
 			if test.name == "Dashboard" {
 				if overview, ok := result["overview"].(map[string]interface{}); ok {
@@ -263,7 +263,7 @@ func testAnalyticsEndpoints(accountID, projectID string) error {
 					fmt.Printf("      👥 Users today: %.0f\n", overview["unique_users_today"])
 				}
 				if userMetrics, ok := result["user_metrics"].(map[string]interface{}); ok {
-					fmt.Printf("      📈 DAU: %.0f, WAU: %.0f, MAU: %.0f\n", 
+					fmt.Printf("      📈 DAU: %.0f, WAU: %.0f, MAU: %.0f\n",
 						userMetrics["dau"], userMetrics["wau"], userMetrics["mau"])
 				}
 			}
@@ -271,27 +271,21 @@ func testAnalyticsEndpoints(accountID, projectID string) error {
 			fmt.Printf("   ✅ %s - Status: %d\n", test.name, resp.StatusCode)
 		}
 	}
-	
+
 	return nil
 }
 
-func cleanup(dbClient *db.PrismaClient, accountID, projectID string) error {
+func cleanup(dbConn *gorm.DB, accountID, projectID string) error {
 	// Delete project
-	_, err := dbClient.Project.FindMany(
-		db.Project.ID.Equals(projectID),
-	).Delete().Exec(context.Background())
-	if err != nil {
+	if err := dbConn.Where("id = ?", projectID).Delete(&Project{}).Error; err != nil {
 		return fmt.Errorf("failed to delete project: %v", err)
 	}
-	
+
 	// Delete account
-	_, err = dbClient.Account.FindMany(
-		db.Account.ID.Equals(accountID),
-	).Delete().Exec(context.Background())
-	if err != nil {
+	if err := dbConn.Where("id = ?", accountID).Delete(&Account{}).Error; err != nil {
 		return fmt.Errorf("failed to delete account: %v", err)
 	}
-	
+
 	fmt.Printf("✅ Cleaned up test account and project\n")
 	return nil
 }

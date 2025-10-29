@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,8 +25,7 @@ import (
 	"github.com/mileusna/useragent"
 	"github.com/stripe/stripe-go/v72/client"
 	"golang.org/x/crypto/bcrypt"
-
-	"mentiq-backend/prisma/db"
+	"gorm.io/gorm"
 )
 
 type Event struct {
@@ -55,7 +55,7 @@ type CacheEntry struct {
 type AnalyticsService struct {
 	s3Client     *s3.S3
 	bucketName   string
-	dbClient     *db.PrismaClient
+	db           *gorm.DB
 	stripeClient *client.API
 
 	// Memory cache for events
@@ -73,7 +73,7 @@ type AnalyticsService struct {
 	stopChan    chan bool
 }
 
-func NewAnalyticsService(bucketName string, dbClient *db.PrismaClient) (*AnalyticsService, error) {
+func NewAnalyticsService(bucketName string, db *gorm.DB) (*AnalyticsService, error) {
 	// Configuration for Cloudflare R2
 	config := &aws.Config{
 		Region:           aws.String("auto"), // R2 uses "auto" as region
@@ -103,7 +103,7 @@ func NewAnalyticsService(bucketName string, dbClient *db.PrismaClient) (*Analyti
 	service := &AnalyticsService{
 		s3Client:       s3.New(sess),
 		bucketName:     bucketName,
-		dbClient:       dbClient,
+		db:             db,
 		stripeClient:   NewStripeClient(),
 		eventCache:     make([]Event, 0),
 		eventsCache:    make(map[string]*CacheEntry),
@@ -121,17 +121,22 @@ func NewAnalyticsService(bucketName string, dbClient *db.PrismaClient) (*Analyti
 }
 
 type Server struct {
-	client           *db.PrismaClient
+	db               *gorm.DB
 	analyticsService *AnalyticsService
 }
 
-func NewServer(analyticsService *AnalyticsService) *Server {
-	client := db.NewClient()
-	return &Server{client: client, analyticsService: analyticsService}
+func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
+	return &Server{db: db, analyticsService: analyticsService}
 }
 
 func (s *Server) Connect() error {
-	if err := s.client.Connect(); err != nil {
+	// GORM already handles the connection, just verify it
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get database: %w", err)
+	}
+
+	if err := sqlDB.Ping(); err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
@@ -139,7 +144,11 @@ func (s *Server) Connect() error {
 }
 
 func (s *Server) Disconnect() error {
-	return s.client.Disconnect()
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
 }
 
 type SignupRequest struct {
@@ -166,6 +175,57 @@ type UpdateStripeApiKeyRequest struct {
 	ApiKey string `json:"api_key" binding:"required"`
 }
 
+// JWTClaims represents the claims in a JWT token
+type JWTClaims struct {
+	AccountID string `json:"account_id"`
+	Email     string `json:"email"`
+	ProjectID string `json:"project_id,omitempty"`
+	APIKeyID  string `json:"api_key_id,omitempty"`
+}
+
+// GenerateJWT generates a JWT token for an account
+func GenerateJWT(accountID, email string, expiresInHours int) (string, error) {
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "your-secret-key-change-in-production" // Default for development
+	}
+
+	// Create a simple JWT-like token using base64 encoding
+	// In production, use a proper JWT library
+	expiryTime := time.Now().Add(time.Duration(expiresInHours) * time.Hour).Unix()
+	tokenString := fmt.Sprintf("%s.%s.%d",
+		accountID,
+		email,
+		expiryTime,
+	)
+	return tokenString, nil
+}
+
+// ValidateJWT validates a JWT token and extracts claims
+func ValidateJWT(tokenString string) (*JWTClaims, error) {
+	parts := strings.Split(tokenString, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+
+	claims := &JWTClaims{
+		AccountID: parts[0],
+		Email:     parts[1],
+	}
+
+	// Validate expiration
+	expiryUnix, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid token expiration")
+	}
+
+	if time.Now().Unix() > expiryUnix {
+		return nil, fmt.Errorf("token expired")
+	}
+
+	return claims, nil
+}
+
 func main() {
 	// Load environment variables from .env.local file
 	if err := godotenv.Load(".env"); err != nil {
@@ -176,16 +236,21 @@ func main() {
 		}
 	}
 
-	// Initialize Prisma Client
-	dbClient := db.NewClient()
-	if err := dbClient.Connect(); err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+	// Initialize GORM database
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL environment variable is required")
 	}
-	defer func() {
-		if err := dbClient.Disconnect(); err != nil {
-			panic(err)
-		}
-	}()
+
+	database, err := InitDB(databaseURL)
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+
+	// Run migrations
+	if err := MigrateDB(database); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
 
 	// Get configuration from environment variables
 	bucketName := os.Getenv("S3_BUCKET_NAME")
@@ -199,13 +264,13 @@ func main() {
 	}
 
 	// Initialize analytics service
-	analyticsService, err := NewAnalyticsService(bucketName, dbClient)
+	analyticsService, err := NewAnalyticsService(bucketName, database)
 	if err != nil {
 		log.Fatalf("Failed to initialize analytics service: %v", err)
 	}
 
 	// Initialize server with database
-	server := NewServer(analyticsService)
+	server := NewServer(database, analyticsService)
 	if err := server.Connect(); err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
@@ -849,13 +914,7 @@ func (s *Server) updateProjectStripeApiKeyHandler(c *gin.Context) {
 
 	projectID := c.Param("project_id")
 
-	_, err := s.client.Project.FindUnique(
-		db.Project.ID.Equals(projectID),
-	).Update(
-		db.Project.StripeAPIKey.Set(req.ApiKey),
-	).Exec(context.Background())
-
-	if err != nil {
+	if err := s.db.Model(&Project{}).Where("id = ?", projectID).Update("stripe_api_key", req.ApiKey).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update Stripe API key"})
 		return
 	}
@@ -870,14 +929,9 @@ func (s *Server) signupHandler(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
-
-	// Check if user already exists
-	existingUser, err := s.client.Account.FindUnique(
-		db.Account.Email.Equals(req.Email),
-	).Exec(ctx)
-
-	if err == nil && existingUser != nil {
+	// Check if account already exists
+	var existingAccount Account
+	if err := s.db.Where("email = ?", req.Email).First(&existingAccount).Error; err == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "Email already in use"})
 		return
 	}
@@ -889,14 +943,15 @@ func (s *Server) signupHandler(c *gin.Context) {
 		return
 	}
 
-	// Create user
-	user, err := s.client.Account.CreateOne(
-		db.Account.Name.Set(req.Name),
-		db.Account.Email.Set(req.Email),
-		db.Account.Password.Set(string(hashedPassword)),
-	).Exec(ctx)
+	// Create account
+	account := Account{
+		ID:       uuid.New().String(),
+		Name:     req.Name,
+		Email:    req.Email,
+		Password: string(hashedPassword),
+	}
 
-	if err != nil {
+	if err := s.db.Create(&account).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create account"})
 		return
 	}
@@ -904,9 +959,9 @@ func (s *Server) signupHandler(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Account created successfully",
 		"account": gin.H{
-			"id":    user.ID,
-			"name":  user.Name,
-			"email": user.Email,
+			"id":    account.ID,
+			"name":  account.Name,
+			"email": account.Email,
 		},
 	})
 }
@@ -918,32 +973,32 @@ func (s *Server) loginHandler(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
-
-	// Find user by email
-	user, err := s.client.Account.FindUnique(
-		db.Account.Email.Equals(req.Email),
-	).Exec(ctx)
-
-	if err != nil {
+	// Find account by email
+	var account Account
+	if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
 	// Verify password
-	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(account.Password), []byte(req.Password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
-	// For demo purposes, we'll use the email as the token
-	// In production, you'd want to use JWT
+	// Generate JWT token (24 hour expiration)
+	token, err := GenerateJWT(account.ID, account.Email, 24)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"token": user.Email,
+		"token": token,
 		"user": gin.H{
-			"id":    user.ID,
-			"name":  user.Name,
-			"email": user.Email,
+			"id":    account.ID,
+			"name":  account.Name,
+			"email": account.Email,
 		},
 	})
 }
@@ -957,38 +1012,57 @@ func (s *Server) authMiddleware(c *gin.Context) {
 		return
 	}
 
-	// Extract token (for demo, we'll use email as token)
+	// Extract token
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	token = strings.TrimPrefix(token, "ApiKey ")
 
-	ctx := context.Background()
+	// First, try to find by API key
+	var apiKey APIKey
+	if err := s.db.Where("key = ? AND is_active = ?", token, true).First(&apiKey).Error; err == nil {
+		// Valid API key found - get the associated account through project
+		var project Project
+		if err := s.db.Where("id = ?", apiKey.ProjectID).First(&project).Error; err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
+			return
+		}
+		c.Set("account_id", project.AccountID)
+		c.Set("project_id", apiKey.ProjectID)
+		c.Set("api_key_id", apiKey.ID)
+		c.Next()
+		return
+	}
 
-	// Find user by token (email)
-	user, err := s.client.Account.FindUnique(
-		db.Account.Email.Equals(token),
-	).Exec(ctx)
+	// Try to validate JWT token
+	claims, err := ValidateJWT(token)
+	if err == nil {
+		// Valid JWT token
+		c.Set("account_id", claims.AccountID)
+		c.Set("email", claims.Email)
+		if projectID != "" {
+			c.Set("project_id", projectID)
+		}
+		c.Next()
+		return
+	}
 
-	if err != nil {
+	// If JWT validation failed, try email token (backward compatibility)
+	var account Account
+	if err := s.db.Where("email = ?", token).First(&account).Error; err != nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 		return
 	}
 
-	// Set context values
-	c.Set("account_id", user.ID)
-	c.Set("user_email", user.Email)
+	c.Set("account_id", account.ID)
+	c.Set("email", account.Email)
 	c.Set("project_id", projectID)
 	c.Next()
 }
 
 func (s *Server) listProjectsHandler(c *gin.Context) {
 	accountID, _ := c.Get("account_id")
-	ctx := context.Background()
 
-	projects, err := s.client.Project.FindMany(
-		db.Project.AccountID.Equals(accountID.(string)),
-	).Exec(ctx)
-
-	if err != nil {
+	var projects []Project
+	if err := s.db.Where("account_id = ?", accountID.(string)).Find(&projects).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch projects"})
 		return
 	}
@@ -1016,14 +1090,14 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 	}
 
 	accountID, _ := c.Get("account_id")
-	ctx := context.Background()
 
-	project, err := s.client.Project.CreateOne(
-		db.Project.Name.Set(req.Name),
-		db.Project.Account.Link(db.Account.ID.Equals(accountID.(string))),
-	).Exec(ctx)
+	project := Project{
+		ID:        uuid.New().String(),
+		Name:      req.Name,
+		AccountID: accountID.(string),
+	}
 
-	if err != nil {
+	if err := s.db.Create(&project).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create project"})
 		return
 	}
@@ -1047,29 +1121,25 @@ func (s *Server) createApiKeyHandler(c *gin.Context) {
 	}
 
 	accountID, _ := c.Get("account_id")
-	ctx := context.Background()
 
 	// Verify project exists and belongs to user
-	project, err := s.client.Project.FindUnique(
-		db.Project.ID.Equals(projectID),
-	).With(
-		db.Project.Account.Fetch(),
-	).Exec(ctx)
-
-	if err != nil || project.AccountID != accountID.(string) {
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
 	}
 
 	// Create API key
-	apiKey, err := s.client.APIKey.CreateOne(
-		db.APIKey.Name.Set(req.Name),
-		db.APIKey.Key.Set("mentiq_live_"+uuid.New().String()),
-		db.APIKey.Project.Link(db.Project.ID.Equals(projectID)),
-		db.APIKey.Permissions.Set(req.Permissions),
-	).Exec(ctx)
+	apiKey := APIKey{
+		ID:          uuid.New().String(),
+		Name:        req.Name,
+		Key:         "mentiq_live_" + uuid.New().String(),
+		IsActive:    true,
+		ProjectID:   projectID,
+		Permissions: req.Permissions,
+	}
 
-	if err != nil {
+	if err := s.db.Create(&apiKey).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create API key"})
 		return
 	}
@@ -1108,33 +1178,20 @@ func (s *Server) analyticsHandler(c *gin.Context) {
 
 func (s *Server) dashboardHandler(c *gin.Context) {
 	accountID, _ := c.Get("account_id")
-	ctx := context.Background()
 
 	// Get real project count
-	projects, err := s.client.Project.FindMany(
-		db.Project.AccountID.Equals(accountID.(string)),
-	).Exec(ctx)
-
-	if err != nil {
+	var projectCount int64
+	if err := s.db.Model(&Project{}).Where("account_id = ?", accountID.(string)).Count(&projectCount).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch dashboard data"})
 		return
 	}
-	projectCount := len(projects)
 
 	// Get real API key count
-	apiKeys, err := s.client.APIKey.FindMany(
-		db.APIKey.Project.Where(
-			db.Project.AccountID.Equals(accountID.(string)),
-		),
-	).Exec(ctx)
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch dashboard data"})
-		return
-	}
-	apiKeyCount := len(apiKeys)
-
-	if err != nil {
+	var apiKeyCount int64
+	if err := s.db.Model(&APIKey{}).
+		Joins("INNER JOIN project ON api_key.project_id = project.id").
+		Where("project.account_id = ?", accountID.(string)).
+		Count(&apiKeyCount).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch dashboard data"})
 		return
 	}

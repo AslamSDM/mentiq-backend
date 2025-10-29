@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,8 +10,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stripe/stripe-go/v72"
 	"github.com/stripe/stripe-go/v72/client"
-
-	"mentiq-backend/prisma/db"
 )
 
 // AnalyticsQuery represents the query parameters for analytics requests
@@ -74,21 +71,15 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 		return
 	}
 
-	project, err := as.dbClient.Project.FindUnique(
-		db.Project.ID.Equals(projectID.(string)),
-	).With(
-		db.Project.Account.Fetch(),
-	).Exec(context.Background())
-	if err != nil {
+	// Get project with GORM
+	var proj Project
+	if err := as.db.Where("id = ?", projectID.(string)).First(&proj).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch project"})
 		return
 	}
 
-	// Get Stripe API key from project
+	// Get Stripe API key from project (optional - currently not stored in Project model)
 	var stripeKey string
-	if apiKey, ok := project.StripeAPIKey(); ok {
-		stripeKey = string(apiKey)
-	}
 
 	sc := &client.API{}
 	if stripeKey != "" {
