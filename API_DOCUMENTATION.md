@@ -10,8 +10,9 @@ Complete API reference for the Mentiq Analytics Platform. This documentation cov
 4. [Project Management](#project-management)
 5. [API Key Management](#api-key-management)
 6. [Analytics Endpoints](#analytics-endpoints)
-7. [A/B Testing Endpoints](#ab-testing-endpoints)
-8. [Error Handling](#error-handling)
+7. [Session Recording](#session-recording)
+8. [A/B Testing Endpoints](#ab-testing-endpoints)
+9. [Error Handling](#error-handling)
 
 ---
 
@@ -22,6 +23,7 @@ All protected endpoints (except `/health`, `/signup`, `/login`) require authenti
 ### Authentication Methods
 
 #### 1. JWT Token (Recommended)
+
 Obtained from the `/login` endpoint. Valid for 24 hours.
 
 ```bash
@@ -32,6 +34,7 @@ curl -X GET http://localhost:8080/api/v1/projects \
 **Token Format:** `accountID.email.expiryUnixTimestamp`
 
 #### 2. API Key
+
 Generated from the `/api/v1/projects/:project_id/apikeys` endpoint. Use for event ingestion.
 
 ```bash
@@ -41,17 +44,18 @@ curl -X POST http://localhost:8080/api/v1/events \
 
 ### Required Headers
 
-| Header | Description | Required |
-|--------|-------------|----------|
-| `Authorization` | Bearer token (JWT or API Key) | Yes (all protected routes) |
-| `X-Project-ID` | Project ID (for multi-project contexts) | For analytics endpoints |
-| `Content-Type` | `application/json` | For POST/PUT requests |
+| Header          | Description                             | Required                   |
+| --------------- | --------------------------------------- | -------------------------- |
+| `Authorization` | Bearer token (JWT or API Key)           | Yes (all protected routes) |
+| `X-Project-ID`  | Project ID (for multi-project contexts) | For analytics endpoints    |
+| `Content-Type`  | `application/json`                      | For POST/PUT requests      |
 
 ---
 
 ## Public Endpoints
 
 ### Health Check
+
 Check if the server is running.
 
 ```
@@ -59,6 +63,7 @@ GET /health
 ```
 
 **Response:**
+
 ```json
 {
   "status": "healthy",
@@ -74,6 +79,7 @@ GET /health
 ## Authentication Endpoints
 
 ### Sign Up
+
 Create a new user account.
 
 ```
@@ -82,6 +88,7 @@ Content-Type: application/json
 ```
 
 **Request Body:**
+
 ```json
 {
   "name": "John Doe",
@@ -91,11 +98,13 @@ Content-Type: application/json
 ```
 
 **Validation Rules:**
+
 - `name`: Required, non-empty string
 - `email`: Required, valid email format
 - `password`: Required, minimum 8 characters
 
 **Response (201 Created):**
+
 ```json
 {
   "message": "Account created successfully",
@@ -108,6 +117,7 @@ Content-Type: application/json
 ```
 
 **Error Response (409 Conflict):**
+
 ```json
 {
   "error": "Email already in use"
@@ -115,6 +125,7 @@ Content-Type: application/json
 ```
 
 **Error Response (400 Bad Request):**
+
 ```json
 {
   "error": "Invalid query parameters"
@@ -124,6 +135,7 @@ Content-Type: application/json
 ---
 
 ### Login
+
 Authenticate and obtain a JWT token.
 
 ```
@@ -132,6 +144,7 @@ Content-Type: application/json
 ```
 
 **Request Body:**
+
 ```json
 {
   "email": "john@example.com",
@@ -140,6 +153,7 @@ Content-Type: application/json
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "token": "550e8400-e29b-41d4-a716-446655440000.john@example.com.1730000000",
@@ -154,6 +168,7 @@ Content-Type: application/json
 **Token Expiration:** 24 hours
 
 **Error Response (401 Unauthorized):**
+
 ```json
 {
   "error": "Invalid credentials"
@@ -167,6 +182,7 @@ Content-Type: application/json
 All project endpoints require JWT authentication.
 
 ### Create Project
+
 Create a new analytics project.
 
 ```
@@ -176,6 +192,7 @@ Content-Type: application/json
 ```
 
 **Request Body:**
+
 ```json
 {
   "name": "My Analytics Project"
@@ -183,6 +200,7 @@ Content-Type: application/json
 ```
 
 **Response (201 Created):**
+
 ```json
 {
   "id": "proj_550e8400e29b41d4",
@@ -194,6 +212,7 @@ Content-Type: application/json
 ```
 
 **Error Response (400 Bad Request):**
+
 ```json
 {
   "error": "name is required"
@@ -203,6 +222,7 @@ Content-Type: application/json
 ---
 
 ### List Projects
+
 Get all projects for the current account.
 
 ```
@@ -211,6 +231,7 @@ Authorization: Bearer <JWT_TOKEN>
 ```
 
 **Response (200 OK):**
+
 ```json
 [
   {
@@ -233,6 +254,7 @@ Authorization: Bearer <JWT_TOKEN>
 ---
 
 ### Update Stripe API Key
+
 Store a Stripe API key for a project (used for revenue metrics).
 
 ```
@@ -242,9 +264,11 @@ Content-Type: application/json
 ```
 
 **Path Parameters:**
+
 - `project_id`: The project ID
 
 **Request Body:**
+
 ```json
 {
   "api_key": "sk_live_51234567890abcdef"
@@ -252,6 +276,7 @@ Content-Type: application/json
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "message": "Stripe API key updated successfully"
@@ -263,6 +288,7 @@ Content-Type: application/json
 ## API Key Management
 
 ### Create API Key
+
 Generate a new API key for a project (used for event ingestion and integrations).
 
 ```
@@ -272,9 +298,11 @@ Content-Type: application/json
 ```
 
 **Path Parameters:**
+
 - `project_id`: The project ID
 
 **Request Body:**
+
 ```json
 {
   "name": "Production API Key",
@@ -283,6 +311,7 @@ Content-Type: application/json
 ```
 
 **Response (201 Created):**
+
 ```json
 {
   "id": "key_550e8400e29b41d4",
@@ -298,6 +327,7 @@ Content-Type: application/json
 **Important:** Store the `key` value securely. You won't be able to retrieve it again.
 
 **Error Response (404 Not Found):**
+
 ```json
 {
   "error": "Project not found"
@@ -311,6 +341,7 @@ Content-Type: application/json
 All analytics endpoints require authentication and the `X-Project-ID` header.
 
 ### Get Analytics
+
 Retrieve aggregated analytics metrics for a project.
 
 ```
@@ -321,19 +352,20 @@ X-Project-ID: <PROJECT_ID>
 
 **Query Parameters:**
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `start_date` | string | 7 days ago | Start date (YYYY-MM-DD) |
-| `end_date` | string | Today | End date (YYYY-MM-DD) |
-| `event_type` | string | - | Filter by event type |
-| `user_id` | string | - | Filter by user ID |
-| `session_id` | string | - | Filter by session ID |
-| `metrics` | array | all | Comma-separated list of metrics |
-| `group_by` | string | day | Grouping: hour, day, week, month |
-| `limit` | integer | 100 | Result limit |
-| `offset` | integer | 0 | Result offset |
+| Parameter    | Type    | Default    | Description                      |
+| ------------ | ------- | ---------- | -------------------------------- |
+| `start_date` | string  | 7 days ago | Start date (YYYY-MM-DD)          |
+| `end_date`   | string  | Today      | End date (YYYY-MM-DD)            |
+| `event_type` | string  | -          | Filter by event type             |
+| `user_id`    | string  | -          | Filter by user ID                |
+| `session_id` | string  | -          | Filter by session ID             |
+| `metrics`    | array   | all        | Comma-separated list of metrics  |
+| `group_by`   | string  | day        | Grouping: hour, day, week, month |
+| `limit`      | integer | 100        | Result limit                     |
+| `offset`     | integer | 0          | Result offset                    |
 
 **Available Metrics:**
+
 - `total_events` - Total number of events
 - `unique_users` - Number of unique users
 - `top_events` - Most common event types
@@ -357,6 +389,7 @@ X-Project-ID: <PROJECT_ID>
 - `arpu` - Average Revenue Per User (Stripe)
 
 **Response (200 OK):**
+
 ```json
 {
   "query": {
@@ -416,6 +449,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Dashboard
+
 Get dashboard summary data for quick insights.
 
 ```
@@ -425,9 +459,11 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Query Parameters:**
+
 - `date`: Date for dashboard (YYYY-MM-DD), defaults to today
 
 **Response (200 OK):**
+
 ```json
 {
   "date": "2024-01-15",
@@ -476,6 +512,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Real-Time Analytics
+
 Get real-time metrics for current activity.
 
 ```
@@ -485,6 +522,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "current_visitors": 23,
@@ -512,6 +550,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get User Metrics
+
 Get DAU/WAU/MAU metrics with growth rates.
 
 ```
@@ -521,10 +560,12 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Query Parameters:**
+
 - `date`: Date for metrics (YYYY-MM-DD), defaults to today
 - `metric`: Specific metric (dau, wau, mau) or "all" for all metrics
 
 **Response (200 OK):**
+
 ```json
 {
   "status": "success",
@@ -547,6 +588,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Heatmap Data
+
 Get click and scroll heatmap data for pages.
 
 ```
@@ -556,6 +598,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "status": "success",
@@ -590,6 +633,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Error Analytics
+
 Get error tracking and analysis data.
 
 ```
@@ -599,6 +643,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "status": "success",
@@ -628,6 +673,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Session Analytics
+
 Get detailed analytics for a specific user session.
 
 ```
@@ -637,9 +683,11 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Path Parameters:**
+
 - `session_id`: The session ID to analyze
 
 **Response (200 OK):**
+
 ```json
 {
   "status": "success",
@@ -672,6 +720,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Retention Cohorts
+
 Get user retention cohort analysis.
 
 ```
@@ -681,6 +730,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "status": "success",
@@ -720,6 +770,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Flush Cache
+
 Manually trigger a cache flush (moves events from memory to storage).
 
 ```
@@ -729,6 +780,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "message": "Cache flushed successfully",
@@ -738,6 +790,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK - Empty Cache):**
+
 ```json
 {
   "message": "Cache is empty, nothing to flush",
@@ -748,6 +801,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Clear Data Cache
+
 Clear all cached analytics data (forces fresh computation on next query).
 
 ```
@@ -757,6 +811,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK):**
+
 ```json
 {
   "message": "All data caches cleared successfully",
@@ -771,11 +826,282 @@ X-Project-ID: <PROJECT_ID>
 
 ---
 
+## Session Recording
+
+Session recording allows you to capture and replay user interactions on your website. This feature uses [rrweb](https://www.rrweb.io/) format for recording browser events.
+
+### Ingest Recording
+
+Store session recording events and metadata.
+
+```
+POST /api/v1/sessions/:session_id/recordings
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+```
+
+**Path Parameters:**
+
+| Parameter    | Type   | Description                   |
+| ------------ | ------ | ----------------------------- |
+| `session_id` | string | Unique identifier for session |
+
+**Request Body:**
+
+```json
+{
+  "account_id": "acc_123",
+  "project_id": "proj_456",
+  "user_id": "user_789",
+  "events": [
+    {
+      "type": 2,
+      "timestamp": 1234567890,
+      "data": {
+        "node": {
+          "id": 1,
+          "type": 0,
+          "tagName": "html"
+        }
+      }
+    },
+    {
+      "type": 3,
+      "timestamp": 1234567891,
+      "data": {
+        "source": 0,
+        "positions": [
+          {
+            "x": 100,
+            "y": 200,
+            "id": 5,
+            "timeOffset": 10
+          }
+        ]
+      }
+    }
+  ],
+  "duration": 120,
+  "start_url": "https://example.com/home"
+}
+```
+
+**Request Fields:**
+
+| Field        | Type   | Required | Description                   |
+| ------------ | ------ | -------- | ----------------------------- |
+| `account_id` | string | Yes      | Account ID                    |
+| `project_id` | string | Yes      | Project ID                    |
+| `user_id`    | string | No       | User ID (optional)            |
+| `events`     | array  | Yes      | Array of rrweb events         |
+| `duration`   | number | Yes      | Recording duration in seconds |
+| `start_url`  | string | Yes      | URL where the session started |
+
+**Response (200 OK):**
+
+```json
+{
+  "message": "Recording ingested successfully",
+  "recording_id": "rec_abc123"
+}
+```
+
+**Notes:**
+
+- Events are stored in S3/R2 for efficient retrieval
+- Metadata is stored in the database for fast querying
+- Multiple calls with the same `session_id` will update the recording
+- Event format follows [rrweb specification](https://github.com/rrweb-io/rrweb/blob/master/guide.md)
+
+---
+
+### List Recordings
+
+Retrieve a paginated list of session recordings.
+
+```
+GET /api/v1/recordings?project_id=<PROJECT_ID>&limit=50&offset=0
+Authorization: Bearer <JWT_TOKEN>
+```
+
+**Query Parameters:**
+
+| Parameter    | Type   | Required | Default | Description                          |
+| ------------ | ------ | -------- | ------- | ------------------------------------ |
+| `project_id` | string | Yes      | -       | Filter by project                    |
+| `session_id` | string | No       | -       | Filter by specific session           |
+| `user_id`    | string | No       | -       | Filter by specific user              |
+| `limit`      | number | No       | 50      | Maximum number of results (max: 100) |
+| `offset`     | number | No       | 0       | Number of results to skip            |
+
+**Response (200 OK):**
+
+```json
+{
+  "recordings": [
+    {
+      "id": "rec_abc123",
+      "session_id": "sess_xyz789",
+      "account_id": "acc_123",
+      "project_id": "proj_456",
+      "user_id": "user_789",
+      "duration": 120,
+      "start_url": "https://example.com/home",
+      "event_count": 1523,
+      "created_at": "2024-01-15T10:30:00Z",
+      "updated_at": "2024-01-15T10:32:00Z"
+    },
+    {
+      "id": "rec_def456",
+      "session_id": "sess_abc123",
+      "account_id": "acc_123",
+      "project_id": "proj_456",
+      "user_id": null,
+      "duration": 45,
+      "start_url": "https://example.com/pricing",
+      "event_count": 421,
+      "created_at": "2024-01-15T09:15:00Z",
+      "updated_at": "2024-01-15T09:15:45Z"
+    }
+  ],
+  "total": 127,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**Response Fields:**
+
+| Field         | Type   | Description                         |
+| ------------- | ------ | ----------------------------------- |
+| `id`          | string | Unique recording identifier         |
+| `session_id`  | string | Session identifier                  |
+| `account_id`  | string | Account that owns the recording     |
+| `project_id`  | string | Project identifier                  |
+| `user_id`     | string | User identifier (null if anonymous) |
+| `duration`    | number | Recording duration in seconds       |
+| `start_url`   | string | URL where the session started       |
+| `event_count` | number | Number of events in the recording   |
+| `created_at`  | string | ISO 8601 timestamp of creation      |
+| `updated_at`  | string | ISO 8601 timestamp of last update   |
+
+---
+
+### Get Recording
+
+Retrieve a specific recording with all its events.
+
+```
+GET /api/v1/recordings/:id
+Authorization: Bearer <JWT_TOKEN>
+```
+
+**Path Parameters:**
+
+| Parameter | Type   | Description  |
+| --------- | ------ | ------------ |
+| `id`      | string | Recording ID |
+
+**Response (200 OK):**
+
+```json
+{
+  "id": "rec_abc123",
+  "session_id": "sess_xyz789",
+  "account_id": "acc_123",
+  "project_id": "proj_456",
+  "user_id": "user_789",
+  "duration": 120,
+  "start_url": "https://example.com/home",
+  "event_count": 1523,
+  "created_at": "2024-01-15T10:30:00Z",
+  "updated_at": "2024-01-15T10:32:00Z",
+  "events": [
+    {
+      "type": 2,
+      "timestamp": 1234567890,
+      "data": {
+        "node": {
+          "id": 1,
+          "type": 0,
+          "tagName": "html"
+        }
+      }
+    },
+    {
+      "type": 3,
+      "timestamp": 1234567891,
+      "data": {
+        "source": 0,
+        "positions": [
+          {
+            "x": 100,
+            "y": 200,
+            "id": 5,
+            "timeOffset": 10
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Response Fields:**
+
+All metadata fields from the list endpoint, plus:
+
+| Field    | Type  | Description                           |
+| -------- | ----- | ------------------------------------- |
+| `events` | array | Full array of rrweb events for replay |
+
+**Error Responses:**
+
+```json
+// 404 Not Found
+{
+  "error": "Recording not found"
+}
+
+// 500 Internal Server Error
+{
+  "error": "Failed to retrieve recording events"
+}
+```
+
+**Usage Example:**
+
+```javascript
+// Fetch and replay a recording
+async function replayRecording(recordingId) {
+  const response = await fetch(`/api/v1/recordings/${recordingId}`, {
+    headers: {
+      Authorization: `Bearer ${jwtToken}`,
+    },
+  });
+
+  const recording = await response.json();
+
+  // Use rrweb player to replay
+  new rrwebPlayer({
+    target: document.getElementById("player"),
+    props: {
+      events: recording.events,
+      width: 1024,
+      height: 768,
+    },
+  });
+}
+```
+
+---
+
 ## A/B Testing Endpoints
 
 All A/B testing endpoints require API key authentication.
 
 ### Create Experiment
+
 Create a new A/B test experiment.
 
 ```
@@ -786,6 +1112,7 @@ Content-Type: application/json
 ```
 
 **Request Body:**
+
 ```json
 {
   "name": "Homepage Button Color Test",
@@ -816,6 +1143,7 @@ Content-Type: application/json
 ```
 
 **Response (201 Created):**
+
 ```json
 {
   "id": "exp_550e8400e29b41d4",
@@ -857,6 +1185,7 @@ Content-Type: application/json
 ---
 
 ### List Experiments
+
 Get all experiments for a project.
 
 ```
@@ -866,6 +1195,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Response (200 OK):**
+
 ```json
 [
   {
@@ -898,6 +1228,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Experiment
+
 Get details of a specific experiment.
 
 ```
@@ -907,9 +1238,11 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Path Parameters:**
+
 - `id`: The experiment ID
 
 **Response (200 OK):**
+
 ```json
 {
   "id": "exp_550e8400e29b41d4",
@@ -929,6 +1262,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Get Variant Assignment
+
 Get the assigned variant for a user in an experiment.
 
 ```
@@ -937,12 +1271,14 @@ Authorization: Bearer <API_KEY>
 ```
 
 **Query Parameters:**
+
 - `experimentKey`: The experiment key
 - `projectId`: The project ID
 - `userId`: (Optional) The user ID
 - `anonymousId`: (Optional) The anonymous ID (use if userId not available)
 
 **Response (200 OK):**
+
 ```json
 {
   "id": "var_550e8400e29b41d4",
@@ -959,6 +1295,7 @@ Authorization: Bearer <API_KEY>
 ---
 
 ### Track Conversion
+
 Record a conversion event for a user in an experiment.
 
 ```
@@ -969,6 +1306,7 @@ Content-Type: application/json
 ```
 
 **Request Body:**
+
 ```json
 {
   "experimentId": "exp_550e8400e29b41d4",
@@ -985,6 +1323,7 @@ Content-Type: application/json
 **Note:** Either `userId` or `anonymousId` is required.
 
 **Response (200 OK):**
+
 ```json
 {
   "status": "ok"
@@ -994,6 +1333,7 @@ Content-Type: application/json
 ---
 
 ### Get Experiment Results
+
 Get aggregated results for an experiment.
 
 ```
@@ -1003,15 +1343,17 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Path Parameters:**
+
 - `id`: The experiment ID
 
 **Response (200 OK):**
+
 ```json
 [
   {
     "variantId": "var_550e8400e29b41d4",
     "totalConversions": 1250,
-    "totalValue": 1875.50,
+    "totalValue": 1875.5,
     "uniqueUsers": 1200
   },
   {
@@ -1026,6 +1368,7 @@ X-Project-ID: <PROJECT_ID>
 ---
 
 ### Update Experiment Status
+
 Change the status of an experiment.
 
 ```
@@ -1035,12 +1378,15 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Path Parameters:**
+
 - `id`: The experiment ID
 
 **Query Parameters:**
+
 - `status`: One of: DRAFT, RUNNING, PAUSED, COMPLETED, ARCHIVED
 
 **Response (200 OK):**
+
 ```json
 {
   "status": "success"
@@ -1048,6 +1394,7 @@ X-Project-ID: <PROJECT_ID>
 ```
 
 **Valid Status Transitions:**
+
 - DRAFT → RUNNING, ARCHIVED
 - RUNNING → PAUSED, COMPLETED, ARCHIVED
 - PAUSED → RUNNING, ARCHIVED
@@ -1070,14 +1417,14 @@ All error responses follow this format:
 
 ### Common Error Codes
 
-| Status Code | Description |
-|-------------|-------------|
-| `400 Bad Request` | Invalid request parameters or validation error |
-| `401 Unauthorized` | Missing or invalid authentication token |
-| `403 Forbidden` | Authenticated user lacks permission |
-| `404 Not Found` | Resource not found |
-| `409 Conflict` | Resource already exists (e.g., duplicate email) |
-| `500 Internal Server Error` | Server error |
+| Status Code                 | Description                                     |
+| --------------------------- | ----------------------------------------------- |
+| `400 Bad Request`           | Invalid request parameters or validation error  |
+| `401 Unauthorized`          | Missing or invalid authentication token         |
+| `403 Forbidden`             | Authenticated user lacks permission             |
+| `404 Not Found`             | Resource not found                              |
+| `409 Conflict`              | Resource already exists (e.g., duplicate email) |
+| `500 Internal Server Error` | Server error                                    |
 
 ### Common Error Messages
 
@@ -1128,10 +1475,12 @@ Currently no rate limiting is implemented. Production deployment should implemen
 ## Pagination
 
 List endpoints support pagination via query parameters:
+
 - `limit`: Number of results (default: 100, max: 1000)
 - `offset`: Number of results to skip (default: 0)
 
 Example:
+
 ```
 GET /api/v1/projects?limit=50&offset=100
 ```
@@ -1141,6 +1490,7 @@ GET /api/v1/projects?limit=50&offset=100
 ## Timestamps
 
 All timestamps are in ISO 8601 format with UTC timezone:
+
 ```
 2024-01-15T10:30:00Z
 ```
@@ -1152,6 +1502,7 @@ All timestamps are in ISO 8601 format with UTC timezone:
 ### Complete Workflow Example
 
 1. **Sign up:**
+
 ```bash
 curl -X POST http://localhost:8080/signup \
   -H "Content-Type: application/json" \
@@ -1163,6 +1514,7 @@ curl -X POST http://localhost:8080/signup \
 ```
 
 2. **Login:**
+
 ```bash
 curl -X POST http://localhost:8080/login \
   -H "Content-Type: application/json" \
@@ -1174,6 +1526,7 @@ curl -X POST http://localhost:8080/login \
 ```
 
 3. **Create project:**
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/projects \
   -H "Authorization: Bearer <TOKEN>" \
@@ -1185,6 +1538,7 @@ curl -X POST http://localhost:8080/api/v1/projects \
 ```
 
 4. **Create API key:**
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/projects/<PROJECT_ID>/apikeys \
   -H "Authorization: Bearer <TOKEN>" \
@@ -1197,6 +1551,7 @@ curl -X POST http://localhost:8080/api/v1/projects/<PROJECT_ID>/apikeys \
 ```
 
 5. **Create experiment:**
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/experiments \
   -H "Authorization: Bearer <API_KEY>" \
@@ -1216,6 +1571,7 @@ curl -X POST http://localhost:8080/api/v1/experiments \
 ```
 
 6. **Get analytics:**
+
 ```bash
 curl -X GET "http://localhost:8080/api/v1/analytics?start_date=2024-01-01&metrics=total_events,unique_users" \
   -H "Authorization: Bearer <TOKEN>" \

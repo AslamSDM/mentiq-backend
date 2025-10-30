@@ -29,6 +29,7 @@ func MigrateDB(db *gorm.DB) error {
 		&Variant{},
 		&ExperimentAssignment{},
 		&ConversionEvent{},
+		&SessionRecording{},
 	)
 }
 
@@ -36,8 +37,8 @@ func MigrateDB(db *gorm.DB) error {
 func CreateIndices(db *gorm.DB) error {
 	// Create indices for faster queries
 	indices := []struct {
-		model interface{}
-		index string
+		model  interface{}
+		index  string
 		column string
 	}{
 		// Account indices
@@ -63,6 +64,11 @@ func CreateIndices(db *gorm.DB) error {
 		{&ConversionEvent{}, "idx_conversion_experiment_id", "experiment_id"},
 		{&ConversionEvent{}, "idx_conversion_variant_id", "variant_id"},
 		{&ConversionEvent{}, "idx_conversion_user_id", "user_id"},
+		// SessionRecording indices
+		{&SessionRecording{}, "idx_recording_session_id", "session_id"},
+		{&SessionRecording{}, "idx_recording_account_id", "account_id"},
+		{&SessionRecording{}, "idx_recording_project_id", "project_id"},
+		{&SessionRecording{}, "idx_recording_created_at", "created_at"},
 	}
 
 	for _, idx := range indices {

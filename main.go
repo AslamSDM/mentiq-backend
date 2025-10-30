@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -181,49 +185,103 @@ type JWTClaims struct {
 	Email     string `json:"email"`
 	ProjectID string `json:"project_id,omitempty"`
 	APIKeyID  string `json:"api_key_id,omitempty"`
+	Exp       int64  `json:"exp"` // Expiration time
+	Iat       int64  `json:"iat"` // Issued at time
 }
 
-// GenerateJWT generates a JWT token for an account
+// GenerateJWT generates a JWT token for an account with HMAC-SHA256 signing
 func GenerateJWT(accountID, email string, expiresInHours int) (string, error) {
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
-		jwtSecret = "your-secret-key-change-in-production" // Default for development
+		return "", fmt.Errorf("JWT_SECRET must be configured")
 	}
 
-	// Create a simple JWT-like token using base64 encoding
-	// In production, use a proper JWT library
+	now := time.Now().Unix()
 	expiryTime := time.Now().Add(time.Duration(expiresInHours) * time.Hour).Unix()
-	tokenString := fmt.Sprintf("%s.%s.%d",
-		accountID,
-		email,
-		expiryTime,
-	)
-	return tokenString, nil
+
+	claims := JWTClaims{
+		AccountID: accountID,
+		Email:     email,
+		Exp:       expiryTime,
+		Iat:       now,
+	}
+
+	// Create header
+	header := map[string]string{
+		"alg": "HS256",
+		"typ": "JWT",
+	}
+
+	// Encode header
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal header: %v", err)
+	}
+	headerEncoded := base64.RawURLEncoding.EncodeToString(headerJSON)
+
+	// Encode payload
+	payloadJSON, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal claims: %v", err)
+	}
+	payloadEncoded := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	// Create signature
+	message := headerEncoded + "." + payloadEncoded
+	h := hmac.New(sha256.New, []byte(jwtSecret))
+	h.Write([]byte(message))
+	signature := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+
+	// Combine all parts
+	token := message + "." + signature
+
+	return token, nil
 }
 
 // ValidateJWT validates a JWT token and extracts claims
 func ValidateJWT(tokenString string) (*JWTClaims, error) {
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		return nil, fmt.Errorf("JWT_SECRET must be configured")
+	}
+
+	// Split token into parts
 	parts := strings.Split(tokenString, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid token format")
 	}
 
-	claims := &JWTClaims{
-		AccountID: parts[0],
-		Email:     parts[1],
+	headerEncoded := parts[0]
+	payloadEncoded := parts[1]
+	signatureEncoded := parts[2]
+
+	// Verify signature
+	message := headerEncoded + "." + payloadEncoded
+	h := hmac.New(sha256.New, []byte(jwtSecret))
+	h.Write([]byte(message))
+	expectedSignature := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+
+	if !hmac.Equal([]byte(signatureEncoded), []byte(expectedSignature)) {
+		return nil, fmt.Errorf("invalid token signature")
 	}
 
-	// Validate expiration
-	expiryUnix, err := strconv.ParseInt(parts[2], 10, 64)
+	// Decode and parse payload
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(payloadEncoded)
 	if err != nil {
-		return nil, fmt.Errorf("invalid token expiration")
+		return nil, fmt.Errorf("invalid token payload encoding: %v", err)
 	}
 
-	if time.Now().Unix() > expiryUnix {
+	var claims JWTClaims
+	if err := json.Unmarshal(payloadJSON, &claims); err != nil {
+		return nil, fmt.Errorf("invalid token payload: %v", err)
+	}
+
+	// Check expiration
+	if time.Now().Unix() > claims.Exp {
 		return nil, fmt.Errorf("token expired")
 	}
 
-	return claims, nil
+	return &claims, nil
 }
 
 func main() {
@@ -248,9 +306,9 @@ func main() {
 	}
 
 	// Run migrations
-	if err := MigrateDB(database); err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
-	}
+	// if err := MigrateDB(database); err != nil {
+	// 	log.Fatalf("Failed to run migrations: %v", err)
+	// }
 
 	// Get configuration from environment variables
 	bucketName := os.Getenv("S3_BUCKET_NAME")
@@ -314,6 +372,11 @@ func main() {
 		apiV1.GET("/analytics/errors", server.analyticsService.GetErrorAnalyticsHandler)
 		apiV1.GET("/sessions/:session_id", server.analyticsService.GetSessionAnalyticsHandler)
 		apiV1.GET("/analytics/retention", server.analyticsService.GetRetentionCohortsHandler)
+
+		// Session Recording routes
+		apiV1.POST("/sessions/:session_id/recordings", server.ingestRecordingHandler)
+		apiV1.GET("/recordings", server.listRecordingsHandler)
+		apiV1.GET("/recordings/:id", server.getRecordingHandler)
 
 		// Project and API Key management
 		apiV1.POST("/projects", server.createProjectHandler)
@@ -922,6 +985,216 @@ func (s *Server) updateProjectStripeApiKeyHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Stripe API key updated successfully"})
 }
 
+// Session Recording Handlers
+
+// ingestRecordingHandler receives and stores session recording data
+func (s *Server) ingestRecordingHandler(c *gin.Context) {
+	sessionID := c.Param("session_id")
+
+	// Parse request body
+	var recordingData struct {
+		Events    []map[string]interface{} `json:"events"`
+		Duration  int                      `json:"duration"`
+		StartURL  string                   `json:"start_url"`
+		AccountID string                   `json:"account_id"`
+		ProjectID string                   `json:"project_id"`
+		UserID    *string                  `json:"user_id"`
+	}
+
+	if err := c.ShouldBindJSON(&recordingData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Validate required fields
+	if recordingData.AccountID == "" || recordingData.ProjectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account_id and project_id are required"})
+		return
+	}
+
+	// Generate unique ID for this recording
+	recordingID := uuid.New().String()
+
+	// Store events to S3
+	storagePath := fmt.Sprintf("recordings/%s/%s/%s.json",
+		recordingData.ProjectID, sessionID, recordingID)
+
+	// Marshal events to JSON
+	eventsJSON, err := json.Marshal(recordingData.Events)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal events"})
+		return
+	}
+
+	// Upload to S3
+	_, err = s.analyticsService.s3Client.PutObject(&s3.PutObjectInput{
+		Bucket:      aws.String(s.analyticsService.bucketName),
+		Key:         aws.String(storagePath),
+		Body:        bytes.NewReader(eventsJSON),
+		ContentType: aws.String("application/json"),
+	})
+	if err != nil {
+		log.Printf("Failed to upload recording to S3: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store recording"})
+		return
+	}
+
+	// Save or update recording metadata in database
+	recording := SessionRecording{
+		ID:          recordingID,
+		SessionID:   sessionID,
+		AccountID:   recordingData.AccountID,
+		ProjectID:   recordingData.ProjectID,
+		UserID:      recordingData.UserID,
+		StoragePath: storagePath,
+		Duration:    recordingData.Duration,
+		StartURL:    recordingData.StartURL,
+		EventCount:  len(recordingData.Events),
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+
+	// Check if recording already exists and update, otherwise create
+	var existingRecording SessionRecording
+	err = s.db.Where("session_id = ? AND project_id = ?", sessionID, recordingData.ProjectID).First(&existingRecording).Error
+
+	if err == nil {
+		// Update existing recording
+		recording.ID = existingRecording.ID
+		recording.CreatedAt = existingRecording.CreatedAt
+		if err := s.db.Save(&recording).Error; err != nil {
+			log.Printf("Failed to update recording: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save recording"})
+			return
+		}
+	} else {
+		// Create new recording
+		if err := s.db.Create(&recording).Error; err != nil {
+			log.Printf("Failed to create recording: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save recording"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Recording ingested successfully",
+		"recording_id": recording.ID,
+	})
+}
+
+// listRecordingsHandler returns a list of recordings for a project
+func (s *Server) listRecordingsHandler(c *gin.Context) {
+	projectID := c.Query("project_id")
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id query parameter is required"})
+		return
+	}
+
+	// Optional filters
+	sessionID := c.Query("session_id")
+	userID := c.Query("user_id")
+	limit := 50
+	offset := 0
+
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+
+	if offsetStr := c.Query("offset"); offsetStr != "" {
+		if parsedOffset, err := strconv.Atoi(offsetStr); err == nil && parsedOffset >= 0 {
+			offset = parsedOffset
+		}
+	}
+
+	// Build query
+	query := s.db.Model(&SessionRecording{}).Where("project_id = ?", projectID)
+
+	if sessionID != "" {
+		query = query.Where("session_id = ?", sessionID)
+	}
+
+	if userID != "" {
+		query = query.Where("user_id = ?", userID)
+	}
+
+	// Get total count
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		log.Printf("Failed to count recordings: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recordings"})
+		return
+	}
+
+	// Get recordings
+	var recordings []SessionRecording
+	if err := query.Order("created_at DESC").Limit(limit).Offset(offset).Find(&recordings).Error; err != nil {
+		log.Printf("Failed to fetch recordings: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recordings"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"recordings": recordings,
+		"total":      total,
+		"limit":      limit,
+		"offset":     offset,
+	})
+}
+
+// getRecordingHandler returns a specific recording with its events
+func (s *Server) getRecordingHandler(c *gin.Context) {
+	recordingID := c.Param("id")
+
+	// Fetch recording metadata from database
+	var recording SessionRecording
+	if err := s.db.Where("id = ?", recordingID).First(&recording).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found"})
+			return
+		}
+		log.Printf("Failed to fetch recording: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording"})
+		return
+	}
+
+	// Fetch events from S3
+	result, err := s.analyticsService.s3Client.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(s.analyticsService.bucketName),
+		Key:    aws.String(recording.StoragePath),
+	})
+	if err != nil {
+		log.Printf("Failed to fetch recording from S3: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording events"})
+		return
+	}
+	defer result.Body.Close()
+
+	// Read events
+	var events []map[string]interface{}
+	if err := json.NewDecoder(result.Body).Decode(&events); err != nil {
+		log.Printf("Failed to decode recording events: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recording events"})
+		return
+	}
+
+	// Return recording with events
+	c.JSON(http.StatusOK, gin.H{
+		"id":          recording.ID,
+		"session_id":  recording.SessionID,
+		"account_id":  recording.AccountID,
+		"project_id":  recording.ProjectID,
+		"user_id":     recording.UserID,
+		"duration":    recording.Duration,
+		"start_url":   recording.StartURL,
+		"event_count": recording.EventCount,
+		"created_at":  recording.CreatedAt,
+		"updated_at":  recording.UpdatedAt,
+		"events":      events,
+	})
+}
+
 func (s *Server) signupHandler(c *gin.Context) {
 	var req SignupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1034,6 +1307,7 @@ func (s *Server) authMiddleware(c *gin.Context) {
 
 	// Try to validate JWT token
 	claims, err := ValidateJWT(token)
+	log.Default().Println("JWT validation error:", claims.APIKeyID, claims.AccountID, claims.Email, err, token)
 	if err == nil {
 		// Valid JWT token
 		c.Set("account_id", claims.AccountID)
