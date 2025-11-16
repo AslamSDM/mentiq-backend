@@ -1,14 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"sort"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/gin-gonic/gin"
-	"github.com/stripe/stripe-go/v72"
 	"github.com/stripe/stripe-go/v72/client"
 )
 
@@ -108,7 +110,7 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 
 	filteredEvents := as.filterEvents(events, query)
 
-	results := as.calculateMetrics(filteredEvents, query, sc)
+	results := as.calculateMetrics(filteredEvents, query, sc, projectID.(string))
 
 	response := AnalyticsResponse{
 		Query:   query,
@@ -121,35 +123,7 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func getStripeCustomers(sc *client.API) []*stripe.Customer {
-	/*
-		params := &stripe.CustomerListParams{}
-		params.Filters.AddFilter("limit", "", "100")
-		i := customer.List(params)
-		var customers []*stripe.Customer
-		for i.Next() {
-			customers = append(customers, i.Customer())
-		}
-		return customers
-	*/
-	return []*stripe.Customer{}
-}
-
-func getStripeSubscriptions(sc *client.API) []*stripe.Subscription {
-	/*
-		params := &stripe.SubscriptionListParams{}
-		params.Filters.AddFilter("limit", "", "100")
-		i := subscription.List(params)
-		var subscriptions []*stripe.Subscription
-		for i.Next() {
-			subscriptions = append(subscriptions, i.Subscription())
-		}
-		return subscriptions
-	*/
-	return []*stripe.Subscription{}
-}
-
-func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuery, sc *client.API) []MetricResult {
+func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuery, sc *client.API, projectID string) []MetricResult {
 	var results []MetricResult
 
 	for _, metric := range query.Metrics {
@@ -501,79 +475,81 @@ func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuer
 			})
 
 		case "conversion_rate":
-			customers := getStripeCustomers(sc)
-			totalCustomers := len(customers)
-			payingCustomers := 0
-			for _, c := range customers {
-				if len(c.Subscriptions.Data) > 0 {
-					payingCustomers++
+			// Use real Stripe data from database instead of API calls
+			var stripeMetrics RevenueMetrics
+			today := time.Now().Format("2006-01-02")
+
+			if err := as.db.Where("project_id = ? AND date = ?", projectID, today).First(&stripeMetrics).Error; err == nil {
+				// Calculate conversion rate from stored metrics
+				var totalCustomers int64
+				as.db.Model(&StripeCustomer{}).Where("project_id = ?", projectID).Count(&totalCustomers)
+
+				var conversionRate float64
+				if totalCustomers > 0 {
+					conversionRate = float64(stripeMetrics.ActiveSubscriptions) / float64(totalCustomers) * 100
 				}
+
+				results = append(results, MetricResult{
+					Metric: "conversion_rate",
+					Value:  fmt.Sprintf("%.2f%%", conversionRate),
+				})
+			} else {
+				results = append(results, MetricResult{
+					Metric: "conversion_rate",
+					Value:  "No data - sync Stripe first",
+				})
 			}
-			var conversionRate float64
-			if totalCustomers > 0 {
-				conversionRate = float64(payingCustomers) / float64(totalCustomers) * 100
-			}
-			results = append(results, MetricResult{
-				Metric: "conversion_rate",
-				Value:  fmt.Sprintf("%.2f%%", conversionRate),
-			})
 
 		case "churn_rate":
-			subscriptions := getStripeSubscriptions(sc)
-			canceledSubscriptions := 0
-			activeSubscriptions := 0
-			for _, s := range subscriptions {
-				if s.Status == stripe.SubscriptionStatusCanceled {
-					canceledSubscriptions++
-				}
-				if s.Status == stripe.SubscriptionStatusActive {
-					activeSubscriptions++
-				}
+			// Use real Stripe data from database
+			var stripeMetrics RevenueMetrics
+			today := time.Now().Format("2006-01-02")
+
+			if err := as.db.Where("project_id = ? AND date = ?", projectID, today).First(&stripeMetrics).Error; err == nil {
+				results = append(results, MetricResult{
+					Metric: "churn_rate",
+					Value:  fmt.Sprintf("%.2f%%", stripeMetrics.ChurnRate),
+				})
+			} else {
+				results = append(results, MetricResult{
+					Metric: "churn_rate",
+					Value:  "No data - sync Stripe first",
+				})
 			}
-			var churnRate float64
-			if activeSubscriptions > 0 {
-				churnRate = float64(canceledSubscriptions) / float64(activeSubscriptions) * 100
-			}
-			results = append(results, MetricResult{
-				Metric: "churn_rate",
-				Value:  fmt.Sprintf("%.2f%%", churnRate),
-			})
 
 		case "mrr":
-			subscriptions := getStripeSubscriptions(sc)
-			mrr := 0.0
-			for _, s := range subscriptions {
-				if s.Status == stripe.SubscriptionStatusActive {
-					for _, item := range s.Items.Data {
-						mrr += float64(item.Price.UnitAmount) / 100
-					}
-				}
+			// Use real Stripe data from database
+			var stripeMetrics RevenueMetrics
+			today := time.Now().Format("2006-01-02")
+
+			if err := as.db.Where("project_id = ? AND date = ?", projectID, today).First(&stripeMetrics).Error; err == nil {
+				results = append(results, MetricResult{
+					Metric: "mrr",
+					Value:  fmt.Sprintf("$%.2f", float64(stripeMetrics.MRR)/100),
+				})
+			} else {
+				results = append(results, MetricResult{
+					Metric: "mrr",
+					Value:  "No data - sync Stripe first",
+				})
 			}
-			results = append(results, MetricResult{
-				Metric: "mrr",
-				Value:  fmt.Sprintf("$%.2f", mrr),
-			})
 
 		case "arpu":
-			subscriptions := getStripeSubscriptions(sc)
-			mrr := 0.0
-			payingUsers := make(map[string]bool)
-			for _, s := range subscriptions {
-				if s.Status == stripe.SubscriptionStatusActive {
-					for _, item := range s.Items.Data {
-						mrr += float64(item.Price.UnitAmount) / 100
-					}
-					payingUsers[s.Customer.ID] = true
-				}
+			// Use real Stripe data from database
+			var stripeMetrics RevenueMetrics
+			today := time.Now().Format("2006-01-02")
+
+			if err := as.db.Where("project_id = ? AND date = ?", projectID, today).First(&stripeMetrics).Error; err == nil {
+				results = append(results, MetricResult{
+					Metric: "arpu",
+					Value:  fmt.Sprintf("$%.2f", float64(stripeMetrics.ARPU)/100),
+				})
+			} else {
+				results = append(results, MetricResult{
+					Metric: "arpu",
+					Value:  "No data - sync Stripe first",
+				})
 			}
-			var arpu float64
-			if len(payingUsers) > 0 {
-				arpu = mrr / float64(len(payingUsers))
-			}
-			results = append(results, MetricResult{
-				Metric: "arpu",
-				Value:  fmt.Sprintf("$%.2f", arpu),
-			})
 		}
 	}
 
@@ -600,7 +576,7 @@ func convertStringMapToInterface(m map[string]string) map[string]interface{} {
 	return result
 }
 
-// fetchEventsForDateRange fetches events from S3 for the given date range
+// fetchEventsForDateRange fetches events from R2 storage for the given date range
 func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startDate, endDate string) ([]Event, error) {
 	// Check cache first
 	if cachedEvents, found := as.getCachedEvents(accountID, projectID, startDate, endDate); found {
@@ -608,15 +584,99 @@ func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startD
 		return cachedEvents, nil
 	}
 
-	// For now, return empty slice - in production you'd fetch from S3
-	// This would involve iterating through S3 objects with the proper key structure
-	events := []Event{}
+	// Try to fetch from PostgreSQL first (for recent events)
+	var events []Event
 
+	// If R2 events exist and are more recent than database, use R2 data instead
+	r2Events, r2Err := as.fetchEventsFromR2(accountID, projectID, startDate, endDate)
+	if r2Err == nil && len(r2Events) > len(events) {
+		log.Printf("Using %d events from R2 storage (more recent than database)", len(r2Events))
+		events = r2Events
+	}
 	// Cache the results
 	as.setCachedEvents(accountID, projectID, startDate, endDate, events)
 
-	log.Printf("Fetched %d events from S3 for date range %s to %s", len(events), startDate, endDate)
+	log.Printf("Fetched %d events from database for date range %s to %s", len(events), startDate, endDate)
 	return events, nil
+}
+
+// fetchEventsFromR2 fetches events from R2/S3 storage as fallback
+func (as *AnalyticsService) fetchEventsFromR2(accountID, projectID, startDate, endDate string) ([]Event, error) {
+	log.Printf("Fetching from R2 storage for account %s, project %s, date range %s to %s",
+		accountID, projectID, startDate, endDate)
+
+	// Parse dates to generate S3 key prefixes
+	start, err := time.Parse("2006-01-02", startDate)
+	if err != nil {
+		return nil, fmt.Errorf("invalid start date: %v", err)
+	}
+
+	end, err := time.Parse("2006-01-02", endDate)
+	if err != nil {
+		return nil, fmt.Errorf("invalid end date: %v", err)
+	}
+
+	var allEvents []Event
+
+	// Iterate through each date in the range
+	for date := start; !date.After(end); date = date.AddDate(0, 0, 1) {
+		// Generate S3 prefix for this date
+		prefix := fmt.Sprintf("events/account_id=%s/project_id=%s/year=%d/month=%02d/day=%02d/",
+			accountID, projectID, date.Year(), int(date.Month()), date.Day())
+
+		// List objects with this prefix
+		result, err := as.s3Client.ListObjectsV2(&s3.ListObjectsV2Input{
+			Bucket: aws.String(as.bucketName),
+			Prefix: aws.String(prefix),
+		})
+
+		if err != nil {
+			log.Printf("Error listing S3 objects for prefix %s: %v", prefix, err)
+			continue
+		}
+
+		// Fetch and parse each batch file
+		for _, obj := range result.Contents {
+			events, err := as.fetchAndParseBatchFile(*obj.Key)
+			if err != nil {
+				log.Printf("Error fetching batch file %s: %v", *obj.Key, err)
+				continue
+			}
+			allEvents = append(allEvents, events...)
+		}
+	}
+
+	log.Printf("Fetched %d events from R2 storage", len(allEvents))
+	return allEvents, nil
+}
+
+// fetchAndParseBatchFile fetches and parses a single batch file from S3
+func (as *AnalyticsService) fetchAndParseBatchFile(key string) ([]Event, error) {
+	// Get object from S3
+	result, err := as.s3Client.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(as.bucketName),
+		Key:    aws.String(key),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get object %s: %v", key, err)
+	}
+	defer result.Body.Close()
+
+	// Read the JSON content
+	var batchPayload struct {
+		BatchID    string  `json:"batch_id"`
+		BatchSize  int     `json:"batch_size"`
+		UploadedAt string  `json:"uploaded_at"`
+		Events     []Event `json:"events"`
+	}
+
+	if err := json.NewDecoder(result.Body).Decode(&batchPayload); err != nil {
+		return nil, fmt.Errorf("failed to decode batch file %s: %v", key, err)
+	}
+
+	log.Printf("Parsed batch file %s: %d events", key, len(batchPayload.Events))
+	return batchPayload.Events, nil
 }
 
 // filterEvents filters events based on query parameters
@@ -746,6 +806,43 @@ func (as *AnalyticsService) getPageViewTimeSeries(events []Event, groupBy string
 	})
 }
 
+// Helper method to calculate DAU, WAU, MAU
+func (as *AnalyticsService) calculateUserMetrics(accountID, projectID string, date time.Time) (int, int, int) {
+	today := date.Format("2006-01-02")
+	sevenDaysAgo := date.AddDate(0, 0, -7).Format("2006-01-02")
+	thirtyDaysAgo := date.AddDate(0, 0, -30).Format("2006-01-02")
+
+	// Get events for different periods
+	dauEvents, _ := as.fetchEventsForDateRange(accountID, projectID, today, today)
+	wauEvents, _ := as.fetchEventsForDateRange(accountID, projectID, sevenDaysAgo, today)
+	mauEvents, _ := as.fetchEventsForDateRange(accountID, projectID, thirtyDaysAgo, today)
+
+	// Count unique users for each period
+	dauUsers := make(map[string]bool)
+	wauUsers := make(map[string]bool)
+	mauUsers := make(map[string]bool)
+
+	for _, event := range dauEvents {
+		if event.UserID != "" {
+			dauUsers[event.UserID] = true
+		}
+	}
+
+	for _, event := range wauEvents {
+		if event.UserID != "" {
+			wauUsers[event.UserID] = true
+		}
+	}
+
+	for _, event := range mauEvents {
+		if event.UserID != "" {
+			mauUsers[event.UserID] = true
+		}
+	}
+
+	return len(dauUsers), len(wauUsers), len(mauUsers)
+}
+
 // Missing Handler Methods
 
 // GetDashboardHandler returns dashboard summary data
@@ -767,33 +864,116 @@ func (as *AnalyticsService) GetDashboardHandler(c *gin.Context) {
 
 	// Get date parameter or use today
 	dateParam := c.DefaultQuery("date", time.Now().Format("2006-01-02"))
+	today, _ := time.Parse("2006-01-02", dateParam)
+	yesterday := today.AddDate(0, 0, -1)
 
-	// For now, return mock data - in production you'd calculate from real events
+	// Calculate real metrics from events
+	todayEvents, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), dateParam, dateParam)
+	if err != nil {
+		log.Printf("Error fetching today's events: %v", err)
+	}
+
+	yesterdayEvents, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), yesterday.Format("2006-01-02"), yesterday.Format("2006-01-02"))
+	if err != nil {
+		log.Printf("Error fetching yesterday's events: %v", err)
+	}
+
+	// Calculate unique users
+	todayUsers := make(map[string]bool)
+	yesterdayUsers := make(map[string]bool)
+	todayPageViews := 0
+	yesterdayPageViews := 0
+
+	for _, event := range todayEvents {
+		if event.UserID != "" {
+			todayUsers[event.UserID] = true
+		}
+		if event.EventType == "page_view" || event.EventType == "pageview" {
+			todayPageViews++
+		}
+	}
+
+	for _, event := range yesterdayEvents {
+		if event.UserID != "" {
+			yesterdayUsers[event.UserID] = true
+		}
+		if event.EventType == "page_view" || event.EventType == "pageview" {
+			yesterdayPageViews++
+		}
+	}
+
+	// Calculate growth rates
+	eventGrowthRate := "0%"
+	userGrowthRate := "0%"
+	if len(yesterdayEvents) > 0 {
+		eventGrowth := float64(len(todayEvents)-len(yesterdayEvents)) / float64(len(yesterdayEvents)) * 100
+		eventGrowthRate = fmt.Sprintf("%+.1f%%", eventGrowth)
+	}
+	if len(yesterdayUsers) > 0 {
+		userGrowth := float64(len(todayUsers)-len(yesterdayUsers)) / float64(len(yesterdayUsers)) * 100
+		userGrowthRate = fmt.Sprintf("%+.1f%%", userGrowth)
+	}
+
+	// Calculate DAU, WAU, MAU
+	dau, wau, mau := as.calculateUserMetrics(accountID.(string), projectID.(string), today)
+
+	// Calculate top events
+	eventCounts := make(map[string]int)
+	totalEvents := 0
+	for _, event := range todayEvents {
+		eventCounts[event.EventType]++
+		totalEvents++
+	}
+
+	topEvents := make([]map[string]interface{}, 0)
+	for eventType, count := range eventCounts {
+		percentage := 0.0
+		if totalEvents > 0 {
+			percentage = float64(count) / float64(totalEvents) * 100
+		}
+		topEvents = append(topEvents, map[string]interface{}{
+			"event_type": eventType,
+			"count":      count,
+			"percentage": percentage,
+		})
+	}
+
+	// Sort top events by count
+	sort.Slice(topEvents, func(i, j int) bool {
+		return topEvents[i]["count"].(int) > topEvents[j]["count"].(int)
+	})
+
+	// Get total page views from last 30 days
+	thirtyDaysAgo := today.AddDate(0, 0, -30)
+	thirtyDayEvents, _ := as.fetchEventsForDateRange(accountID.(string), projectID.(string), thirtyDaysAgo.Format("2006-01-02"), dateParam)
+	totalPageViews := 0
+	for _, event := range thirtyDayEvents {
+		if event.EventType == "page_view" || event.EventType == "pageview" {
+			totalPageViews++
+		}
+	}
+
 	dashboardData := map[string]interface{}{
 		"date": dateParam,
 		"overview": map[string]interface{}{
-			"total_events_today":     142,
-			"total_events_yesterday": 98,
-			"unique_users_today":     67,
-			"unique_users_yesterday": 45,
-			"event_growth_rate":      "+44.9%",
-			"user_growth_rate":       "+48.9%",
+			"total_events_today":     len(todayEvents),
+			"total_events_yesterday": len(yesterdayEvents),
+			"unique_users_today":     len(todayUsers),
+			"unique_users_yesterday": len(yesterdayUsers),
+			"event_growth_rate":      eventGrowthRate,
+			"user_growth_rate":       userGrowthRate,
 		},
 		"user_metrics": map[string]interface{}{
-			"dau": 67,
-			"wau": 245,
-			"mau": 1024,
+			"dau": dau,
+			"wau": wau,
+			"mau": mau,
 		},
 		"page_metrics": map[string]interface{}{
-			"page_views_today":     89,
-			"page_views_yesterday": 67,
-			"total_page_views":     2456,
+			"page_views_today":     todayPageViews,
+			"page_views_yesterday": yesterdayPageViews,
+			"total_page_views":     totalPageViews,
 		},
-		"top_events": []map[string]interface{}{
-			{"event_type": "page_view", "count": 89, "percentage": 62.7},
-			{"event_type": "click", "count": 34, "percentage": 23.9},
-			{"event_type": "form_submit", "count": 19, "percentage": 13.4},
-		},
+		"top_events": topEvents,
 		"meta": map[string]interface{}{
 			"processing_time_ms": time.Since(start).Milliseconds(),
 			"cache_hit":          false,
@@ -815,18 +995,84 @@ func (as *AnalyticsService) GetRealTimeHandler(c *gin.Context) {
 		return
 	}
 
-	// Return real-time metrics
+	now := time.Now()
+	fiveMinutesAgo := now.Add(-5 * time.Minute)
+	oneHourAgo := now.Add(-1 * time.Hour)
+
+	// Get recent events from cache and recent data
+	todayEvents, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), now.Format("2006-01-02"), now.Format("2006-01-02"))
+	if err != nil {
+		log.Printf("Error fetching today's events for real-time: %v", err)
+	}
+
+	// Count events in different time windows
+	eventsLast5Min := 0
+	eventsLastHour := 0
+	currentVisitors := make(map[string]bool) // Track active sessions
+	pageVisits := make(map[string]int)
+
+	for _, event := range todayEvents {
+		// Count events in time windows
+		if event.Timestamp.After(fiveMinutesAgo) {
+			eventsLast5Min++
+		}
+		if event.Timestamp.After(oneHourAgo) {
+			eventsLastHour++
+
+			// Count current visitors (users active in last hour)
+			if event.UserID != "" {
+				currentVisitors[event.UserID] = true
+			} else if event.SessionID != "" {
+				currentVisitors[event.SessionID] = true
+			}
+		}
+
+		// Track page visits for top pages
+		if event.EventType == "page_view" || event.EventType == "pageview" {
+			if event.Properties != nil {
+				var pageURL string
+				if url, ok := event.Properties["url"].(string); ok {
+					pageURL = url
+				} else if path, ok := event.Properties["path"].(string); ok {
+					pageURL = path
+				} else if page, ok := event.Properties["page"].(string); ok {
+					pageURL = page
+				}
+
+				if pageURL != "" && event.Timestamp.After(oneHourAgo) {
+					pageVisits[pageURL]++
+				}
+			}
+		}
+	}
+
+	// Get top pages
+	topPages := make([]map[string]interface{}, 0)
+	for page, visitors := range pageVisits {
+		topPages = append(topPages, map[string]interface{}{
+			"page":     page,
+			"visitors": visitors,
+		})
+	}
+
+	// Sort by visitor count
+	sort.Slice(topPages, func(i, j int) bool {
+		return topPages[i]["visitors"].(int) > topPages[j]["visitors"].(int)
+	})
+
+	// Limit to top 10
+	if len(topPages) > 10 {
+		topPages = topPages[:10]
+	}
+
 	realTimeData := map[string]interface{}{
-		"current_visitors":  23,
-		"events_last_5_min": 45,
-		"events_last_hour":  312,
-		"cache_size":        as.getCacheSize(),
-		"top_pages_now": []map[string]interface{}{
-			{"page": "/dashboard", "visitors": 8},
-			{"page": "/analytics", "visitors": 6},
-			{"page": "/settings", "visitors": 3},
-		},
-		"timestamp": time.Now().UTC(),
+		"current_visitors":   len(currentVisitors),
+		"events_last_5_min":  eventsLast5Min,
+		"events_last_hour":   eventsLastHour,
+		"cache_size":         as.getCacheSize(),
+		"top_pages_now":      topPages,
+		"timestamp":          now.UTC(),
+		"total_events_today": len(todayEvents),
 	}
 
 	c.JSON(http.StatusOK, realTimeData)
@@ -853,17 +1099,44 @@ func (as *AnalyticsService) GetUserMetricsHandler(c *gin.Context) {
 		return
 	}
 
-	// For now, return mock data - in production you'd calculate from real events
+	// Calculate real user metrics
+	currentDate, _ := time.Parse("2006-01-02", dateParam)
+	previousDate := currentDate.AddDate(0, 0, -1)
+
+	// Calculate current metrics
+	dau, wau, mau := as.calculateUserMetrics(accountID.(string), projectID.(string), currentDate)
+
+	// Calculate previous day metrics for growth rates
+	prevDau, prevWau, prevMau := as.calculateUserMetrics(accountID.(string), projectID.(string), previousDate)
+
+	// Calculate growth rates
+	dauGrowth := "0%"
+	wauGrowth := "0%"
+	mauGrowth := "0%"
+
+	if prevDau > 0 {
+		growth := float64(dau-prevDau) / float64(prevDau) * 100
+		dauGrowth = fmt.Sprintf("%+.1f%%", growth)
+	}
+	if prevWau > 0 {
+		growth := float64(wau-prevWau) / float64(prevWau) * 100
+		wauGrowth = fmt.Sprintf("%+.1f%%", growth)
+	}
+	if prevMau > 0 {
+		growth := float64(mau-prevMau) / float64(prevMau) * 100
+		mauGrowth = fmt.Sprintf("%+.1f%%", growth)
+	}
+
 	userMetrics := map[string]interface{}{
 		"status": "success",
 		"data": map[string]interface{}{
 			"date":       dateParam,
-			"dau":        67,
-			"wau":        245,
-			"mau":        1024,
-			"dau_growth": "+12.3%",
-			"wau_growth": "+8.7%",
-			"mau_growth": "+15.2%",
+			"dau":        dau,
+			"wau":        wau,
+			"mau":        mau,
+			"dau_growth": dauGrowth,
+			"wau_growth": wauGrowth,
+			"mau_growth": mauGrowth,
 		},
 		"meta": map[string]interface{}{
 			"processing_time_ms": time.Since(start).Milliseconds(),
@@ -902,30 +1175,161 @@ func (as *AnalyticsService) GetHeatmapHandler(c *gin.Context) {
 		return
 	}
 
-	// Mock heatmap data
+	// Get query parameters
+	pageURL := c.Query("page_url")
+	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -7).Format("2006-01-02"))
+	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+
+	// Fetch real heatmap events from date range
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), startDate, endDate)
+	if err != nil {
+		log.Printf("Error fetching heatmap events: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch heatmap data"})
+		return
+	}
+
+	// Process heatmap data from events
+	pageHeatmaps := make(map[string][]map[string]interface{})
+	scrollData := make(map[string][]float64) // page -> scroll depths
+
+	for _, event := range events {
+		if event.EventType == "click" || event.EventType == "heatmap_click" {
+			if event.Properties != nil {
+				// Get page URL from event properties
+				eventPageURL := ""
+				if pageURLProp, ok := event.Properties["page_url"].(string); ok {
+					eventPageURL = pageURLProp
+				} else if pathProp, ok := event.Properties["path"].(string); ok {
+					eventPageURL = pathProp
+				} else if urlProp, ok := event.Properties["url"].(string); ok {
+					eventPageURL = urlProp
+				}
+
+				// Filter by page URL if specified
+				if pageURL != "" && eventPageURL != pageURL {
+					continue
+				}
+
+				// Extract coordinates
+				if x, okX := event.Properties["x"]; okX {
+					if y, okY := event.Properties["y"]; okY {
+						clickData := map[string]interface{}{
+							"x":     x,
+							"y":     y,
+							"count": 1, // We'll aggregate these later
+						}
+
+						if eventPageURL == "" {
+							eventPageURL = "unknown"
+						}
+
+						pageHeatmaps[eventPageURL] = append(pageHeatmaps[eventPageURL], clickData)
+					}
+				}
+			}
+		} else if event.EventType == "scroll" {
+			if event.Properties != nil {
+				// Get page URL and scroll depth
+				eventPageURL := ""
+				if pageURLProp, ok := event.Properties["page_url"].(string); ok {
+					eventPageURL = pageURLProp
+				} else if pathProp, ok := event.Properties["path"].(string); ok {
+					eventPageURL = pathProp
+				}
+
+				if scrollDepth, ok := event.Properties["scroll_depth"]; ok {
+					if depth, ok := scrollDepth.(float64); ok {
+						if eventPageURL == "" {
+							eventPageURL = "unknown"
+						}
+						scrollData[eventPageURL] = append(scrollData[eventPageURL], depth)
+					}
+				}
+			}
+		}
+	}
+
+	// Aggregate click data (merge clicks at same coordinates)
+	aggregatedHeatmaps := make([]map[string]interface{}, 0)
+	for page, clicks := range pageHeatmaps {
+		clickCounts := make(map[string]map[string]interface{})
+
+		for _, click := range clicks {
+			key := fmt.Sprintf("%v,%v", click["x"], click["y"])
+			if existing, exists := clickCounts[key]; exists {
+				existing["count"] = existing["count"].(int) + 1
+			} else {
+				clickCounts[key] = map[string]interface{}{
+					"x":     click["x"],
+					"y":     click["y"],
+					"count": 1,
+				}
+			}
+		}
+
+		// Convert to slice
+		aggregatedClicks := make([]map[string]interface{}, 0)
+		for _, clickData := range clickCounts {
+			aggregatedClicks = append(aggregatedClicks, clickData)
+		}
+
+		// Sort by count (highest first)
+		sort.Slice(aggregatedClicks, func(i, j int) bool {
+			return aggregatedClicks[i]["count"].(int) > aggregatedClicks[j]["count"].(int)
+		})
+
+		aggregatedHeatmaps = append(aggregatedHeatmaps, map[string]interface{}{
+			"page":   page,
+			"clicks": aggregatedClicks,
+		})
+	}
+
+	// Calculate scroll depth statistics
+	scrollStats := make(map[string]float64)
+	if len(scrollData) > 0 {
+		// Combine all scroll data
+		allScrolls := make([]float64, 0)
+		for _, scrolls := range scrollData {
+			allScrolls = append(allScrolls, scrolls...)
+		}
+
+		if len(allScrolls) > 0 {
+			sort.Float64s(allScrolls)
+
+			// Calculate percentages of users who reached certain depths
+			total := float64(len(allScrolls))
+			scrollStats["25%"] = float64(len(filterScrolls(allScrolls, 0.25))) / total
+			scrollStats["50%"] = float64(len(filterScrolls(allScrolls, 0.50))) / total
+			scrollStats["75%"] = float64(len(filterScrolls(allScrolls, 0.75))) / total
+			scrollStats["100%"] = float64(len(filterScrolls(allScrolls, 1.0))) / total
+		}
+	}
+
 	heatmapData := map[string]interface{}{
 		"status": "success",
 		"data": map[string]interface{}{
-			"page_heatmaps": []map[string]interface{}{
-				{
-					"page": "/dashboard",
-					"clicks": []map[string]interface{}{
-						{"x": 150, "y": 200, "count": 45},
-						{"x": 300, "y": 150, "count": 32},
-						{"x": 250, "y": 350, "count": 28},
-					},
-				},
+			"page_heatmaps": aggregatedHeatmaps,
+			"scroll_depth":  scrollStats,
+			"date_range": map[string]string{
+				"start": startDate,
+				"end":   endDate,
 			},
-			"scroll_depth": map[string]interface{}{
-				"25%":  0.89,
-				"50%":  0.67,
-				"75%":  0.45,
-				"100%": 0.23,
-			},
+			"total_events": len(events),
 		},
 	}
 
 	c.JSON(http.StatusOK, heatmapData)
+}
+
+// Helper function to filter scroll depths above a threshold
+func filterScrolls(scrolls []float64, threshold float64) []float64 {
+	result := make([]float64, 0)
+	for _, scroll := range scrolls {
+		if scroll >= threshold {
+			result = append(result, scroll)
+		}
+	}
+	return result
 }
 
 // GetErrorAnalyticsHandler returns error analytics data
@@ -1006,6 +1410,7 @@ func (as *AnalyticsService) GetSessionAnalyticsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, sessionData)
 }
 
+// TODO
 // GetRetentionCohortsHandler returns retention cohort analysis
 func (as *AnalyticsService) GetRetentionCohortsHandler(c *gin.Context) {
 	accountID, _ := c.Get("account_id")
