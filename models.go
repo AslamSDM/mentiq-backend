@@ -33,10 +33,11 @@ type User struct {
 
 // Project represents a project
 type Project struct {
-	ID        string    `gorm:"primaryKey" json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID           string    `gorm:"primaryKey" json:"id"`
+	Name         string    `json:"name"`
+	StripeAPIKey string    `json:"-" gorm:"column:stripe_api_key"` // Don't expose in JSON for security
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 
 	// Foreign keys
 	AccountID string  `json:"account_id"`
@@ -194,4 +195,282 @@ type SessionRecording struct {
 
 func (SessionRecording) TableName() string {
 	return "session_recording"
+}
+
+// StripeCustomer represents a Stripe customer record
+type StripeCustomer struct {
+	ID         string    `gorm:"primaryKey" json:"id"`    // Stripe customer ID
+	ProjectID  string    `json:"project_id" gorm:"index"` // FK to Project
+	Email      string    `json:"email"`
+	Name       string    `json:"name"`
+	Delinquent bool      `json:"delinquent"`
+	Balance    int64     `json:"balance"` // In cents
+	Currency   string    `json:"currency"`
+	Created    time.Time `json:"created"` // Stripe creation time
+	Deleted    bool      `json:"deleted" gorm:"default:false"`
+	LastSyncAt time.Time `json:"last_sync_at"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+
+	// Relations
+	Project       Project              `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+	Subscriptions []StripeSubscription `gorm:"foreignKey:CustomerID" json:"subscriptions,omitempty"`
+}
+
+// StripeSubscription represents a Stripe subscription record
+type StripeSubscription struct {
+	ID                 string     `gorm:"primaryKey" json:"id"`     // Stripe subscription ID
+	CustomerID         string     `json:"customer_id" gorm:"index"` // FK to StripeCustomer
+	ProjectID          string     `json:"project_id" gorm:"index"`  // FK to Project
+	Status             string     `json:"status"`                   // active, canceled, etc.
+	CurrentPeriodStart time.Time  `json:"current_period_start"`
+	CurrentPeriodEnd   time.Time  `json:"current_period_end"`
+	TrialStart         *time.Time `json:"trial_start"`
+	TrialEnd           *time.Time `json:"trial_end"`
+	CanceledAt         *time.Time `json:"canceled_at"`
+	EndedAt            *time.Time `json:"ended_at"`
+	StartDate          time.Time  `json:"start_date"`
+	PriceID            string     `json:"price_id"`
+	ProductID          string     `json:"product_id"`
+	UnitAmount         int64      `json:"unit_amount"` // In cents
+	Currency           string     `json:"currency"`
+	Quantity           int64      `json:"quantity"`
+	Interval           string     `json:"interval"` // month, year, etc.
+	IntervalCount      int64      `json:"interval_count"`
+	Created            time.Time  `json:"created"` // Stripe creation time
+	LastSyncAt         time.Time  `json:"last_sync_at"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+
+	// Relations
+	Customer StripeCustomer  `gorm:"foreignKey:CustomerID;references:ID" json:"customer,omitempty"`
+	Project  Project         `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+	Invoices []StripeInvoice `gorm:"foreignKey:SubscriptionID" json:"invoices,omitempty"`
+}
+
+// StripeInvoice represents a Stripe invoice record
+type StripeInvoice struct {
+	ID             string     `gorm:"primaryKey" json:"id"`         // Stripe invoice ID
+	CustomerID     string     `json:"customer_id" gorm:"index"`     // FK to StripeCustomer
+	SubscriptionID *string    `json:"subscription_id" gorm:"index"` // FK to StripeSubscription (nullable)
+	ProjectID      string     `json:"project_id" gorm:"index"`      // FK to Project
+	Status         string     `json:"status"`                       // paid, open, draft, uncollectible, void
+	AmountPaid     int64      `json:"amount_paid"`                  // In cents
+	AmountDue      int64      `json:"amount_due"`                   // In cents
+	Subtotal       int64      `json:"subtotal"`                     // In cents
+	Total          int64      `json:"total"`                        // In cents
+	Currency       string     `json:"currency"`
+	PeriodStart    time.Time  `json:"period_start"`
+	PeriodEnd      time.Time  `json:"period_end"`
+	Created        time.Time  `json:"created"` // Stripe creation time
+	DueDate        *time.Time `json:"due_date"`
+	PaidAt         *time.Time `json:"paid_at"`
+	LastSyncAt     time.Time  `json:"last_sync_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+
+	// Relations
+	Customer     StripeCustomer      `gorm:"foreignKey:CustomerID;references:ID" json:"customer,omitempty"`
+	Subscription *StripeSubscription `gorm:"foreignKey:SubscriptionID;references:ID" json:"subscription,omitempty"`
+	Project      Project             `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// StripeCharge represents a Stripe charge/payment record
+type StripeCharge struct {
+	ID             string    `gorm:"primaryKey" json:"id"`     // Stripe charge ID
+	CustomerID     *string   `json:"customer_id" gorm:"index"` // FK to StripeCustomer (nullable)
+	InvoiceID      *string   `json:"invoice_id" gorm:"index"`  // FK to StripeInvoice (nullable)
+	ProjectID      string    `json:"project_id" gorm:"index"`  // FK to Project
+	Amount         int64     `json:"amount"`                   // In cents
+	AmountCaptured int64     `json:"amount_captured"`          // In cents
+	AmountRefunded int64     `json:"amount_refunded"`          // In cents
+	Currency       string    `json:"currency"`
+	Status         string    `json:"status"` // succeeded, pending, failed
+	Paid           bool      `json:"paid"`
+	Refunded       bool      `json:"refunded"`
+	Created        time.Time `json:"created"` // Stripe creation time
+	LastSyncAt     time.Time `json:"last_sync_at"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+
+	// Relations
+	Customer *StripeCustomer `gorm:"foreignKey:CustomerID;references:ID" json:"customer,omitempty"`
+	Invoice  *StripeInvoice  `gorm:"foreignKey:InvoiceID;references:ID" json:"invoice,omitempty"`
+	Project  Project         `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// RevenueMetrics represents calculated revenue metrics for a project
+type RevenueMetrics struct {
+	ID                       uint      `gorm:"primaryKey" json:"id"`
+	ProjectID                string    `json:"project_id" gorm:"index"`
+	Date                     time.Time `json:"date" gorm:"index"` // Date for the metrics
+	MRR                      int64     `json:"mrr"`               // Monthly Recurring Revenue in cents
+	ARR                      int64     `json:"arr"`               // Annual Recurring Revenue in cents
+	TotalRevenue             int64     `json:"total_revenue"`     // Total revenue in cents
+	ActiveSubscriptions      int       `json:"active_subscriptions"`
+	CanceledSubscriptions    int       `json:"canceled_subscriptions"`
+	NewSubscriptions         int       `json:"new_subscriptions"`
+	ChurnedSubscriptions     int       `json:"churned_subscriptions"`
+	ExpansionRevenue         int64     `json:"expansion_revenue"`            // In cents
+	ContractionRevenue       int64     `json:"contraction_revenue"`          // In cents
+	NetRevenue               int64     `json:"net_revenue"`                  // In cents
+	ChurnRate                float64   `json:"churn_rate"`                   // Percentage
+	GrowthRate               float64   `json:"growth_rate"`                  // Percentage
+	ARPU                     int64     `json:"arpu"`                         // Average Revenue Per User in cents
+	CustomerLifetimeValue    int64     `json:"customer_lifetime_value"`      // In cents
+	TrialToPayConversionRate float64   `json:"trial_to_pay_conversion_rate"` // Percentage
+	CreatedAt                time.Time `json:"created_at"`
+	UpdatedAt                time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// UserSessionMetrics represents user session analytics
+type UserSessionMetrics struct {
+	ID                 uint      `gorm:"primaryKey" json:"id"`
+	ProjectID          string    `json:"project_id" gorm:"index"`
+	Date               time.Time `json:"date" gorm:"index"`
+	DAU                int       `json:"dau"`                   // Daily Active Users
+	WAU                int       `json:"wau"`                   // Weekly Active Users
+	MAU                int       `json:"mau"`                   // Monthly Active Users
+	StickinessRatio    float64   `json:"stickiness_ratio"`      // DAU/MAU
+	AvgSessionDuration int       `json:"avg_session_duration"`  // In seconds
+	AvgSessionsPerUser float64   `json:"avg_sessions_per_user"` // Sessions per user
+	TotalSessions      int       `json:"total_sessions"`
+	BounceRate         float64   `json:"bounce_rate"`      // Percentage
+	ReturnUserRate     float64   `json:"return_user_rate"` // Percentage
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// UserCohortMetrics represents retention cohort analysis
+type UserCohortMetrics struct {
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	ProjectID       string    `json:"project_id" gorm:"index"`
+	CohortMonth     time.Time `json:"cohort_month" gorm:"index"` // Month users signed up
+	PeriodNumber    int       `json:"period_number"`             // 0, 1, 2, 3... months after signup
+	UsersInCohort   int       `json:"users_in_cohort"`           // Total users who signed up in cohort_month
+	ActiveUsers     int       `json:"active_users"`              // Users still active in this period
+	RetentionRate   float64   `json:"retention_rate"`            // Percentage
+	RevenueRetained float64   `json:"revenue_retained"`          // Revenue retained from this cohort
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// DeviceAnalytics represents device and platform analytics
+type DeviceAnalytics struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	ProjectID      string    `json:"project_id" gorm:"index"`
+	Date           time.Time `json:"date" gorm:"index"`
+	Device         string    `json:"device" gorm:"index"`  // desktop, mobile, tablet
+	OS             string    `json:"os" gorm:"index"`      // iOS, Android, Windows, macOS, Linux
+	Browser        string    `json:"browser" gorm:"index"` // Chrome, Safari, Firefox, etc.
+	Sessions       int       `json:"sessions"`             // Number of sessions
+	Users          int       `json:"users"`                // Unique users
+	PageViews      int       `json:"page_views"`           // Total page views
+	BounceRate     float64   `json:"bounce_rate"`          // Percentage
+	AvgSessionTime int       `json:"avg_session_time"`     // In seconds
+	ConversionRate float64   `json:"conversion_rate"`      // Percentage
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// LocationAnalytics represents geographical analytics
+type LocationAnalytics struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	ProjectID      string    `json:"project_id" gorm:"index"`
+	Date           time.Time `json:"date" gorm:"index"`
+	Country        string    `json:"country" gorm:"index"`
+	CountryCode    string    `json:"country_code" gorm:"index"` // ISO 3166-1 alpha-2
+	City           string    `json:"city" gorm:"index"`
+	Sessions       int       `json:"sessions"`
+	Users          int       `json:"users"`
+	PageViews      int       `json:"page_views"`
+	BounceRate     float64   `json:"bounce_rate"`     // Percentage
+	ConversionRate float64   `json:"conversion_rate"` // Percentage
+	Revenue        int64     `json:"revenue"`         // In cents
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// FeatureAdoption represents feature adoption analytics
+type FeatureAdoption struct {
+	ID                   uint      `gorm:"primaryKey" json:"id"`
+	ProjectID            string    `json:"project_id" gorm:"index"`
+	Date                 time.Time `json:"date" gorm:"index"`
+	FeatureName          string    `json:"feature_name" gorm:"index"`
+	TotalUsers           int       `json:"total_users"`             // Total active users in period
+	UsersWhoTriedFeature int       `json:"users_who_tried_feature"` // Users who used feature at least once
+	AdoptionRate         float64   `json:"adoption_rate"`           // Percentage
+	DailyActiveFeature   int       `json:"daily_active_feature"`    // Daily users of this feature
+	WeeklyActiveFeature  int       `json:"weekly_active_feature"`   // Weekly users of this feature
+	MonthlyActiveFeature int       `json:"monthly_active_feature"`  // Monthly users of this feature
+	FeatureStickiness    float64   `json:"feature_stickiness"`      // DAF/MAF ratio
+	TimeToFirstUse       int       `json:"time_to_first_use"`       // Avg days from signup to first use
+	DropoffAfterFirstUse float64   `json:"dropoff_after_first_use"` // Percentage who don't return
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// ConversionFunnel represents conversion funnel analytics
+type ConversionFunnel struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	ProjectID      string    `json:"project_id" gorm:"index"`
+	Date           time.Time `json:"date" gorm:"index"`
+	FunnelName     string    `json:"funnel_name" gorm:"index"` // e.g., "signup_to_paid"
+	StepNumber     int       `json:"step_number"`              // 1, 2, 3, etc.
+	StepName       string    `json:"step_name"`                // e.g., "signup", "onboarding", "first_purchase"
+	Users          int       `json:"users"`                    // Users who reached this step
+	ConversionRate float64   `json:"conversion_rate"`          // % who converted from previous step
+	DropoffRate    float64   `json:"dropoff_rate"`             // % who dropped off at this step
+	AvgTimeInStep  int       `json:"avg_time_in_step"`         // Avg time spent in this step (seconds)
+	Revenue        int64     `json:"revenue"`                  // Revenue generated at this step (cents)
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+}
+
+// ChurnAnalytics represents churn prediction and analysis
+type ChurnAnalytics struct {
+	ID                  uint       `gorm:"primaryKey" json:"id"`
+	ProjectID           string     `json:"project_id" gorm:"index"`
+	Date                time.Time  `json:"date" gorm:"index"`
+	UserID              string     `json:"user_id" gorm:"index"`
+	ChurnRiskScore      float64    `json:"churn_risk_score"`    // 0-100 risk score
+	ChurnRiskCategory   string     `json:"churn_risk_category"` // low, medium, high, critical
+	LastActiveDate      time.Time  `json:"last_active_date"`
+	DaysSinceLastActive int        `json:"days_since_last_active"`
+	LoginFrequency      float64    `json:"login_frequency"`     // Logins per week
+	FeatureUsageScore   float64    `json:"feature_usage_score"` // 0-100 based on feature adoption
+	SupportTickets      int        `json:"support_tickets"`     // Number of support tickets
+	NegativeFeedback    int        `json:"negative_feedback"`   // Count of negative feedback
+	SubscriptionValue   int64      `json:"subscription_value"`  // Monthly value in cents
+	IsChurned           bool       `json:"is_churned"`
+	ChurnedAt           *time.Time `json:"churned_at"`
+	ChurnReason         string     `json:"churn_reason"`
+	PredictedChurnDate  *time.Time `json:"predicted_churn_date"`
+	InterventionSent    bool       `json:"intervention_sent"` // Whether retention campaign was sent
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
 }

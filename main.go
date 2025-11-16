@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +29,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/mileusna/useragent"
+	geoip2 "github.com/oschwald/geoip2-golang"
 	"github.com/stripe/stripe-go/v72/client"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
@@ -125,12 +128,21 @@ func NewAnalyticsService(bucketName string, db *gorm.DB) (*AnalyticsService, err
 }
 
 type Server struct {
-	db               *gorm.DB
-	analyticsService *AnalyticsService
+	db                       *gorm.DB
+	analyticsService         *AnalyticsService
+	stripeService            *StripeService
+	enhancedAnalyticsService *EnhancedAnalyticsService
 }
 
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
-	return &Server{db: db, analyticsService: analyticsService}
+	stripeService := NewStripeService(db)
+	enhancedAnalyticsService := NewEnhancedAnalyticsService(db)
+	return &Server{
+		db:                       db,
+		analyticsService:         analyticsService,
+		stripeService:            stripeService,
+		enhancedAnalyticsService: enhancedAnalyticsService,
+	}
 }
 
 func (s *Server) Connect() error {
@@ -358,6 +370,7 @@ func main() {
 
 	// API routes
 	apiV1 := router.Group("/api/v1")
+
 	apiV1.Use(server.authMiddleware) // Apply auth middleware to all v1 routes
 	{
 		apiV1.POST("/events", server.analyticsService.ingestEventHandler)
@@ -375,22 +388,53 @@ func main() {
 
 		// Session Recording routes
 		apiV1.POST("/sessions/:session_id/recordings", server.ingestRecordingHandler)
-		apiV1.GET("/recordings", server.listRecordingsHandler)
-		apiV1.GET("/recordings/:id", server.getRecordingHandler)
+		apiV1.GET("/projects/:project_id/recordings", server.listRecordingsHandler)
+		apiV1.GET("/projects/:project_id/recordings/:recordingId", server.getRecordingHandler)
+		apiV1.GET("/projects/:project_id/sessions", server.getSessionsHandler)
+		apiV1.GET("/projects/:project_id/sessions/:sessionId", server.getSessionHandler)
+
+		// Heatmap routes
+		apiV1.GET("/projects/:project_id/heatmaps", server.analyticsService.GetHeatmapHandler)
+		apiV1.GET("/projects/:project_id/heatmaps/pages", server.getHeatmapPagesHandler)
+		apiV1.POST("/projects/:project_id/heatmaps/click", server.ingestClickEventHandler)
+		apiV1.POST("/projects/:project_id/heatmaps/scroll", server.ingestScrollEventHandler)
+		apiV1.POST("/projects/:project_id/heatmaps/events", server.ingestHeatmapEventHandler)
 
 		// Project and API Key management
 		apiV1.POST("/projects", server.createProjectHandler)
 		apiV1.GET("/projects", server.listProjectsHandler)
 		apiV1.POST("/projects/:project_id/apikeys", server.createApiKeyHandler)
+		apiV1.GET("/projects/:project_id/apikeys", server.listApiKeysHandler)
+		apiV1.PUT("/projects/:project_id/apikeys/:key_id", server.updateApiKeyHandler)
+		apiV1.DELETE("/projects/:project_id/apikeys/:key_id", server.deleteApiKeyHandler)
 		apiV1.PUT("/projects/:project_id/stripe-key", server.updateProjectStripeApiKeyHandler)
 
+		// Stripe Revenue Analytics routes
+		apiV1.POST("/projects/:project_id/stripe/sync", server.stripeService.SyncStripeDataHandler)
+		apiV1.GET("/projects/:project_id/stripe/metrics", server.stripeService.GetRevenueMetricsHandler)
+		apiV1.GET("/projects/:project_id/stripe/analytics", server.stripeService.GetRevenueAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/stripe/customers", server.stripeService.GetCustomerAnalyticsHandler)
+
+		// Enhanced Analytics routes
+		apiV1.GET("/projects/:project_id/analytics/location", server.enhancedAnalyticsService.LocationAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/analytics/devices", server.enhancedAnalyticsService.DeviceAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/analytics/cohorts", server.enhancedAnalyticsService.RetentionCohortHandler)
+		apiV1.GET("/projects/:project_id/analytics/features", server.enhancedAnalyticsService.FeatureAdoptionHandler)
+		apiV1.GET("/projects/:project_id/analytics/churn", server.enhancedAnalyticsService.ChurnRiskHandler)
+		apiV1.GET("/projects/:project_id/analytics/funnels", server.enhancedAnalyticsService.ConversionFunnelHandler)
+		apiV1.GET("/projects/:project_id/analytics/sessions", server.enhancedAnalyticsService.SessionAnalyticsHandler)
+
 		// A/B Testing routes
-		apiV1.POST("/experiments", server.CreateExperiment)
-		apiV1.GET("/experiments", server.GetExperiments)
-		apiV1.GET("/experiments/:id", server.GetExperiment)
+		apiV1.POST("/projects/:project_id/experiments", server.CreateExperiment)
+		apiV1.GET("/projects/:project_id/experiments", server.GetExperiments)
+		apiV1.GET("/projects/:project_id/experiments/:experimentId", server.GetExperiment)
+		apiV1.PATCH("/projects/:project_id/experiments/:experimentId", server.UpdateExperiment)
+		apiV1.DELETE("/projects/:project_id/experiments/:experimentId", server.DeleteExperiment)
+		apiV1.GET("/projects/:project_id/experiments/:experimentId/results", server.GetExperimentResults)
+
+		// Global experiment routes (for SDK)
 		apiV1.POST("/experiments/:experimentKey/assignment", server.GetAssignment)
 		apiV1.POST("/experiments/track", server.TrackConversion)
-		apiV1.GET("/experiments/:id/results", server.GetExperimentResults)
 		apiV1.PUT("/experiments/:id/status", server.UpdateExperimentStatus)
 	}
 
@@ -450,9 +494,21 @@ func (as *AnalyticsService) Stop() {
 // addEventToCache adds an event to the memory cache
 func (as *AnalyticsService) addEventToCache(event Event) {
 	as.cacheMutex.Lock()
-	defer as.cacheMutex.Unlock()
+
+	// Add event to cache
 	as.eventCache = append(as.eventCache, event)
-	log.Printf("Event %s added to cache. Cache size: %d", event.EventID, len(as.eventCache))
+	cacheSize := len(as.eventCache)
+
+	as.cacheMutex.Unlock()
+
+	log.Printf("Event %s added to cache. Cache size: %d", event.EventID, cacheSize)
+
+	// Auto-flush if cache exceeds threshold (1000 events)
+	const maxCacheSize = 1000
+	if cacheSize >= maxCacheSize {
+		log.Printf("Cache size reached %d, triggering auto-flush", cacheSize)
+		go as.flushEventCache()
+	}
 }
 
 // flushEventCache processes all cached events and uploads them to S3 in batches
@@ -539,11 +595,11 @@ func (as *AnalyticsService) storeBatchToS3(events []Event) (int, int) {
 		return 0, len(events)
 	}
 
-	// Upload to S3
+	// Upload to S3/R2
 	_, err = as.s3Client.PutObject(&s3.PutObjectInput{
 		Bucket:      aws.String(as.bucketName),
 		Key:         aws.String(key),
-		Body:        aws.ReadSeekCloser(strings.NewReader(string(batchJSON))),
+		Body:        bytes.NewReader(batchJSON),
 		ContentType: aws.String("application/json"),
 		Metadata: map[string]*string{
 			"batch-id":    aws.String(batchID),
@@ -705,37 +761,6 @@ func (as *AnalyticsService) cleanExpiredCache() {
 	}
 }
 
-func (as *AnalyticsService) storeEventToS3(event Event) error {
-	eventJSON, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event: %v", err)
-	}
-
-	// Create S3 key with account, project, and date partitioning
-	key := fmt.Sprintf("events/account_id=%s/project_id=%s/year=%d/month=%02d/day=%02d/%s.json",
-		event.AccountID,
-		event.ProjectID,
-		event.Timestamp.Year(),
-		event.Timestamp.Month(),
-		event.Timestamp.Day(),
-		event.EventID,
-	)
-
-	_, err = as.s3Client.PutObject(&s3.PutObjectInput{
-		Bucket:      aws.String(as.bucketName),
-		Key:         aws.String(key),
-		Body:        aws.ReadSeekCloser(strings.NewReader(string(eventJSON))),
-		ContentType: aws.String("application/json"),
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to store event to S3: %v", err)
-	}
-
-	log.Printf("Event %s stored to S3 with key: %s", event.EventID, key)
-	return nil
-}
-
 func (as *AnalyticsService) ingestEventHandler(c *gin.Context) {
 	var event Event
 	if err := c.ShouldBindJSON(&event); err != nil {
@@ -794,11 +819,70 @@ func (as *AnalyticsService) ingestEventHandler(c *gin.Context) {
 	})
 }
 
+// Global GeoIP database reader (initialized once)
+var geoipDB *geoip2.Reader
+var geoipOnce sync.Once
+
 func getGeoLocation(ipAddress string) (string, string) {
-	// In a real application, you would use a service like MaxMind GeoIP
-	// to get the location from the IP address.
-	// For this example, we'll return dummy data.
-	return "United States", "New York"
+	// Initialize GeoIP database once
+	geoipOnce.Do(func() {
+		mmdbPath := os.Getenv("GEOIP_MMDB_PATH")
+		if mmdbPath == "" {
+			mmdbPath = "./GeoLite2-City.mmdb" // Default path
+		}
+
+		db, err := geoip2.Open(mmdbPath)
+		if err != nil {
+			log.Printf("Warning: Failed to open GeoIP database at %s: %v", mmdbPath, err)
+			log.Printf("Geolocation will return default values. Download from: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data")
+			return
+		}
+		geoipDB = db
+		log.Printf("GeoIP database loaded successfully from: %s", mmdbPath)
+	})
+
+	// If GeoIP database is not available, return default
+	if geoipDB == nil {
+		return "Unknown", "Unknown"
+	}
+
+	// Parse IP address
+	ip := net.ParseIP(ipAddress)
+	if ip == nil {
+		log.Printf("Invalid IP address: %s", ipAddress)
+		return "Unknown", "Unknown"
+	}
+
+	// Skip private/local IPs
+	if ip.IsPrivate() || ip.IsLoopback() {
+		return "Local", "Local"
+	}
+
+	// Query the database
+	record, err := geoipDB.City(ip)
+	if err != nil {
+		log.Printf("Error looking up IP %s: %v", ipAddress, err)
+		return "Unknown", "Unknown"
+	}
+
+	country := "Unknown"
+	city := "Unknown"
+
+	// Extract country
+	if record.Country.Names != nil {
+		if name, ok := record.Country.Names["en"]; ok && name != "" {
+			country = name
+		}
+	}
+
+	// Extract city
+	if record.City.Names != nil {
+		if name, ok := record.City.Names["en"]; ok && name != "" {
+			city = name
+		}
+	}
+
+	return country, city
 }
 
 func (as *AnalyticsService) batchIngestHandler(c *gin.Context) {
@@ -1084,9 +1168,9 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 
 // listRecordingsHandler returns a list of recordings for a project
 func (s *Server) listRecordingsHandler(c *gin.Context) {
-	projectID := c.Query("project_id")
+	projectID := c.Param("project_id")
 	if projectID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id query parameter is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id is required"})
 		return
 	}
 
@@ -1145,11 +1229,12 @@ func (s *Server) listRecordingsHandler(c *gin.Context) {
 
 // getRecordingHandler returns a specific recording with its events
 func (s *Server) getRecordingHandler(c *gin.Context) {
-	recordingID := c.Param("id")
+	recordingID := c.Param("recordingId")
+	projectID := c.Param("project_id")
 
-	// Fetch recording metadata from database
+	// Fetch recording metadata from database and verify it belongs to the project
 	var recording SessionRecording
-	if err := s.db.Where("id = ?", recordingID).First(&recording).Error; err != nil {
+	if err := s.db.Where("id = ? AND project_id = ?", recordingID, projectID).First(&recording).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found"})
 			return
@@ -1193,6 +1278,479 @@ func (s *Server) getRecordingHandler(c *gin.Context) {
 		"updated_at":  recording.UpdatedAt,
 		"events":      events,
 	})
+}
+
+// getSessionsHandler returns a list of sessions for a project
+func (s *Server) getSessionsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id is required"})
+		return
+	}
+
+	// Optional filters
+	userID := c.Query("user_id")
+	limit := 50
+	offset := 0
+
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+
+	if offsetStr := c.Query("offset"); offsetStr != "" {
+		if parsedOffset, err := strconv.Atoi(offsetStr); err == nil && parsedOffset >= 0 {
+			offset = parsedOffset
+		}
+	}
+
+	// For now, get sessions from events - in a real implementation you might have a separate sessions table
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	if startDate == "" {
+		startDate = time.Now().AddDate(0, 0, -7).Format("2006-01-02")
+	}
+	if endDate == "" {
+		endDate = time.Now().Format("2006-01-02")
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Fetch events to construct sessions
+	events, err := s.analyticsService.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	if err != nil {
+		log.Printf("Failed to fetch events for sessions: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve sessions"})
+		return
+	}
+
+	// Group events by session_id to create session summaries
+	sessionMap := make(map[string]map[string]interface{})
+	for _, event := range events {
+		sessionID := event.SessionID
+		if sessionID == "" {
+			continue
+		}
+
+		if userID != "" && event.UserID != userID {
+			continue
+		}
+
+		session, exists := sessionMap[sessionID]
+		if !exists {
+			session = map[string]interface{}{
+				"id":         sessionID,
+				"user_id":    event.UserID,
+				"start_time": event.Timestamp,
+				"end_time":   event.Timestamp,
+				"events":     0,
+				"page_views": 0,
+				"device":     "Unknown",
+				"browser":    "Unknown",
+				"location":   "Unknown",
+			}
+			sessionMap[sessionID] = session
+		}
+
+		// Update session data
+		session["events"] = session["events"].(int) + 1
+		if event.EventType == "page_view" {
+			session["page_views"] = session["page_views"].(int) + 1
+		}
+
+		// Update end time if this event is later
+		if event.Timestamp.After(session["end_time"].(time.Time)) {
+			session["end_time"] = event.Timestamp
+		}
+
+		// Update start time if this event is earlier
+		if event.Timestamp.Before(session["start_time"].(time.Time)) {
+			session["start_time"] = event.Timestamp
+		}
+
+		// Extract device info from event if available
+		if event.Device != "" {
+			session["device"] = event.Device
+		}
+		if event.Browser != "" {
+			session["browser"] = event.Browser
+		}
+		if event.Country != "" {
+			session["location"] = event.Country
+		}
+	}
+
+	// Convert to slice and calculate durations
+	sessions := make([]map[string]interface{}, 0, len(sessionMap))
+	for _, session := range sessionMap {
+		startTime := session["start_time"].(time.Time)
+		endTime := session["end_time"].(time.Time)
+		session["duration"] = int(endTime.Sub(startTime).Seconds())
+		sessions = append(sessions, session)
+	}
+
+	// Sort by start time descending
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i]["start_time"].(time.Time).After(sessions[j]["start_time"].(time.Time))
+	})
+
+	// Apply pagination
+	total := len(sessions)
+	start := offset
+	end := offset + limit
+	if start > total {
+		start = total
+	}
+	if end > total {
+		end = total
+	}
+
+	paginatedSessions := sessions[start:end]
+
+	c.JSON(http.StatusOK, gin.H{
+		"sessions": paginatedSessions,
+		"total":    total,
+		"limit":    limit,
+		"offset":   offset,
+	})
+}
+
+// getSessionHandler returns detailed information about a specific session
+func (s *Server) getSessionHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	sessionID := c.Param("sessionId")
+
+	if projectID == "" || sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id and session_id are required"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Fetch events for this session
+	startDate := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+	endDate := time.Now().Format("2006-01-02")
+
+	events, err := s.analyticsService.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	if err != nil {
+		log.Printf("Failed to fetch events for session: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve session"})
+		return
+	}
+
+	// Filter events for this session
+	sessionEvents := make([]Event, 0)
+	for _, event := range events {
+		if event.SessionID == sessionID {
+			sessionEvents = append(sessionEvents, event)
+		}
+	}
+
+	if len(sessionEvents) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
+		return
+	}
+
+	// Sort events by timestamp
+	sort.Slice(sessionEvents, func(i, j int) bool {
+		return sessionEvents[i].Timestamp.Before(sessionEvents[j].Timestamp)
+	})
+
+	// Calculate session summary
+	firstEvent := sessionEvents[0]
+	lastEvent := sessionEvents[len(sessionEvents)-1]
+	duration := int(lastEvent.Timestamp.Sub(firstEvent.Timestamp).Seconds())
+
+	pageViews := 0
+	for _, event := range sessionEvents {
+		if event.EventType == "page_view" {
+			pageViews++
+		}
+	}
+
+	session := map[string]interface{}{
+		"id":         sessionID,
+		"user_id":    firstEvent.UserID,
+		"start_time": firstEvent.Timestamp,
+		"end_time":   lastEvent.Timestamp,
+		"duration":   duration,
+		"events":     sessionEvents,
+		"page_views": pageViews,
+		"device":     "Unknown",
+		"browser":    "Unknown",
+		"location":   "Unknown",
+	}
+
+	// Extract device info from event if available
+	if firstEvent.Device != "" {
+		session["device"] = firstEvent.Device
+	}
+	if firstEvent.Browser != "" {
+		session["browser"] = firstEvent.Browser
+	}
+	if firstEvent.Country != "" {
+		session["location"] = firstEvent.Country
+	}
+
+	c.JSON(http.StatusOK, session)
+}
+
+// ingestClickEventHandler handles click event ingestion for heatmaps
+func (s *Server) ingestClickEventHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var clickData map[string]interface{}
+	if err := c.ShouldBindJSON(&clickData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+
+	// Create event with click type
+	event := Event{
+		EventID:    uuid.New().String(),
+		EventType:  "click",
+		Timestamp:  time.Now(),
+		Properties: clickData,
+		UserAgent:  c.GetHeader("User-Agent"),
+		IPAddress:  getClientIPFromGin(c),
+		AccountID:  accountID.(string),
+		ProjectID:  projectID,
+	}
+
+	// Extract user/session IDs if provided
+	if userID, ok := clickData["user_id"].(string); ok {
+		event.UserID = userID
+	}
+	if sessionID, ok := clickData["session_id"].(string); ok {
+		event.SessionID = sessionID
+	}
+
+	// Parse User-Agent for device info
+	ua := useragent.Parse(event.UserAgent)
+	event.Device = ua.Device
+	event.OS = ua.OS
+	event.Browser = ua.Name
+
+	// Get geo location
+	country, city := getGeoLocation(event.IPAddress)
+	event.Country = country
+	event.City = city
+
+	// Add to cache
+	s.analyticsService.addEventToCache(event)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "success",
+		"event_id": event.EventID,
+	})
+}
+
+// ingestScrollEventHandler handles scroll event ingestion for heatmaps
+func (s *Server) ingestScrollEventHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var scrollData map[string]interface{}
+	if err := c.ShouldBindJSON(&scrollData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+
+	// Create event with scroll type
+	event := Event{
+		EventID:    uuid.New().String(),
+		EventType:  "scroll",
+		Timestamp:  time.Now(),
+		Properties: scrollData,
+		UserAgent:  c.GetHeader("User-Agent"),
+		IPAddress:  getClientIPFromGin(c),
+		AccountID:  accountID.(string),
+		ProjectID:  projectID,
+	}
+
+	// Extract user/session IDs if provided
+	if userID, ok := scrollData["user_id"].(string); ok {
+		event.UserID = userID
+	}
+	if sessionID, ok := scrollData["session_id"].(string); ok {
+		event.SessionID = sessionID
+	}
+
+	// Parse User-Agent for device info
+	ua := useragent.Parse(event.UserAgent)
+	event.Device = ua.Device
+	event.OS = ua.OS
+	event.Browser = ua.Name
+
+	// Get geo location
+	country, city := getGeoLocation(event.IPAddress)
+	event.Country = country
+	event.City = city
+
+	// Add to cache
+	s.analyticsService.addEventToCache(event)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "success",
+		"event_id": event.EventID,
+	})
+}
+
+// ingestHeatmapEventHandler handles generic heatmap event ingestion (click, scroll, mousemove, etc.)
+func (s *Server) ingestHeatmapEventHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var eventData map[string]interface{}
+	if err := c.ShouldBindJSON(&eventData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+
+	// Extract event type from data or default to "heatmap"
+	eventType := "heatmap"
+	if et, ok := eventData["event_type"].(string); ok && et != "" {
+		eventType = et
+	}
+
+	// Create event
+	event := Event{
+		EventID:    uuid.New().String(),
+		EventType:  eventType,
+		Timestamp:  time.Now(),
+		Properties: eventData,
+		UserAgent:  c.GetHeader("User-Agent"),
+		IPAddress:  getClientIPFromGin(c),
+		AccountID:  accountID.(string),
+		ProjectID:  projectID,
+	}
+
+	// Extract user/session IDs if provided
+	if userID, ok := eventData["user_id"].(string); ok {
+		event.UserID = userID
+	}
+	if sessionID, ok := eventData["session_id"].(string); ok {
+		event.SessionID = sessionID
+	}
+
+	// Parse User-Agent for device info
+	ua := useragent.Parse(event.UserAgent)
+	event.Device = ua.Device
+	event.OS = ua.OS
+	event.Browser = ua.Name
+
+	// Get geo location
+	country, city := getGeoLocation(event.IPAddress)
+	event.Country = country
+	event.City = city
+
+	// Add to cache
+	s.analyticsService.addEventToCache(event)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "success",
+		"event_id": event.EventID,
+	})
+}
+
+// getHeatmapPagesHandler returns a list of pages with heatmap data
+func (s *Server) getHeatmapPagesHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id is required"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Fetch recent events to get page URLs
+	startDate := time.Now().AddDate(0, 0, -7).Format("2006-01-02")
+	endDate := time.Now().Format("2006-01-02")
+
+	events, err := s.analyticsService.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	if err != nil {
+		log.Printf("Failed to fetch events for heatmap pages: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve pages"})
+		return
+	}
+
+	// Extract unique page URLs and count visits
+	pageMap := make(map[string]map[string]interface{})
+	for _, event := range events {
+		if event.Properties == nil {
+			continue
+		}
+
+		var url string
+		if urlProp, exists := event.Properties["url"]; exists {
+			if urlStr, ok := urlProp.(string); ok {
+				url = urlStr
+			}
+		}
+
+		if url == "" {
+			continue
+		}
+
+		page, exists := pageMap[url]
+		if !exists {
+			page = map[string]interface{}{
+				"id":           uuid.New().String(),
+				"url":          url,
+				"title":        url, // Default to URL, could extract from page_view events
+				"visits":       0,
+				"last_updated": event.Timestamp,
+			}
+			pageMap[url] = page
+		}
+
+		page["visits"] = page["visits"].(int) + 1
+		if event.Timestamp.After(page["last_updated"].(time.Time)) {
+			page["last_updated"] = event.Timestamp
+		}
+
+		// Try to get page title from properties
+		if title, exists := event.Properties["title"]; exists {
+			if titleStr, ok := title.(string); ok && titleStr != "" {
+				page["title"] = titleStr
+			}
+		}
+	}
+
+	// Convert to slice and sort by visits descending
+	pages := make([]map[string]interface{}, 0, len(pageMap))
+	for _, page := range pageMap {
+		pages = append(pages, page)
+	}
+
+	sort.Slice(pages, func(i, j int) bool {
+		return pages[i]["visits"].(int) > pages[j]["visits"].(int)
+	})
+
+	c.JSON(http.StatusOK, pages)
 }
 
 func (s *Server) signupHandler(c *gin.Context) {
@@ -1429,25 +1987,131 @@ func (s *Server) createApiKeyHandler(c *gin.Context) {
 	})
 }
 
-func (s *Server) analyticsHandler(c *gin.Context) {
-	// Mock analytics data - in a real implementation, you'd query the database
+func (s *Server) listApiKeysHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	accountID, _ := c.Get("account_id")
+
+	// Verify project exists and belongs to user
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	var apiKeys []APIKey
+	if err := s.db.Where("project_id = ?", projectID).Find(&apiKeys).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch API keys"})
+		return
+	}
+
+	var result []gin.H
+	for _, key := range apiKeys {
+		result = append(result, gin.H{
+			"id":          key.ID,
+			"name":        key.Name,
+			"key":         key.Key,
+			"permissions": key.Permissions,
+			"isActive":    key.IsActive,
+			"projectId":   key.ProjectID,
+			"createdAt":   key.CreatedAt,
+			"updatedAt":   key.UpdatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) updateApiKeyHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	keyID := c.Param("key_id")
+	accountID, _ := c.Get("account_id")
+
+	// Verify project exists and belongs to user
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	var updateReq struct {
+		Name        *string  `json:"name"`
+		Permissions []string `json:"permissions"`
+		IsActive    *bool    `json:"isActive"`
+	}
+
+	if err := c.ShouldBindJSON(&updateReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var apiKey APIKey
+	if err := s.db.Where("id = ? AND project_id = ?", keyID, projectID).First(&apiKey).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "API key not found"})
+		return
+	}
+
+	// Update fields if provided
+	updates := make(map[string]interface{})
+	if updateReq.Name != nil {
+		updates["name"] = *updateReq.Name
+	}
+	if updateReq.Permissions != nil {
+		updates["permissions"] = updateReq.Permissions
+	}
+	if updateReq.IsActive != nil {
+		updates["is_active"] = *updateReq.IsActive
+	}
+
+	if len(updates) > 0 {
+		if err := s.db.Model(&apiKey).Updates(updates).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update API key"})
+			return
+		}
+	}
+
+	// Fetch the updated key
+	if err := s.db.Where("id = ?", keyID).First(&apiKey).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch updated API key"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"totalEvents":        15420,
-		"uniqueUsers":        3284,
-		"sessions":           8921,
-		"bounceRate":         32.5,
-		"avgSessionDuration": 245,
-		"topPages": []map[string]interface{}{
-			{"page": "/dashboard", "views": 3421},
-			{"page": "/projects", "views": 2156},
-			{"page": "/analytics", "views": 1876},
-		},
-		"eventsOverTime": []map[string]interface{}{
-			{"date": "2024-01-20", "count": 1200},
-			{"date": "2024-01-21", "count": 1450},
-			{"date": "2024-01-22", "count": 1680},
-		},
+		"id":          apiKey.ID,
+		"name":        apiKey.Name,
+		"key":         apiKey.Key,
+		"permissions": apiKey.Permissions,
+		"isActive":    apiKey.IsActive,
+		"projectId":   apiKey.ProjectID,
+		"createdAt":   apiKey.CreatedAt,
+		"updatedAt":   apiKey.UpdatedAt,
 	})
+}
+
+func (s *Server) deleteApiKeyHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	keyID := c.Param("key_id")
+	accountID, _ := c.Get("account_id")
+
+	// Verify project exists and belongs to user
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	// Delete the API key
+	result := s.db.Where("id = ? AND project_id = ?", keyID, projectID).Delete(&APIKey{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete API key"})
+		return
+	}
+
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "API key not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "API key deleted successfully"})
 }
 
 func (s *Server) dashboardHandler(c *gin.Context) {
@@ -1475,22 +2139,6 @@ func (s *Server) dashboardHandler(c *gin.Context) {
 			"totalProjects": projectCount,
 			"totalApiKeys":  apiKeyCount,
 			"activeUsers":   234, // Mock data for now
-		},
-	})
-}
-
-func (s *Server) realtimeHandler(c *gin.Context) {
-	// Mock real-time data - in a real implementation, you'd use WebSockets or server-sent events
-	c.JSON(http.StatusOK, gin.H{
-		"activeUsers": 42,
-		"recentEvents": []map[string]interface{}{
-			{
-				"id":        uuid.New().String(),
-				"type":      "page_view",
-				"timestamp": time.Now().Format(time.RFC3339),
-				"userId":    "user_123",
-				"page":      "/dashboard",
-			},
 		},
 	})
 }
