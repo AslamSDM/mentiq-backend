@@ -295,5 +295,5 @@ func getServerURL() string {
 	if port == "" {
 		port = "8080"
 	}
-	return fmt.Sprintf("http://localhost:%s", port)
+	return fmt.Sprintf("http://65.109.6.92:%s", port)
 }
