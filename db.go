@@ -30,6 +30,20 @@ func MigrateDB(db *gorm.DB) error {
 		&ExperimentAssignment{},
 		&ConversionEvent{},
 		&SessionRecording{},
+		// Stripe revenue models
+		&StripeCustomer{},
+		&StripeSubscription{},
+		&StripeInvoice{},
+		&StripeCharge{},
+		&RevenueMetrics{},
+		// Enhanced analytics models
+		&UserSessionMetrics{},
+		&UserCohortMetrics{},
+		&DeviceAnalytics{},
+		&LocationAnalytics{},
+		&FeatureAdoption{},
+		&ConversionFunnel{},
+		&ChurnAnalytics{},
 	)
 }
 
@@ -69,6 +83,42 @@ func CreateIndices(db *gorm.DB) error {
 		{&SessionRecording{}, "idx_recording_account_id", "account_id"},
 		{&SessionRecording{}, "idx_recording_project_id", "project_id"},
 		{&SessionRecording{}, "idx_recording_created_at", "created_at"},
+		// Stripe indices
+		{&StripeCustomer{}, "idx_stripe_customer_project_id", "project_id"},
+		{&StripeCustomer{}, "idx_stripe_customer_email", "email"},
+		{&StripeSubscription{}, "idx_stripe_subscription_customer_id", "customer_id"},
+		{&StripeSubscription{}, "idx_stripe_subscription_project_id", "project_id"},
+		{&StripeSubscription{}, "idx_stripe_subscription_status", "status"},
+		{&StripeInvoice{}, "idx_stripe_invoice_customer_id", "customer_id"},
+		{&StripeInvoice{}, "idx_stripe_invoice_project_id", "project_id"},
+		{&StripeInvoice{}, "idx_stripe_invoice_subscription_id", "subscription_id"},
+		{&StripeInvoice{}, "idx_stripe_invoice_status", "status"},
+		{&StripeCharge{}, "idx_stripe_charge_customer_id", "customer_id"},
+		{&StripeCharge{}, "idx_stripe_charge_project_id", "project_id"},
+		{&StripeCharge{}, "idx_stripe_charge_status", "status"},
+		{&RevenueMetrics{}, "idx_revenue_metrics_project_id", "project_id"},
+		{&RevenueMetrics{}, "idx_revenue_metrics_date", "date"},
+		// Enhanced analytics indices
+		{&UserSessionMetrics{}, "idx_session_metrics_project_id", "project_id"},
+		{&UserSessionMetrics{}, "idx_session_metrics_date", "date"},
+		{&UserCohortMetrics{}, "idx_cohort_metrics_project_id", "project_id"},
+		{&UserCohortMetrics{}, "idx_cohort_metrics_cohort_month", "cohort_month"},
+		{&DeviceAnalytics{}, "idx_device_analytics_project_id", "project_id"},
+		{&DeviceAnalytics{}, "idx_device_analytics_date", "date"},
+		{&DeviceAnalytics{}, "idx_device_analytics_device", "device"},
+		{&LocationAnalytics{}, "idx_location_analytics_project_id", "project_id"},
+		{&LocationAnalytics{}, "idx_location_analytics_date", "date"},
+		{&LocationAnalytics{}, "idx_location_analytics_country", "country"},
+		{&FeatureAdoption{}, "idx_feature_adoption_project_id", "project_id"},
+		{&FeatureAdoption{}, "idx_feature_adoption_date", "date"},
+		{&FeatureAdoption{}, "idx_feature_adoption_feature_name", "feature_name"},
+		{&ConversionFunnel{}, "idx_conversion_funnel_project_id", "project_id"},
+		{&ConversionFunnel{}, "idx_conversion_funnel_date", "date"},
+		{&ConversionFunnel{}, "idx_conversion_funnel_name", "funnel_name"},
+		{&ChurnAnalytics{}, "idx_churn_analytics_project_id", "project_id"},
+		{&ChurnAnalytics{}, "idx_churn_analytics_date", "date"},
+		{&ChurnAnalytics{}, "idx_churn_analytics_user_id", "user_id"},
+		{&ChurnAnalytics{}, "idx_churn_analytics_risk_score", "churn_risk_score"},
 	}
 
 	for _, idx := range indices {
