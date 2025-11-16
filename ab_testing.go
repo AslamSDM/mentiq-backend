@@ -15,25 +15,43 @@ import (
 )
 
 type CreateExperimentRequest struct {
-	Name         string  `json:"name" binding:"required"`
-	Key          string  `json:"key" binding:"required"`
-	Status       string  `json:"status" binding:"required"`
-	TrafficSplit float64 `json:"trafficSplit" binding:"required"`
-	ProjectID    string  `json:"projectId" binding:"required"`
+	Name              string             `json:"name" binding:"required"`
+	Description       string             `json:"description"`
+	TrafficAllocation float64            `json:"trafficAllocation" binding:"required"`
+	ProjectID         string             `json:"projectId"`
+	Variants          []CreateVariantReq `json:"variants" binding:"required,min=1"`
+	Goals             []CreateGoalReq    `json:"goals"`
 
-	Description *string            `json:"description"`
-	StartDate   *time.Time         `json:"startDate"`
-	EndDate     *time.Time         `json:"endDate"`
-	Variants    []CreateVariantReq `json:"variants" binding:"required,min=1"`
+	// Optional fields
+	Key       *string    `json:"key"`
+	Status    string     `json:"status"`
+	StartDate *time.Time `json:"startDate"`
+	EndDate   *time.Time `json:"endDate"`
 }
-type CreateVariantReq struct {
-	Name string `json:"name" binding:"required"`
-	Key  string `json:"key" binding
-:"required"`
 
-	Description  *string `json:"description"`
-	IsControl    bool    `json:"isControl" binding:"required"`
-	TrafficSplit float64 `json:"trafficSplit" binding:"required"`
+type CreateVariantReq struct {
+	Name          string                `json:"name" binding:"required"`
+	Description   string                `json:"description"`
+	TrafficWeight float64               `json:"trafficWeight" binding:"required"`
+	IsControl     bool                  `json:"isControl"`
+	Changes       []CreateVariantChange `json:"changes"`
+
+	// Optional backend fields
+	Key *string `json:"key"`
+}
+
+type CreateVariantChange struct {
+	Selector string `json:"selector"`
+	Property string `json:"property"`
+	Value    string `json:"value"`
+	Type     string `json:"type"`
+}
+
+type CreateGoalReq struct {
+	Name      string `json:"name" binding:"required"`
+	Type      string `json:"type" binding:"required"`
+	Target    string `json:"target" binding:"required"`
+	IsPrimary bool   `json:"isPrimary"`
 }
 
 type GetExperimentRequest struct {
@@ -55,10 +73,6 @@ type TrackConversionRequest struct {
 	AnonymousID  string                 `json:"anonymousId"`
 	Properties   map[string]interface{} `json:"properties"`
 }
-
-// This file has been deprecated.
-// All A/B testing functionality is now in ab_testing.go
-// This file can be safely deleted.
 
 type ExperimentResponse struct {
 	Id           string            `json:"id"`
@@ -97,10 +111,33 @@ type AssignmentResponse struct {
 
 // A/B Testing Service Methods
 func (s *Server) CreateExperiment(c *gin.Context) {
+	projectID := c.Param("id")
+
 	var req CreateExperimentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Set project ID from route parameter
+	req.ProjectID = projectID
+
+	// Generate key if not provided
+	experimentKey := fmt.Sprintf("exp_%s", uuid.New().String()[:8])
+	if req.Key != nil && *req.Key != "" {
+		experimentKey = *req.Key
+	}
+
+	// Set default status if not provided
+	status := "DRAFT"
+	if req.Status != "" {
+		status = req.Status
+	}
+
+	// Convert description to pointer
+	var description *string
+	if req.Description != "" {
+		description = &req.Description
 	}
 
 	// Create experiment and variants within a transaction
@@ -109,11 +146,11 @@ func (s *Server) CreateExperiment(c *gin.Context) {
 		experiment := Experiment{
 			ID:           uuid.New().String(),
 			Name:         req.Name,
-			Key:          req.Key,
-			Status:       req.Status,
-			TrafficSplit: req.TrafficSplit,
+			Key:          experimentKey,
+			Status:       status,
+			TrafficSplit: req.TrafficAllocation,
 			ProjectID:    req.ProjectID,
-			Description:  req.Description,
+			Description:  description,
 			StartDate:    req.StartDate,
 			EndDate:      req.EndDate,
 		}
@@ -124,13 +161,23 @@ func (s *Server) CreateExperiment(c *gin.Context) {
 
 		// Create the Variants and link them to the Experiment
 		for _, v := range req.Variants {
+			variantKey := fmt.Sprintf("var_%s", uuid.New().String()[:8])
+			if v.Key != nil && *v.Key != "" {
+				variantKey = *v.Key
+			}
+
+			var variantDesc *string
+			if v.Description != "" {
+				variantDesc = &v.Description
+			}
+
 			variant := Variant{
 				ID:           uuid.New().String(),
 				Name:         v.Name,
-				Key:          v.Key,
-				Description:  v.Description,
+				Key:          variantKey,
+				Description:  variantDesc,
 				IsControl:    v.IsControl,
-				TrafficSplit: v.TrafficSplit,
+				TrafficSplit: v.TrafficWeight,
 				ExperimentID: experiment.ID,
 			}
 
@@ -158,10 +205,10 @@ func (s *Server) CreateExperiment(c *gin.Context) {
 }
 
 func (s *Server) GetExperiments(c *gin.Context) {
-	projectID, _ := c.Get("project_id")
+	projectID := c.Param("id")
 
 	var experiments []Experiment
-	if err := s.db.Preload("Variants").Where("project_id = ?", projectID.(string)).Find(&experiments).Error; err != nil {
+	if err := s.db.Preload("Variants").Where("project_id = ?", projectID).Find(&experiments).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch experiments"})
 		return
 	}
@@ -210,15 +257,12 @@ func (s *Server) GetExperiments(c *gin.Context) {
 }
 
 func (s *Server) GetExperiment(c *gin.Context) {
-	var req GetExperimentRequest
-	if err := c.ShouldBindQuery(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+	experimentID := c.Param("experimentId")
+	projectID := c.Param("id")
 
 	var experiment Experiment
 	if err := s.db.Preload("Variants").
-		Where("key = ? AND project_id = ?", req.ExperimentKey, req.ProjectID).
+		Where("id = ? AND project_id = ?", experimentID, projectID).
 		First(&experiment).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
@@ -411,7 +455,19 @@ func (s *Server) TrackConversion(c *gin.Context) {
 }
 
 func (s *Server) GetExperimentResults(c *gin.Context) {
-	experimentID := c.Param("id")
+	experimentID := c.Param("experimentId")
+	projectID := c.Param("id")
+
+	// Verify experiment belongs to project
+	var experiment Experiment
+	if err := s.db.Where("id = ? AND project_id = ?", experimentID, projectID).First(&experiment).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find experiment"})
+		return
+	}
 
 	// Fetch conversions
 	var conversions []ConversionEvent
@@ -454,6 +510,61 @@ func (s *Server) GetExperimentResults(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, results)
+}
+
+func (s *Server) UpdateExperiment(c *gin.Context) {
+	experimentID := c.Param("experimentId")
+	projectID := c.Param("id")
+
+	var updates map[string]interface{}
+	if err := c.ShouldBindJSON(&updates); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify experiment belongs to project
+	var experiment Experiment
+	if err := s.db.Where("id = ? AND project_id = ?", experimentID, projectID).First(&experiment).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find experiment"})
+		return
+	}
+
+	// Update experiment
+	if err := s.db.Model(&experiment).Updates(updates).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update experiment"})
+		return
+	}
+
+	// Fetch updated experiment with variants
+	if err := s.db.Preload("Variants").Where("id = ?", experimentID).First(&experiment).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch updated experiment"})
+		return
+	}
+
+	c.JSON(http.StatusOK, experiment)
+}
+
+func (s *Server) DeleteExperiment(c *gin.Context) {
+	experimentID := c.Param("experimentId")
+	projectID := c.Param("id")
+
+	// Verify experiment belongs to project and delete
+	result := s.db.Where("id = ? AND project_id = ?", experimentID, projectID).Delete(&Experiment{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete experiment"})
+		return
+	}
+
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 
 func (s *Server) UpdateExperimentStatus(c *gin.Context) {

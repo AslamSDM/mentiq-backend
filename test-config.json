@@ -1,0 +1,259 @@
+{
+  "testConfig": {
+    "baseUrl": "http://localhost:8080",
+    "accountId": "test_account_automated",
+    "projectId": "test_project_automated",
+    "timeout": 5000
+  },
+  "testSuites": {
+    "healthCheck": {
+      "name": "Health Check",
+      "tests": [
+        {
+          "name": "Server Health",
+          "method": "GET",
+          "endpoint": "/health",
+          "expectedStatus": 200
+        }
+      ]
+    },
+    "eventIngestion": {
+      "name": "Event Ingestion",
+      "tests": [
+        {
+          "name": "Basic Page View",
+          "method": "POST",
+          "endpoint": "/api/v1/events",
+          "data": {
+            "event_type": "page_view",
+            "user_id": "test_user_1",
+            "session_id": "test_session_1",
+            "properties": {
+              "page_url": "/dashboard",
+              "page_title": "Dashboard"
+            }
+          },
+          "expectedStatus": 200
+        },
+        {
+          "name": "User Signup",
+          "method": "POST",
+          "endpoint": "/api/v1/events",
+          "data": {
+            "event_type": "signup",
+            "user_id": "test_user_2",
+            "properties": {
+              "source": "organic",
+              "plan": "free"
+            }
+          },
+          "expectedStatus": 200
+        },
+        {
+          "name": "Feature Click",
+          "method": "POST",
+          "endpoint": "/api/v1/events",
+          "data": {
+            "event_type": "click",
+            "user_id": "test_user_1",
+            "properties": {
+              "element": "pricing_button",
+              "page": "/pricing"
+            }
+          },
+          "expectedStatus": 200
+        }
+      ]
+    },
+    "enhancedAnalytics": {
+      "name": "Enhanced Analytics",
+      "tests": [
+        {
+          "name": "Dashboard Analytics",
+          "method": "GET",
+          "endpoint": "/api/v1/analytics/dashboard",
+          "expectedStatus": 200
+        },
+        {
+          "name": "Location Analytics",
+          "method": "GET",
+          "endpoint": "/api/v1/analytics/location",
+          "expectedStatus": 200
+        },
+        {
+          "name": "Device Analytics",
+          "method": "GET",
+          "endpoint": "/api/v1/analytics/devices",
+          "expectedStatus": 200
+        },
+        {
+          "name": "Retention Analytics",
+          "method": "GET",
+          "endpoint": "/api/v1/analytics/retention",
+          "expectedStatus": 200
+        },
+        {
+          "name": "Feature Adoption",
+          "method": "GET",
+          "endpoint": "/api/v1/analytics/features",
+          "expectedStatus": 200
+        },
+        {
+          "name": "Churn Analysis",
+          "method": "GET",
+          "endpoint": "/api/v1/analytics/churn",
+          "expectedStatus": 200
+        },
+        {
+          "name": "Conversion Analytics",
+          "method": "GET",
+          "endpoint": "/api/v1/analytics/conversion",
+          "expectedStatus": 200
+        }
+      ]
+    },
+    "sessionRecording": {
+      "name": "Session Recording",
+      "tests": [
+        {
+          "name": "Start Session",
+          "method": "POST",
+          "endpoint": "/api/v1/sessions/start",
+          "data": {
+            "user_id": "test_user_session",
+            "user_agent": "Mozilla/5.0 Test Browser",
+            "url": "/dashboard",
+            "viewport": {
+              "width": 1920,
+              "height": 1080
+            }
+          },
+          "expectedStatus": 200
+        },
+        {
+          "name": "List Sessions",
+          "method": "GET",
+          "endpoint": "/api/v1/sessions/",
+          "expectedStatus": 200
+        }
+      ]
+    },
+    "heatmapAnalytics": {
+      "name": "Heatmap Analytics",
+      "tests": [
+        {
+          "name": "Record Click",
+          "method": "POST",
+          "endpoint": "/api/v1/heatmaps/click",
+          "data": {
+            "page_url": "/dashboard",
+            "x": 150,
+            "y": 300,
+            "element": "nav-button"
+          },
+          "expectedStatus": 200
+        },
+        {
+          "name": "Record Scroll",
+          "method": "POST",
+          "endpoint": "/api/v1/heatmaps/scroll",
+          "data": {
+            "page_url": "/features",
+            "depth": 0.65,
+            "max_depth": 0.85
+          },
+          "expectedStatus": 200
+        },
+        {
+          "name": "Record Heatmap Data",
+          "method": "POST",
+          "endpoint": "/api/v1/heatmaps/record",
+          "data": {
+            "page_url": "/dashboard",
+            "clicks": [
+              {
+                "x": 150,
+                "y": 300,
+                "count": 5,
+                "element": "nav-menu"
+              }
+            ],
+            "scrolls": [
+              {
+                "depth": 0.5,
+                "max_depth": 1.0
+              }
+            ],
+            "viewport_data": {
+              "width": 1920,
+              "height": 1080
+            }
+          },
+          "expectedStatus": 200
+        },
+        {
+          "name": "Get Page Heatmap",
+          "method": "GET",
+          "endpoint": "/api/v1/heatmaps/page?page_url=/dashboard",
+          "expectedStatus": 200
+        },
+        {
+          "name": "Get All Heatmaps",
+          "method": "GET",
+          "endpoint": "/api/v1/heatmaps/all",
+          "expectedStatus": 200
+        }
+      ]
+    },
+    "errorHandling": {
+      "name": "Error Handling",
+      "tests": [
+        {
+          "name": "Invalid Endpoint",
+          "method": "GET",
+          "endpoint": "/api/v1/nonexistent",
+          "expectedStatus": 404
+        },
+        {
+          "name": "Missing Parameter",
+          "method": "GET",
+          "endpoint": "/api/v1/heatmaps/page",
+          "expectedStatus": 400
+        },
+        {
+          "name": "Invalid JSON",
+          "method": "POST",
+          "endpoint": "/api/v1/events",
+          "data": "invalid json",
+          "expectedStatus": 400
+        }
+      ]
+    }
+  },
+  "bulkTestData": {
+    "users": [
+      "user_bulk_1",
+      "user_bulk_2",
+      "user_bulk_3",
+      "user_bulk_4",
+      "user_bulk_5"
+    ],
+    "pages": ["/dashboard", "/analytics", "/settings", "/profile", "/pricing"],
+    "events": ["page_view", "click", "scroll", "hover", "form_submit"],
+    "countries": ["US", "Canada", "UK", "Germany", "Australia"],
+    "devices": ["desktop", "mobile", "tablet"],
+    "eventCount": 50
+  },
+  "performanceTests": {
+    "cacheTest": {
+      "endpoint": "/api/v1/analytics/dashboard",
+      "iterations": 3,
+      "expectCacheImprovement": true
+    },
+    "bulkIngestion": {
+      "endpoint": "/api/v1/events",
+      "batchSize": 10,
+      "batches": 5
+    }
+  }
+}
