@@ -1,15 +1,12 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"sort"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/gin-gonic/gin"
 	"github.com/stripe/stripe-go/v72/client"
 )
@@ -584,99 +581,28 @@ func (as *AnalyticsService) fetchEventsForDateRange(accountID, projectID, startD
 		return cachedEvents, nil
 	}
 
-	// Try to fetch from PostgreSQL first (for recent events)
-	var events []Event
-
-	// If R2 events exist and are more recent than database, use R2 data instead
-	r2Events, r2Err := as.fetchEventsFromR2(accountID, projectID, startDate, endDate)
-	if r2Err == nil && len(r2Events) > len(events) {
-		log.Printf("Using %d events from R2 storage (more recent than database)", len(r2Events))
-		events = r2Events
-	}
-	// Cache the results
-	as.setCachedEvents(accountID, projectID, startDate, endDate, events)
-
-	log.Printf("Fetched %d events from database for date range %s to %s", len(events), startDate, endDate)
-	return events, nil
-}
-
-// fetchEventsFromR2 fetches events from R2/S3 storage as fallback
-func (as *AnalyticsService) fetchEventsFromR2(accountID, projectID, startDate, endDate string) ([]Event, error) {
-	log.Printf("Fetching from R2 storage for account %s, project %s, date range %s to %s",
-		accountID, projectID, startDate, endDate)
-
-	// Parse dates to generate S3 key prefixes
+	// Parse date range
 	start, err := time.Parse("2006-01-02", startDate)
 	if err != nil {
 		return nil, fmt.Errorf("invalid start date: %v", err)
 	}
-
+	// include entire end day
 	end, err := time.Parse("2006-01-02", endDate)
 	if err != nil {
 		return nil, fmt.Errorf("invalid end date: %v", err)
 	}
+	end = end.Add(24*time.Hour - time.Nanosecond)
 
-	var allEvents []Event
-
-	// Iterate through each date in the range
-	for date := start; !date.After(end); date = date.AddDate(0, 0, 1) {
-		// Generate S3 prefix for this date
-		prefix := fmt.Sprintf("events/account_id=%s/project_id=%s/year=%d/month=%02d/day=%02d/",
-			accountID, projectID, date.Year(), int(date.Month()), date.Day())
-
-		// List objects with this prefix
-		result, err := as.s3Client.ListObjectsV2(&s3.ListObjectsV2Input{
-			Bucket: aws.String(as.bucketName),
-			Prefix: aws.String(prefix),
-		})
-
-		if err != nil {
-			log.Printf("Error listing S3 objects for prefix %s: %v", prefix, err)
-			continue
-		}
-
-		// Fetch and parse each batch file
-		for _, obj := range result.Contents {
-			events, err := as.fetchAndParseBatchFile(*obj.Key)
-			if err != nil {
-				log.Printf("Error fetching batch file %s: %v", *obj.Key, err)
-				continue
-			}
-			allEvents = append(allEvents, events...)
-		}
+	var events []Event
+	if err := as.db.Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ?", accountID, projectID, start, end).Order("timestamp ASC").Find(&events).Error; err != nil {
+		return nil, fmt.Errorf("db query failed: %v", err)
 	}
 
-	log.Printf("Fetched %d events from R2 storage", len(allEvents))
-	return allEvents, nil
-}
+	// Cache the results
+	as.setCachedEvents(accountID, projectID, startDate, endDate, events)
 
-// fetchAndParseBatchFile fetches and parses a single batch file from S3
-func (as *AnalyticsService) fetchAndParseBatchFile(key string) ([]Event, error) {
-	// Get object from S3
-	result, err := as.s3Client.GetObject(&s3.GetObjectInput{
-		Bucket: aws.String(as.bucketName),
-		Key:    aws.String(key),
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to get object %s: %v", key, err)
-	}
-	defer result.Body.Close()
-
-	// Read the JSON content
-	var batchPayload struct {
-		BatchID    string  `json:"batch_id"`
-		BatchSize  int     `json:"batch_size"`
-		UploadedAt string  `json:"uploaded_at"`
-		Events     []Event `json:"events"`
-	}
-
-	if err := json.NewDecoder(result.Body).Decode(&batchPayload); err != nil {
-		return nil, fmt.Errorf("failed to decode batch file %s: %v", key, err)
-	}
-
-	log.Printf("Parsed batch file %s: %d events", key, len(batchPayload.Events))
-	return batchPayload.Events, nil
+	log.Printf("Fetched %d events from TimescaleDB for date range %s to %s", len(events), startDate, endDate)
+	return events, nil
 }
 
 // filterEvents filters events based on query parameters

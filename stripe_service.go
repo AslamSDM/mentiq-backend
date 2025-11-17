@@ -8,11 +8,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stripe/stripe-go/v72"
-	"github.com/stripe/stripe-go/v72/charge"
 	"github.com/stripe/stripe-go/v72/client"
 	"github.com/stripe/stripe-go/v72/customer"
-	"github.com/stripe/stripe-go/v72/invoice"
-	"github.com/stripe/stripe-go/v72/sub"
 	"gorm.io/gorm"
 )
 
@@ -43,9 +40,24 @@ func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 		return
 	}
 
-	// Validate that it's a restricted API key
-	if len(req.ApiKey) < 8 || (req.ApiKey[:8] != "rk_live_" && req.ApiKey[:8] != "rk_test_") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid API key format. Please use a restricted API key (rk_live_* or rk_test_*)"})
+	// Validate Stripe API key format (accept both secret and restricted keys)
+	if len(req.ApiKey) < 8 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid API key format"})
+		return
+	}
+
+	prefix := req.ApiKey[:8]
+	validPrefixes := []string{"sk_live_", "sk_test_", "rk_live_", "rk_test_"}
+	isValid := false
+	for _, p := range validPrefixes {
+		if prefix == p {
+			isValid = true
+			break
+		}
+	}
+
+	if !isValid {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid API key format. Please use a Stripe API key (sk_* or rk_*)"})
 		return
 	}
 
@@ -143,7 +155,7 @@ func (s *StripeService) syncCustomers(sc *client.API, projectID string) (int, er
 	params.Limit = stripe.Int64(100)
 
 	count := 0
-	i := customer.List(params)
+	i := sc.Customers.List(params)
 	for i.Next() {
 		stripeCustomer := i.Customer()
 
@@ -182,7 +194,7 @@ func (s *StripeService) syncSubscriptions(sc *client.API, projectID string) (int
 	// Remove status filter to get all subscriptions
 
 	count := 0
-	i := sub.List(params)
+	i := sc.Subscriptions.List(params)
 	for i.Next() {
 		stripeSub := i.Subscription()
 
@@ -263,7 +275,7 @@ func (s *StripeService) syncInvoices(sc *client.API, projectID string) (int, err
 	params.Limit = stripe.Int64(100)
 
 	count := 0
-	i := invoice.List(params)
+	i := sc.Invoices.List(params)
 	for i.Next() {
 		stripeInvoice := i.Invoice()
 
@@ -317,7 +329,7 @@ func (s *StripeService) syncCharges(sc *client.API, projectID string) (int, erro
 	params.Limit = stripe.Int64(100)
 
 	count := 0
-	i := charge.List(params)
+	i := sc.Charges.List(params)
 	for i.Next() {
 		stripeCharge := i.Charge()
 
@@ -619,13 +631,19 @@ func (s *StripeService) GetCustomerAnalyticsHandler(c *gin.Context) {
 		}
 	}
 
+	// Calculate conversion rate (avoid division by zero)
+	conversionRate := 0.0
+	if totalCustomers > 0 {
+		conversionRate = float64(paidCustomers) / float64(totalCustomers) * 100
+	}
+
 	response := map[string]interface{}{
 		"summary": map[string]interface{}{
 			"total_customers": totalCustomers,
 			"paid_customers":  paidCustomers,
 			"free_customers":  totalCustomers - paidCustomers,
 			"total_mrr":       totalMRR,
-			"conversion_rate": float64(paidCustomers) / float64(totalCustomers) * 100,
+			"conversion_rate": conversionRate,
 		},
 		"customer_segments": segments,
 	}

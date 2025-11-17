@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -20,37 +19,40 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
-	"github.com/mileusna/useragent"
+
 	geoip2 "github.com/oschwald/geoip2-golang"
 	"github.com/stripe/stripe-go/v72/client"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
+// Event represents an analytics event stored in TimescaleDB hypertable
 type Event struct {
-	EventID    string                 `json:"event_id"`
-	EventType  string                 `json:"event_type"`
-	UserID     string                 `json:"user_id,omitempty"`
-	SessionID  string                 `json:"session_id,omitempty"`
-	Timestamp  time.Time              `json:"timestamp"`
-	Properties map[string]interface{} `json:"properties,omitempty"`
+	ID         uint                   `gorm:"primaryKey;autoIncrement" json:"-"` // Internal ID for GORM
+	EventID    string                 `gorm:"type:uuid;uniqueIndex;not null" json:"event_id"`
+	EventType  string                 `gorm:"index;not null" json:"event_type"`
+	UserID     string                 `gorm:"index" json:"user_id,omitempty"`
+	SessionID  string                 `gorm:"index" json:"session_id,omitempty"`
+	Timestamp  time.Time              `gorm:"not null;index:idx_events_time" json:"timestamp"`
+	Properties map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"properties,omitempty"`
 	UserAgent  string                 `json:"user_agent,omitempty"`
 	IPAddress  string                 `json:"ip_address,omitempty"`
-	AccountID  string                 `json:"account_id"`
-	ProjectID  string                 `json:"project_id"`
-	Country    string                 `json:"country,omitempty"`
+	AccountID  string                 `gorm:"index:idx_events_account_project;not null" json:"account_id"`
+	ProjectID  string                 `gorm:"index:idx_events_account_project;not null" json:"project_id"`
+	Country    string                 `gorm:"index" json:"country,omitempty"`
 	City       string                 `json:"city,omitempty"`
-	Device     string                 `json:"device,omitempty"`
-	OS         string                 `json:"os,omitempty"`
-	Browser    string                 `json:"browser,omitempty"`
+	Device     string                 `gorm:"index" json:"device,omitempty"`
+	OS         string                 `gorm:"index" json:"os,omitempty"`
+	Browser    string                 `gorm:"index" json:"browser,omitempty"`
+	CreatedAt  time.Time              `gorm:"autoCreateTime" json:"created_at"`
+}
+
+func (Event) TableName() string {
+	return "events"
 }
 
 // CacheEntry represents a cached item with TTL
@@ -60,70 +62,31 @@ type CacheEntry struct {
 }
 
 type AnalyticsService struct {
-	s3Client     *s3.S3
-	bucketName   string
 	db           *gorm.DB
 	stripeClient *client.API
-
-	// Memory cache for events
-	eventCache []Event
-	cacheMutex sync.RWMutex
+	stopChan     chan struct{}
 
 	// Data caches with TTL
 	eventsCache    map[string]*CacheEntry // Key: accountID:projectID:startDate:endDate
 	dashboardCache map[string]*CacheEntry // Key: accountID:projectID:date
 	metricsCache   map[string]*CacheEntry // Key: accountID:projectID:metric:date
 	dataCacheMutex sync.RWMutex
-
-	// Flush ticker for periodic batch uploads
-	flushTicker *time.Ticker
-	stopChan    chan bool
 }
 
-func NewAnalyticsService(bucketName string, db *gorm.DB) (*AnalyticsService, error) {
-	// Configuration for Cloudflare R2
-	config := &aws.Config{
-		Region:           aws.String("auto"), // R2 uses "auto" as region
-		Endpoint:         aws.String("https://820b251b57951011c6bcc9add6ca5ca4.r2.cloudflarestorage.com"),
-		S3ForcePathStyle: aws.Bool(true), // Required for R2
-	}
-
-	// Set credentials from environment variables
-	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
-
-	if accessKey != "" && secretKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(
-			accessKey,
-			secretKey,
-			"", // token (empty for R2)
-		)
-	} else {
-		log.Printf("Warning: AWS credentials not found in environment variables")
-	}
-
-	sess, err := session.NewSession(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create R2 session: %v", err)
-	}
-
+func NewAnalyticsService(db *gorm.DB) (*AnalyticsService, error) {
 	service := &AnalyticsService{
-		s3Client:       s3.New(sess),
-		bucketName:     bucketName,
 		db:             db,
 		stripeClient:   NewStripeClient(),
-		eventCache:     make([]Event, 0),
 		eventsCache:    make(map[string]*CacheEntry),
 		dashboardCache: make(map[string]*CacheEntry),
 		metricsCache:   make(map[string]*CacheEntry),
-		flushTicker:    time.NewTicker(30 * time.Minute),
-		stopChan:       make(chan bool),
+		stopChan:       make(chan struct{}),
 	}
 
 	// Start the background workers
-	go service.startBatchProcessor()
-	go service.startCacheCleanup() // New cache cleanup worker
+	go service.startCacheCleanup() // Cache cleanup worker
 
+	log.Println("Analytics service initialized with TimescaleDB storage")
 	return service, nil
 }
 
@@ -132,16 +95,26 @@ type Server struct {
 	analyticsService         *AnalyticsService
 	stripeService            *StripeService
 	enhancedAnalyticsService *EnhancedAnalyticsService
+	sessionStorage           *SessionStorageService
 }
 
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 	stripeService := NewStripeService(db)
 	enhancedAnalyticsService := NewEnhancedAnalyticsService(db)
+
+	// Initialize session storage (optional - falls back to DB if not configured)
+	sessionStorage, err := NewSessionStorageService()
+	if err != nil {
+		log.Printf("Session storage not configured: %v. Using database storage for recordings.", err)
+		sessionStorage = nil
+	}
+
 	return &Server{
 		db:                       db,
 		analyticsService:         analyticsService,
 		stripeService:            stripeService,
 		enhancedAnalyticsService: enhancedAnalyticsService,
+		sessionStorage:           sessionStorage,
 	}
 }
 
@@ -322,19 +295,13 @@ func main() {
 	// 	log.Fatalf("Failed to run migrations: %v", err)
 	// }
 
-	// Get configuration from environment variables
-	bucketName := os.Getenv("S3_BUCKET_NAME")
-	if bucketName == "" {
-		log.Fatal("S3_BUCKET_NAME environment variable is required")
-	}
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
 	// Initialize analytics service
-	analyticsService, err := NewAnalyticsService(bucketName, database)
+	analyticsService, err := NewAnalyticsService(database)
 	if err != nil {
 		log.Fatalf("Failed to initialize analytics service: %v", err)
 	}
@@ -444,7 +411,6 @@ func main() {
 	// Start server in a goroutine
 	go func() {
 		log.Printf("Analytics platform server starting on port %s", port)
-		log.Printf("S3 bucket: %s", bucketName)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
 		}
@@ -469,158 +435,7 @@ func main() {
 	log.Println("Server exited")
 }
 
-// startBatchProcessor runs a background goroutine that periodically flushes the event cache
-func (as *AnalyticsService) startBatchProcessor() {
-	for {
-		select {
-		case <-as.flushTicker.C:
-			as.flushEventCache()
-		case <-as.stopChan:
-			as.flushTicker.Stop()
-			as.flushEventCache() // Final flush before stopping
-			return
-		}
-	}
-}
-
-// Stop gracefully stops the analytics service
-func (as *AnalyticsService) Stop() {
-	close(as.stopChan)
-}
-
-// addEventToCache adds an event to the memory cache
-func (as *AnalyticsService) addEventToCache(event Event) {
-	as.cacheMutex.Lock()
-
-	// Add event to cache
-	as.eventCache = append(as.eventCache, event)
-	cacheSize := len(as.eventCache)
-
-	as.cacheMutex.Unlock()
-
-	log.Printf("Event %s added to cache. Cache size: %d", event.EventID, cacheSize)
-
-	// Auto-flush if cache exceeds threshold (1000 events)
-	const maxCacheSize = 1000
-	if cacheSize >= maxCacheSize {
-		log.Printf("Cache size reached %d, triggering auto-flush", cacheSize)
-		go as.flushEventCache()
-	}
-}
-
-// flushEventCache processes all cached events and uploads them to S3 in batches
-func (as *AnalyticsService) flushEventCache() {
-	as.cacheMutex.Lock()
-	if len(as.eventCache) == 0 {
-		as.cacheMutex.Unlock()
-		return
-	}
-
-	eventsToFlush := make([]Event, len(as.eventCache))
-	copy(eventsToFlush, as.eventCache)
-	as.eventCache = as.eventCache[:0] // Clear the cache
-	as.cacheMutex.Unlock()
-
-	log.Printf("Flushing %d events from cache to S3 in batches", len(eventsToFlush))
-
-	// Group events by account/project/date for efficient batching
-	eventGroups := make(map[string][]Event)
-	for _, event := range eventsToFlush {
-		key := fmt.Sprintf("%s/%s/%s",
-			event.AccountID,
-			event.ProjectID,
-			event.Timestamp.Format("2006-01-02"))
-		eventGroups[key] = append(eventGroups[key], event)
-	}
-
-	var totalSuccess, totalFailed int
-	var wg sync.WaitGroup
-
-	// Process each group in parallel
-	for groupKey, events := range eventGroups {
-		wg.Add(1)
-		go func(key string, eventBatch []Event) {
-			defer wg.Done()
-			success, failed := as.storeBatchToS3(eventBatch)
-			totalSuccess += success
-			totalFailed += failed
-			log.Printf("Batch %s: %d success, %d failed", key, success, failed)
-		}(groupKey, events)
-	}
-
-	wg.Wait()
-	log.Printf("Batch flush completed: %d successful, %d failed out of %d total events",
-		totalSuccess, totalFailed, len(eventsToFlush))
-}
-
-// storeBatchToS3 stores a batch of events as a single JSON array file in S3
-func (as *AnalyticsService) storeBatchToS3(events []Event) (int, int) {
-	if len(events) == 0 {
-		return 0, 0
-	}
-
-	// Use the first event to determine the S3 path
-	firstEvent := events[0]
-
-	// Create a batch file with timestamp
-	batchID := uuid.New().String()
-	timestamp := time.Now().UTC()
-
-	// Create S3 key for the batch file
-	key := fmt.Sprintf("events/account_id=%s/project_id=%s/year=%d/month=%02d/day=%02d/batch_%s_%d_events.json",
-		firstEvent.AccountID,
-		firstEvent.ProjectID,
-		firstEvent.Timestamp.Year(),
-		firstEvent.Timestamp.Month(),
-		firstEvent.Timestamp.Day(),
-		batchID,
-		len(events),
-	)
-
-	// Create batch payload
-	batchPayload := map[string]interface{}{
-		"batch_id":    batchID,
-		"batch_size":  len(events),
-		"uploaded_at": timestamp,
-		"events":      events,
-	}
-
-	// Marshal to JSON
-	batchJSON, err := json.Marshal(batchPayload)
-	if err != nil {
-		log.Printf("Failed to marshal batch: %v", err)
-		return 0, len(events)
-	}
-
-	// Upload to S3/R2
-	_, err = as.s3Client.PutObject(&s3.PutObjectInput{
-		Bucket:      aws.String(as.bucketName),
-		Key:         aws.String(key),
-		Body:        bytes.NewReader(batchJSON),
-		ContentType: aws.String("application/json"),
-		Metadata: map[string]*string{
-			"batch-id":    aws.String(batchID),
-			"event-count": aws.String(fmt.Sprintf("%d", len(events))),
-			"account-id":  aws.String(firstEvent.AccountID),
-			"project-id":  aws.String(firstEvent.ProjectID),
-		},
-	})
-
-	if err != nil {
-		log.Printf("Failed to store batch to S3: %v", err)
-		return 0, len(events)
-	}
-
-	log.Printf("Batch %s with %d events stored to S3 with key: %s", batchID, len(events), key)
-	return len(events), 0
-}
-
-// getCacheSize returns the current size of the event cache (thread-safe)
-func (as *AnalyticsService) getCacheSize() int {
-	as.cacheMutex.RLock()
-	defer as.cacheMutex.RUnlock()
-	return len(as.eventCache)
-}
+// These methods are no longer needed with TimescaleDB direct writes
 
 // Cache helper functions
 
@@ -758,62 +573,35 @@ func (as *AnalyticsService) cleanExpiredCache() {
 	}
 }
 
-func (as *AnalyticsService) ingestEventHandler(c *gin.Context) {
-	var event Event
-	if err := c.ShouldBindJSON(&event); err != nil {
-		log.Printf("Failed to decode event: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+// Stop signals background workers to stop and flush if necessary
+func (as *AnalyticsService) Stop() {
+	select {
+	case <-as.stopChan:
+		// already closed
+		return
+	default:
+		close(as.stopChan)
+	}
+}
+
+// addEventToCache persists an event directly to TimescaleDB (no R2/S3 cache)
+func (as *AnalyticsService) addEventToCache(event Event) {
+	if err := as.db.Create(&event).Error; err != nil {
+		log.Printf("Failed to persist event to TimescaleDB: %v", err)
 		return
 	}
+}
 
-	// Extract account and project from context (set by middleware)
-	accountID, _ := c.Get("account_id")
-	projectID, _ := c.Get("project_id")
+// getCacheSize returns the current logical cache size (eventsCache length)
+func (as *AnalyticsService) getCacheSize() int {
+	as.dataCacheMutex.RLock()
+	defer as.dataCacheMutex.RUnlock()
+	return len(as.eventsCache)
+}
 
-	event.AccountID = accountID.(string)
-	event.ProjectID = projectID.(string)
-
-	// Generate event ID if not provided
-	if event.EventID == "" {
-		event.EventID = uuid.New().String()
-	}
-
-	// Set timestamp if not provided
-	if event.Timestamp.IsZero() {
-		event.Timestamp = time.Now().UTC()
-	}
-
-	// Extract client info
-	event.UserAgent = c.GetHeader("User-Agent")
-	event.IPAddress = getClientIPFromGin(c)
-
-	// Parse User-Agent
-	ua := useragent.Parse(event.UserAgent)
-	event.Browser = ua.Name
-	event.OS = ua.OS
-	event.Device = ua.Device
-
-	// Get Geo Location (placeholder)
-	country, city := getGeoLocation(event.IPAddress)
-	event.Country = country
-	event.City = city
-
-	// Validate required fields
-	if event.EventType == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "event_type is required"})
-		return
-	}
-
-	// Add event to cache instead of directly storing to S3
-	as.addEventToCache(event)
-
-	// Return success response
-	c.JSON(http.StatusOK, gin.H{
-		"status":     "success",
-		"event_id":   event.EventID,
-		"message":    "Event queued for processing",
-		"cache_size": as.getCacheSize(),
-	})
+// flushEventCache is a no-op when using direct DB writes
+func (as *AnalyticsService) flushEventCache() {
+	log.Println("flushEventCache called - no-op for TimescaleDB direct writes")
 }
 
 // Global GeoIP database reader (initialized once)
@@ -882,103 +670,11 @@ func getGeoLocation(ipAddress string) (string, string) {
 	return country, city
 }
 
-func (as *AnalyticsService) batchIngestHandler(c *gin.Context) {
-	var events []Event
-	if err := c.ShouldBindJSON(&events); err != nil {
-		log.Printf("Failed to decode events: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
-		return
-	}
-
-	// Extract account and project from context (set by middleware)
-	accountID, _ := c.Get("account_id")
-	projectID, _ := c.Get("project_id")
-
-	var successCount int
-	var errors []string
-
-	for i, event := range events {
-		event.AccountID = accountID.(string)
-		event.ProjectID = projectID.(string)
-
-		// Generate event ID if not provided
-		if event.EventID == "" {
-			event.EventID = uuid.New().String()
-		}
-
-		// Set timestamp if not provided
-		if event.Timestamp.IsZero() {
-			event.Timestamp = time.Now().UTC()
-		}
-
-		// Extract client info
-		event.UserAgent = c.GetHeader("User-Agent")
-		event.IPAddress = getClientIPFromGin(c)
-
-		// Validate required fields
-		if event.EventType == "" {
-			errors = append(errors, fmt.Sprintf("Event %d: event_type is required", i))
-			continue
-		}
-
-		// Add event to cache instead of directly storing to S3
-		as.addEventToCache(event)
-		successCount++
-	}
-
-	// Return response
-	response := gin.H{
-		"status":        "completed",
-		"total_events":  len(events),
-		"success_count": successCount,
-		"error_count":   len(errors),
-		"cache_size":    as.getCacheSize(),
-	}
-
-	if len(errors) > 0 {
-		response["errors"] = errors
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
 func healthCheckHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "healthy",
 		"timestamp": time.Now().UTC(),
 		"service":   "analytics-platform",
-	})
-}
-
-// flushCacheHandler allows manual triggering of cache flush (for testing/admin purposes)
-func (as *AnalyticsService) flushCacheHandler(c *gin.Context) {
-	cacheSize := as.getCacheSize()
-	if cacheSize == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"message":    "Cache is empty, nothing to flush",
-			"cache_size": 0,
-		})
-		return
-	}
-
-	// Use a goroutine to flush cache asynchronously for large caches
-	if cacheSize > 100 {
-		go as.flushEventCache()
-		c.JSON(http.StatusOK, gin.H{
-			"message":           "Cache flush started asynchronously",
-			"events_to_process": cacheSize,
-			"status":            "processing",
-		})
-		return
-	}
-
-	// For smaller caches, flush synchronously
-	as.flushEventCache()
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":          "Cache flushed successfully",
-		"events_processed": cacheSize,
-		"new_cache_size":   as.getCacheSize(),
 	})
 }
 
@@ -1069,6 +765,7 @@ func (s *Server) updateProjectStripeApiKeyHandler(c *gin.Context) {
 // Session Recording Handlers
 
 // ingestRecordingHandler receives and stores session recording data
+// Stores events in S3/R2 if configured, otherwise falls back to DB JSONB storage
 func (s *Server) ingestRecordingHandler(c *gin.Context) {
 	sessionID := c.Param("session_id")
 
@@ -1087,52 +784,76 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 		return
 	}
 
+	// Extract account/project from auth context if not in payload
+	if recordingData.AccountID == "" {
+		if accountID, exists := c.Get("account_id"); exists && accountID != nil {
+			if accID, ok := accountID.(string); ok {
+				recordingData.AccountID = accID
+			}
+		}
+	}
+	if recordingData.ProjectID == "" {
+		if projectID, exists := c.Get("project_id"); exists && projectID != nil {
+			if projID, ok := projectID.(string); ok {
+				recordingData.ProjectID = projID
+			}
+		}
+	}
+
 	// Validate required fields
 	if recordingData.AccountID == "" || recordingData.ProjectID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "account_id and project_id are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account_id and project_id are required (authenticate or include in payload)"})
 		return
 	}
 
 	// Generate unique ID for this recording
 	recordingID := uuid.New().String()
 
-	// Store events to S3
-	storagePath := fmt.Sprintf("recordings/%s/%s/%s.json",
-		recordingData.ProjectID, sessionID, recordingID)
+	var storagePath string
+	var eventsJSON []byte
+	var err error
 
-	// Marshal events to JSON
-	eventsJSON, err := json.Marshal(recordingData.Events)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal events"})
-		return
-	}
-
-	// Upload to S3
-	_, err = s.analyticsService.s3Client.PutObject(&s3.PutObjectInput{
-		Bucket:      aws.String(s.analyticsService.bucketName),
-		Key:         aws.String(storagePath),
-		Body:        bytes.NewReader(eventsJSON),
-		ContentType: aws.String("application/json"),
-	})
-	if err != nil {
-		log.Printf("Failed to upload recording to S3: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store recording"})
-		return
+	// Try to upload to S3/R2 if configured
+	if s.sessionStorage != nil {
+		storagePath, err = s.sessionStorage.UploadRecording(
+			sessionID,
+			recordingData.ProjectID,
+			recordingData.AccountID,
+			recordingData.Events,
+		)
+		if err != nil {
+			log.Printf("Failed to upload recording to S3: %v. Falling back to DB storage.", err)
+			// Fall back to DB storage
+			eventsJSON, err = json.Marshal(recordingData.Events)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal events"})
+				return
+			}
+			storagePath = "" // Empty storage path means data is in RecordingData field
+		}
+	} else {
+		// No S3 configured, store in DB
+		eventsJSON, err = json.Marshal(recordingData.Events)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal events"})
+			return
+		}
 	}
 
 	// Save or update recording metadata in database
 	recording := SessionRecording{
-		ID:          recordingID,
-		SessionID:   sessionID,
-		AccountID:   recordingData.AccountID,
-		ProjectID:   recordingData.ProjectID,
-		UserID:      recordingData.UserID,
-		StoragePath: storagePath,
-		Duration:    recordingData.Duration,
-		StartURL:    recordingData.StartURL,
-		EventCount:  len(recordingData.Events),
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		ID:            recordingID,
+		SessionID:     sessionID,
+		AccountID:     recordingData.AccountID,
+		ProjectID:     recordingData.ProjectID,
+		UserID:        recordingData.UserID,
+		RecordingData: eventsJSON,  // Empty if stored in S3, populated if stored in DB
+		StoragePath:   storagePath, // S3 key if stored in S3, empty if stored in DB
+		Duration:      recordingData.Duration,
+		StartURL:      recordingData.StartURL,
+		EventCount:    len(recordingData.Events),
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 
 	// Check if recording already exists and update, otherwise create
@@ -1157,9 +878,15 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 		}
 	}
 
+	storageType := "S3/R2"
+	if storagePath == "" {
+		storageType = "Database"
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":      "Recording ingested successfully",
 		"recording_id": recording.ID,
+		"storage_type": storageType,
 	})
 }
 
@@ -1241,23 +968,28 @@ func (s *Server) getRecordingHandler(c *gin.Context) {
 		return
 	}
 
-	// Fetch events from S3
-	result, err := s.analyticsService.s3Client.GetObject(&s3.GetObjectInput{
-		Bucket: aws.String(s.analyticsService.bucketName),
-		Key:    aws.String(recording.StoragePath),
-	})
-	if err != nil {
-		log.Printf("Failed to fetch recording from S3: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording events"})
-		return
-	}
-	defer result.Body.Close()
-
-	// Read events
 	var events []map[string]interface{}
-	if err := json.NewDecoder(result.Body).Decode(&events); err != nil {
-		log.Printf("Failed to decode recording events: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recording events"})
+	var err error
+
+	// Check if data is in S3 or DB
+	if recording.StoragePath != "" && s.sessionStorage != nil {
+		// Retrieve from S3/R2
+		events, err = s.sessionStorage.DownloadRecording(recording.StoragePath)
+		if err != nil {
+			log.Printf("Failed to download recording from S3: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording from storage"})
+			return
+		}
+	} else if len(recording.RecordingData) > 0 {
+		// Retrieve from DB
+		if err := json.Unmarshal(recording.RecordingData, &events); err != nil {
+			log.Printf("Failed to decode recording data from DB: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recording events"})
+			return
+		}
+	} else {
+		// No recording data available
+		c.JSON(http.StatusNotFound, gin.H{"error": "Recording events not found"})
 		return
 	}
 
@@ -1697,7 +1429,6 @@ func (s *Server) authMiddleware(c *gin.Context) {
 
 	// Try to validate JWT token
 	claims, err := ValidateJWT(token)
-	log.Default().Println("JWT validation error:", claims.APIKeyID, claims.AccountID, claims.Email, err, token)
 	if err == nil {
 		// Valid JWT token
 		c.Set("account_id", claims.AccountID)

@@ -180,17 +180,19 @@ func (ConversionEvent) TableName() string {
 
 // SessionRecording represents a recorded user session
 type SessionRecording struct {
-	ID          string    `gorm:"primaryKey" json:"id"`
-	SessionID   string    `gorm:"index" json:"session_id"`
-	AccountID   string    `gorm:"index" json:"account_id"`
-	ProjectID   string    `gorm:"index" json:"project_id"`
-	UserID      *string   `json:"user_id"`
-	StoragePath string    `json:"-"`        // S3/R2 key (not exposed to client)
-	Duration    int       `json:"duration"` // in seconds
-	StartURL    string    `json:"start_url"`
-	EventCount  int       `json:"event_count"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string  `gorm:"primaryKey" json:"id"`
+	SessionID   string  `gorm:"index" json:"session_id"`
+	AccountID   string  `gorm:"index" json:"account_id"`
+	ProjectID   string  `gorm:"index" json:"project_id"`
+	UserID      *string `json:"user_id"`
+	StoragePath string  `json:"-"` // S3/R2 key (not exposed to client)
+	// RecordingData stores the raw recording JSON when we save recordings in DB
+	RecordingData []byte    `gorm:"type:jsonb" json:"-"`
+	Duration      int       `json:"duration"` // in seconds
+	StartURL      string    `json:"start_url"`
+	EventCount    int       `json:"event_count"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 func (SessionRecording) TableName() string {
@@ -449,6 +451,7 @@ type ConversionFunnel struct {
 }
 
 // ChurnAnalytics represents churn prediction and analysis
+/* Lines 452-476 omitted */
 type ChurnAnalytics struct {
 	ID                  uint       `gorm:"primaryKey" json:"id"`
 	ProjectID           string     `json:"project_id" gorm:"index"`
