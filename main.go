@@ -270,6 +270,7 @@ func ValidateJWT(tokenString string) (*JWTClaims, error) {
 }
 
 func main() {
+
 	// Load environment variables from .env.local file
 	if err := godotenv.Load(".env"); err != nil {
 		log.Printf("Warning: Could not load .env.local file: %v", err)
@@ -613,13 +614,13 @@ func getGeoLocation(ipAddress string) (string, string) {
 	geoipOnce.Do(func() {
 		mmdbPath := os.Getenv("GEOIP_MMDB_PATH")
 		if mmdbPath == "" {
-			mmdbPath = "./GeoLite2-City.mmdb" // Default path
+			mmdbPath = "./utils/GeoLite2-City.mmdb" // Default path
 		}
 
 		db, err := geoip2.Open(mmdbPath)
 		if err != nil {
 			log.Printf("Warning: Failed to open GeoIP database at %s: %v", mmdbPath, err)
-			log.Printf("Geolocation will return default values. Download from: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data")
+			log.Printf("Geolocation will return default values. Download from: https://github.com/P3TERX/GeoLite.mmdb")
 			return
 		}
 		geoipDB = db
