@@ -26,7 +26,7 @@ func NewSessionStorageService() (*SessionStorageService, error) {
 	accessKey := os.Getenv("CLOUDFLARE_R2_ACCESS_KEY")
 	secretKey := os.Getenv("CLOUDFLARE_R2_SECRET_KEY")
 	accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
-	bucketName := os.Getenv("SESSION_RECORDING_BUCKET")
+	bucketName := os.Getenv("S3_BUCKET_NAME")
 
 	if accessKey == "" || secretKey == "" || accountID == "" {
 		log.Println("Warning: S3/R2 credentials not configured. Session recordings will be stored in database.")
@@ -58,23 +58,17 @@ func NewSessionStorageService() (*SessionStorageService, error) {
 }
 
 // UploadRecording uploads recording data to S3/R2
-func (sss *SessionStorageService) UploadRecording(sessionID, projectID, accountID string, events []map[string]interface{}) (string, error) {
+func (sss *SessionStorageService) UploadRecording(sessionID, projectID, accountID string, events json.RawMessage) (string, error) {
 	// Generate unique key for this recording
 	recordingID := uuid.New().String()
-	key := fmt.Sprintf("recordings/account_id=%s/project_id=%s/session_id=%s/%s.json", 
+	key := fmt.Sprintf("recordings/account_id=%s/project_id=%s/session_id=%s/%s.json",
 		accountID, projectID, sessionID, recordingID)
 
-	// Marshal events to JSON
-	eventsJSON, err := json.Marshal(events)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal events: %w", err)
-	}
-
 	// Upload to S3/R2
-	_, err = sss.s3Client.PutObject(&s3.PutObjectInput{
+	_, err := sss.s3Client.PutObject(&s3.PutObjectInput{
 		Bucket:      aws.String(sss.bucketName),
 		Key:         aws.String(key),
-		Body:        bytes.NewReader(eventsJSON),
+		Body:        bytes.NewReader(events),
 		ContentType: aws.String("application/json"),
 	})
 
@@ -84,9 +78,7 @@ func (sss *SessionStorageService) UploadRecording(sessionID, projectID, accountI
 
 	log.Printf("Uploaded recording to S3: %s", key)
 	return key, nil
-}
-
-// DownloadRecording retrieves recording data from S3/R2
+} // DownloadRecording retrieves recording data from S3/R2
 func (sss *SessionStorageService) DownloadRecording(storagePath string) ([]map[string]interface{}, error) {
 	// Download from S3/R2
 	result, err := sss.s3Client.GetObject(&s3.GetObjectInput{
@@ -107,6 +99,27 @@ func (sss *SessionStorageService) DownloadRecording(storagePath string) ([]map[s
 	}
 
 	return events, nil
+}
+
+// DownloadRecordingData retrieves raw recording data from S3/R2
+func (sss *SessionStorageService) DownloadRecordingData(storagePath string) ([]byte, error) {
+	// Download from S3/R2
+	result, err := sss.s3Client.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(sss.bucketName),
+		Key:    aws.String(storagePath),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to download recording data: %w", err)
+	}
+	defer result.Body.Close()
+
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(result.Body); err != nil {
+		return nil, fmt.Errorf("failed to read recording data from body: %w", err)
+	}
+
+	return buf.Bytes(), nil
 }
 
 // DeleteRecording removes a recording from S3/R2

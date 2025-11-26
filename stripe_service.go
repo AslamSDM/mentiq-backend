@@ -481,11 +481,15 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 	var metrics RevenueMetrics
 	if err := s.db.Where("project_id = ? AND date = ?", projectID, date).First(&metrics).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "No revenue metrics found for this date. Try syncing Stripe data first."})
+			// Return empty metrics instead of error
+			metrics = RevenueMetrics{
+				ProjectID: projectID,
+				Date:      date,
+			}
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch revenue metrics"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch revenue metrics"})
-		return
 	}
 
 	// Convert cents to dollars for display

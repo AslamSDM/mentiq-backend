@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -63,6 +64,32 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 		return
 	}
 
+	// Robustly handle metrics parameter
+	// 1. Start with what Gin bound (might be []string{"a,b,c"} or []string{"a", "b"})
+	rawMetrics := query.Metrics
+	query.Metrics = make([]string, 0)
+
+	// 2. Also check the raw query param in case Gin missed it or bound it weirdly
+	if val := c.Query("metrics"); val != "" {
+		// If we have a raw string, split it and use it if it looks richer than what Gin gave
+		parts := strings.Split(val, ",")
+		if len(parts) > len(rawMetrics) {
+			rawMetrics = parts
+		}
+	}
+
+	// 3. Flatten and clean
+	for _, m := range rawMetrics {
+		// Split by comma just in case we have "a,b" as a single element
+		parts := strings.Split(m, ",")
+		for _, p := range parts {
+			clean := strings.TrimSpace(p)
+			if clean != "" {
+				query.Metrics = append(query.Metrics, clean)
+			}
+		}
+	}
+
 	accountID, _ := c.Get("account_id")
 	projectID, _ := c.Get("project_id")
 	if accountID == "" || projectID == "" {
@@ -98,7 +125,22 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 		query.GroupBy = "day"
 	}
 
-	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), query.StartDate, query.EndDate)
+	// Determine fetch range (extended for rolling windows)
+	fetchStartDate := query.StartDate
+	needsRolling := false
+	for _, m := range query.Metrics {
+		if m == "wau" || m == "mau" {
+			needsRolling = true
+		}
+	}
+	if needsRolling {
+		t, err := time.Parse("2006-01-02", query.StartDate)
+		if err == nil {
+			fetchStartDate = t.AddDate(0, 0, -30).Format("2006-01-02")
+		}
+	}
+
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), fetchStartDate, query.EndDate)
 	if err != nil {
 		log.Printf("Error fetching events: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
@@ -106,24 +148,28 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 	}
 
 	filteredEvents := as.filterEvents(events, query)
+	standardEvents := as.filterEventsByDate(filteredEvents, query.StartDate, query.EndDate)
 
-	results := as.calculateMetrics(filteredEvents, query, sc, projectID.(string))
-
+	results := as.calculateMetrics(standardEvents, filteredEvents, query, sc, projectID.(string))
+	fmt.Printf("%+v\n", results)
 	response := AnalyticsResponse{
 		Query:   query,
 		Results: results,
 	}
-	response.Meta.TotalEvents = len(filteredEvents)
+	response.Meta.TotalEvents = len(standardEvents)
 	response.Meta.ProcessingTime = time.Since(start)
 	response.Meta.DateRange = fmt.Sprintf("%s to %s", query.StartDate, query.EndDate)
 
 	c.JSON(http.StatusOK, response)
 }
 
-func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuery, sc *client.API, projectID string) []MetricResult {
+func (as *AnalyticsService) calculateMetrics(events []Event, extendedEvents []Event, query AnalyticsQuery, sc *client.API, projectID string) []MetricResult {
 	var results []MetricResult
 
+	log.Printf("calculateMetrics called with %d events and metrics: %v", len(events), query.Metrics)
+
 	for _, metric := range query.Metrics {
+		log.Printf("Processing metric: %s", metric)
 		switch metric {
 		case "total_events":
 			results = append(results, MetricResult{
@@ -236,10 +282,17 @@ func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuer
 				}
 			}
 
+			var timeSeries []TimeSeriesPoint
+			if query.GroupBy == "day" {
+				timeSeries = as.getRollingActiveUsersTimeSeries(events, 1, query.StartDate, query.EndDate)
+			} else {
+				timeSeries = as.getDAUTimeSeries(events, query.GroupBy)
+			}
+
 			results = append(results, MetricResult{
 				Metric:     "dau",
 				Value:      len(todayUsers),
-				TimeSeries: as.getDAUTimeSeries(events, query.GroupBy),
+				TimeSeries: timeSeries,
 			})
 
 		case "wau":
@@ -252,10 +305,17 @@ func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuer
 				}
 			}
 
+			var timeSeries []TimeSeriesPoint
+			if query.GroupBy == "day" {
+				timeSeries = as.getRollingActiveUsersTimeSeries(extendedEvents, 7, query.StartDate, query.EndDate)
+			} else {
+				timeSeries = as.getWAUTimeSeries(events, query.GroupBy)
+			}
+
 			results = append(results, MetricResult{
 				Metric:     "wau",
 				Value:      len(weeklyUsers),
-				TimeSeries: as.getWAUTimeSeries(events, query.GroupBy),
+				TimeSeries: timeSeries,
 			})
 
 		case "mau":
@@ -268,10 +328,17 @@ func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuer
 				}
 			}
 
+			var timeSeries []TimeSeriesPoint
+			if query.GroupBy == "day" {
+				timeSeries = as.getRollingActiveUsersTimeSeries(extendedEvents, 30, query.StartDate, query.EndDate)
+			} else {
+				timeSeries = as.getMAUTimeSeries(events, query.GroupBy)
+			}
+
 			results = append(results, MetricResult{
 				Metric:     "mau",
 				Value:      len(monthlyUsers),
-				TimeSeries: as.getMAUTimeSeries(events, query.GroupBy),
+				TimeSeries: timeSeries,
 			})
 
 		case "page_views":
@@ -299,6 +366,28 @@ func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuer
 				Value:      pageViews,
 				Breakdown:  convertMapToInterface(pageViewsByPath),
 				TimeSeries: as.getPageViewTimeSeries(events, query.GroupBy),
+			})
+
+		case "total_sessions":
+			uniqueSessions := make(map[string]bool)
+			for _, event := range events {
+				if event.SessionID != "" {
+					uniqueSessions[event.SessionID] = true
+				}
+			}
+
+			results = append(results, MetricResult{
+				Metric: "total_sessions",
+				Value:  len(uniqueSessions),
+				TimeSeries: as.getTimeSeriesData(events, query.GroupBy, func(events []Event) interface{} {
+					sessions := make(map[string]bool)
+					for _, event := range events {
+						if event.SessionID != "" {
+							sessions[event.SessionID] = true
+						}
+					}
+					return len(sessions)
+				}),
 			})
 
 		case "country_breakdown":
@@ -547,9 +636,17 @@ func (as *AnalyticsService) calculateMetrics(events []Event, query AnalyticsQuer
 					Value:  "No data - sync Stripe first",
 				})
 			}
+
+		default:
+			log.Printf("Unknown metric requested: %s", metric)
+			results = append(results, MetricResult{
+				Metric: metric,
+				Value:  "Metric not implemented",
+			})
 		}
 	}
 
+	log.Printf("calculateMetrics returning %d results: %v", len(results), results)
 	return results
 }
 
@@ -629,6 +726,71 @@ func (as *AnalyticsService) filterEvents(events []Event, query AnalyticsQuery) [
 	}
 
 	return filtered
+}
+
+// filterEventsByDate filters events by date range
+func (as *AnalyticsService) filterEventsByDate(events []Event, startDate, endDate string) []Event {
+	start, _ := time.Parse("2006-01-02", startDate)
+	end, _ := time.Parse("2006-01-02", endDate)
+	end = end.Add(24*time.Hour - time.Nanosecond)
+
+	var filtered []Event
+	for _, e := range events {
+		if (e.Timestamp.Equal(start) || e.Timestamp.After(start)) && (e.Timestamp.Equal(end) || e.Timestamp.Before(end)) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
+// getRollingActiveUsersTimeSeries generates rolling active users time series data
+func (as *AnalyticsService) getRollingActiveUsersTimeSeries(events []Event, windowDays int, startDate, endDate string) []TimeSeriesPoint {
+	// Parse range
+	start, _ := time.Parse("2006-01-02", startDate)
+	end, _ := time.Parse("2006-01-02", endDate)
+
+	// Pre-process events into daily user sets
+	dailyUsers := make(map[string]map[string]bool)
+	for _, event := range events {
+		d := event.Timestamp.Format("2006-01-02")
+		if dailyUsers[d] == nil {
+			dailyUsers[d] = make(map[string]bool)
+		}
+		if event.UserID != "" {
+			dailyUsers[d][event.UserID] = true
+		}
+	}
+
+	var points []TimeSeriesPoint
+	current := start
+
+	// Iterate through the requested range
+	for !current.After(end) {
+		dateStr := current.Format("2006-01-02")
+		windowUsers := make(map[string]bool)
+
+		// Look back windowDays
+		for i := 0; i < windowDays; i++ {
+			d := current.AddDate(0, 0, -i)
+			dStr := d.Format("2006-01-02")
+			if users, ok := dailyUsers[dStr]; ok {
+				for u := range users {
+					windowUsers[u] = true
+				}
+			}
+		}
+
+		count := len(windowUsers)
+		points = append(points, TimeSeriesPoint{
+			Date:        dateStr,
+			Value:       count,
+			UniqueUsers: count,
+		})
+
+		current = current.AddDate(0, 0, 1)
+	}
+
+	return points
 }
 
 // getTimeSeriesData generates time series data based on groupBy parameter
@@ -1094,11 +1256,20 @@ func (as *AnalyticsService) GetUserMetricsHandler(c *gin.Context) {
 
 // GetHeatmapHandler returns heatmap data for analytics
 func (as *AnalyticsService) GetHeatmapHandler(c *gin.Context) {
-	accountID, _ := c.Get("account_id")
-	projectID, _ := c.Get("project_id")
-	if accountID == "" || projectID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized - missing account_id"})
 		return
+	}
+
+	projectID, exists := c.Get("project_id")
+	if !exists || projectID == nil {
+		// Try to get project_id from URL parameter as fallback
+		projectID = c.Param("project_id")
+		if projectID == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized - missing project_id"})
+			return
+		}
 	}
 
 	// Get query parameters
@@ -1106,8 +1277,21 @@ func (as *AnalyticsService) GetHeatmapHandler(c *gin.Context) {
 	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -7).Format("2006-01-02"))
 	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
 
+	// Convert to strings safely
+	accountIDStr, ok := accountID.(string)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid account_id format"})
+		return
+	}
+
+	projectIDStr, ok := projectID.(string)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid project_id format"})
+		return
+	}
+
 	// Fetch real heatmap events from date range
-	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), startDate, endDate)
+	events, err := as.fetchEventsForDateRange(accountIDStr, projectIDStr, startDate, endDate)
 	if err != nil {
 		log.Printf("Error fetching heatmap events: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch heatmap data"})

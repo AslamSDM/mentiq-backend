@@ -600,11 +600,6 @@ func (as *AnalyticsService) getCacheSize() int {
 	return len(as.eventsCache)
 }
 
-// flushEventCache is a no-op when using direct DB writes
-func (as *AnalyticsService) flushEventCache() {
-	log.Println("flushEventCache called - no-op for TimescaleDB direct writes")
-}
-
 // Global GeoIP database reader (initialized once)
 var geoipDB *geoip2.Reader
 var geoipOnce sync.Once
@@ -705,28 +700,6 @@ func (as *AnalyticsService) clearDataCacheHandler(c *gin.Context) {
 	})
 }
 
-func getClientIP(r *http.Request) string {
-	// Check for X-Forwarded-For header (common in load balancers)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP from the comma-separated list
-		if idx := strings.Index(xff, ","); idx != -1 {
-			return strings.TrimSpace(xff[:idx])
-		}
-		return strings.TrimSpace(xff)
-	}
-
-	// Check for X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-
-	// Fall back to RemoteAddr
-	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx != -1 {
-		return r.RemoteAddr[:idx]
-	}
-	return r.RemoteAddr
-}
-
 func getClientIPFromGin(c *gin.Context) string {
 	// Check for X-Forwarded-For header (common in load balancers)
 	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
@@ -772,12 +745,12 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 
 	// Parse request body
 	var recordingData struct {
-		Events    []map[string]interface{} `json:"events"`
-		Duration  int                      `json:"duration"`
-		StartURL  string                   `json:"start_url"`
-		AccountID string                   `json:"account_id"`
-		ProjectID string                   `json:"project_id"`
-		UserID    *string                  `json:"user_id"`
+		Events    json.RawMessage `json:"events"`
+		Duration  int             `json:"duration"`
+		StartURL  string          `json:"start_url"`
+		AccountID string          `json:"account_id"`
+		ProjectID string          `json:"project_id"`
+		UserID    *string         `json:"user_id"`
 	}
 
 	if err := c.ShouldBindJSON(&recordingData); err != nil {
@@ -825,20 +798,19 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 		if err != nil {
 			log.Printf("Failed to upload recording to S3: %v. Falling back to DB storage.", err)
 			// Fall back to DB storage
-			eventsJSON, err = json.Marshal(recordingData.Events)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal events"})
-				return
-			}
+			eventsJSON = recordingData.Events
 			storagePath = "" // Empty storage path means data is in RecordingData field
 		}
 	} else {
 		// No S3 configured, store in DB
-		eventsJSON, err = json.Marshal(recordingData.Events)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal events"})
-			return
-		}
+		eventsJSON = recordingData.Events
+	}
+
+	// Calculate event count
+	var eventCount int
+	var eventsList []interface{}
+	if err := json.Unmarshal(recordingData.Events, &eventsList); err == nil {
+		eventCount = len(eventsList)
 	}
 
 	// Save or update recording metadata in database
@@ -852,7 +824,7 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 		StoragePath:   storagePath, // S3 key if stored in S3, empty if stored in DB
 		Duration:      recordingData.Duration,
 		StartURL:      recordingData.StartURL,
-		EventCount:    len(recordingData.Events),
+		EventCount:    eventCount,
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
 	}
@@ -1116,12 +1088,36 @@ func (s *Server) getSessionsHandler(c *gin.Context) {
 		}
 	}
 
-	// Convert to slice and calculate durations
+	// Fetch recording durations for all sessions
+	sessionIDs := make([]string, 0, len(sessionMap))
+	for sessionID := range sessionMap {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+
+	var recordings []SessionRecording
+	if len(sessionIDs) > 0 {
+		s.db.Where("session_id IN ? AND project_id = ?", sessionIDs, projectID).Find(&recordings)
+	}
+
+	// Create a map of session_id -> recording duration
+	recordingDurations := make(map[string]int)
+	for _, rec := range recordings {
+		recordingDurations[rec.SessionID] = rec.Duration
+	}
+
+	// Convert to slice and set durations
 	sessions := make([]map[string]interface{}, 0, len(sessionMap))
-	for _, session := range sessionMap {
+	for sessionID, session := range sessionMap {
 		startTime := session["start_time"].(time.Time)
 		endTime := session["end_time"].(time.Time)
-		session["duration"] = int(endTime.Sub(startTime).Seconds())
+
+		// Use recording duration if available, otherwise calculate from events
+		if duration, exists := recordingDurations[sessionID]; exists && duration > 0 {
+			session["duration"] = duration
+		} else {
+			session["duration"] = int(endTime.Sub(startTime).Seconds())
+		}
+
 		sessions = append(sessions, session)
 	}
 
@@ -1187,53 +1183,97 @@ func (s *Server) getSessionHandler(c *gin.Context) {
 		}
 	}
 
-	if len(sessionEvents) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
+	// Fetch recording for this session
+	var recording SessionRecording
+	if err := s.db.Where("session_id = ? AND project_id = ?", sessionID, projectID).First(&recording).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "No recording found for this session"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch session recording"})
 		return
 	}
 
-	// Sort events by timestamp
-	sort.Slice(sessionEvents, func(i, j int) bool {
-		return sessionEvents[i].Timestamp.Before(sessionEvents[j].Timestamp)
-	})
+	var rrwebEvents []map[string]interface{}
 
-	// Calculate session summary
-	firstEvent := sessionEvents[0]
-	lastEvent := sessionEvents[len(sessionEvents)-1]
-	duration := int(lastEvent.Timestamp.Sub(firstEvent.Timestamp).Seconds())
-
-	pageViews := 0
-	for _, event := range sessionEvents {
-		if event.EventType == "page_view" {
-			pageViews++
+	// Check if data is in S3 or DB
+	if recording.StoragePath != "" && s.sessionStorage != nil {
+		// Retrieve from S3/R2
+		data, err := s.sessionStorage.DownloadRecordingData(recording.StoragePath)
+		if err != nil {
+			log.Printf("Failed to retrieve recording from S3 for session %s: %v", sessionID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording data"})
+			return
 		}
+		if err := json.Unmarshal(data, &rrwebEvents); err != nil {
+			log.Printf("Failed to unmarshal recording data for session %s: %v", sessionID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recording data"})
+			return
+		}
+	} else if len(recording.RecordingData) > 0 {
+		// Retrieve from DB
+		if err := json.Unmarshal(recording.RecordingData, &rrwebEvents); err != nil {
+			log.Printf("Failed to unmarshal recording data from DB for session %s: %v", sessionID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recording data from DB"})
+			return
+		}
+	} else {
+		// No recording data available
+		rrwebEvents = []map[string]interface{}{}
 	}
 
-	session := map[string]interface{}{
+	// Fetch all analytics events for this session to build the summary
+	var analyticsEvents []Event
+	if err := s.db.Where("session_id = ? AND project_id = ?", sessionID, projectID).Order("timestamp asc").Find(&analyticsEvents).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events for session"})
+		return
+	}
+
+	if len(analyticsEvents) == 0 && len(rrwebEvents) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found or has no events"})
+		return
+	}
+
+	// Calculate session summary from analytics events
+	var startTime, endTime time.Time
+	var user_id string
+	var country, city, device, os, browser string
+
+	if len(analyticsEvents) > 0 {
+		startTime = analyticsEvents[0].Timestamp
+		endTime = analyticsEvents[len(analyticsEvents)-1].Timestamp
+		user_id = analyticsEvents[0].UserID
+		country = analyticsEvents[0].Country
+		city = analyticsEvents[0].City
+		device = analyticsEvents[0].Device
+		os = analyticsEvents[0].OS
+		browser = analyticsEvents[0].Browser
+	} else if recording.CreatedAt != (time.Time{}) {
+		startTime = recording.CreatedAt
+		endTime = recording.CreatedAt.Add(time.Duration(recording.Duration) * time.Second)
+	}
+
+	// Use recording duration if available, otherwise calculate from analytics events
+	duration := recording.Duration
+	if duration == 0 && !startTime.IsZero() && !endTime.IsZero() {
+		duration = int(endTime.Sub(startTime).Seconds())
+	}
+
+	// Respond with session details and the correct rrweb events
+	c.JSON(http.StatusOK, gin.H{
 		"id":         sessionID,
-		"user_id":    firstEvent.UserID,
-		"start_time": firstEvent.Timestamp,
-		"end_time":   lastEvent.Timestamp,
+		"user_id":    user_id,
+		"start_time": startTime,
+		"end_time":   endTime,
 		"duration":   duration,
-		"events":     sessionEvents,
-		"page_views": pageViews,
-		"device":     "Unknown",
-		"browser":    "Unknown",
-		"location":   "Unknown",
-	}
-
-	// Extract device info from event if available
-	if firstEvent.Device != "" {
-		session["device"] = firstEvent.Device
-	}
-	if firstEvent.Browser != "" {
-		session["browser"] = firstEvent.Browser
-	}
-	if firstEvent.Country != "" {
-		session["location"] = firstEvent.Country
-	}
-
-	c.JSON(http.StatusOK, session)
+		"events":     analyticsEvents, // Analytics events for timeline view
+		"eventsList": rrwebEvents,     // RRWeb events for player
+		"country":    country,
+		"city":       city,
+		"device":     device,
+		"os":         os,
+		"browser":    browser,
+	})
 }
 
 // getHeatmapPagesHandler returns a list of pages with heatmap data
