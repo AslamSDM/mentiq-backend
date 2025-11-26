@@ -1070,23 +1070,41 @@ func (eas *EnhancedAnalyticsService) calculateConversionFunnel(projectID string,
 	return funnelSteps, nil
 }
 
-// calculateSessionMetrics calculates enhanced session analytics
+// calculateSessionMetrics calculates enhanced session analytics from events
 func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, start, end time.Time) (map[string]interface{}, error) {
-	// Query UserSessionMetrics from database with proper error handling
-	var sessionMetrics []UserSessionMetrics
-	err := eas.db.Where("project_id = ? AND date BETWEEN ? AND ?", projectID, start, end).
-		Order("date DESC").
-		Find(&sessionMetrics).Error
+	// Adjust end date to include the full day
+	endOfDay := end.Add(24*time.Hour - time.Nanosecond)
+
+	log.Printf("Calculating session metrics for project %s from %s to %s", projectID, start.Format("2006-01-02"), end.Format("2006-01-02"))
+
+	// Get total sessions count
+	var totalSessions int64
+	err := eas.db.Model(&Event{}).
+		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, start, endOfDay).
+		Distinct("session_id").
+		Count(&totalSessions).Error
 
 	if err != nil {
-		log.Printf("Error fetching session metrics for project %s: %v", projectID, err)
-		return nil, fmt.Errorf("failed to fetch session metrics: %v", err)
+		log.Printf("Error counting sessions for project %s: %v", projectID, err)
+		return nil, fmt.Errorf("failed to count sessions: %v", err)
 	}
 
-	log.Printf("Found %d session metrics records for project %s", len(sessionMetrics), projectID)
+	// Get unique users count
+	var uniqueUsers int64
+	err = eas.db.Model(&Event{}).
+		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, start, endOfDay).
+		Distinct("user_id").
+		Count(&uniqueUsers).Error
+
+	if err != nil {
+		log.Printf("Error counting unique users for project %s: %v", projectID, err)
+		return nil, fmt.Errorf("failed to count users: %v", err)
+	}
+
+	log.Printf("Found %d sessions and %d unique users for project %s", totalSessions, uniqueUsers, projectID)
 
 	// Return empty structure if no data found
-	if len(sessionMetrics) == 0 {
+	if totalSessions == 0 {
 		return map[string]interface{}{
 			"overview": map[string]interface{}{
 				"total_sessions":       0,
@@ -1106,81 +1124,130 @@ func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, s
 		}, nil
 	}
 
-	// Aggregate metrics with improved validation
-	totalSessions := 0
-	uniqueUsers := 0
+	// Calculate session durations by grouping events per session
+	type SessionInfo struct {
+		SessionID string
+		UserID    string
+		MinTime   time.Time
+		MaxTime   time.Time
+		Events    int
+	}
+
+	var sessions []SessionInfo
+	err = eas.db.Model(&Event{}).
+		Select("session_id, user_id, MIN(timestamp) as min_time, MAX(timestamp) as max_time, COUNT(*) as events").
+		Where("project_id = ? AND timestamp BETWEEN ? AND ? AND session_id != ''", projectID, start, endOfDay).
+		Group("session_id, user_id").
+		Scan(&sessions).Error
+
+	if err != nil {
+		log.Printf("Error calculating session durations for project %s: %v", projectID, err)
+		return nil, fmt.Errorf("failed to calculate session durations: %v", err)
+	}
+
+	// Calculate metrics from sessions
 	totalDuration := 0
-	bounceRateSum := 0.0
-	returnRateSum := 0.0
-	dau := 0
-	wau := 0
-	mau := 0
-	stickinessSum := 0.0
-	sessionFreqSum := 0.0
-	validCount := 0
+	singleEventSessions := 0
+	returningUsers := make(map[string]int) // user_id -> session count
 
-	timeSeries := make([]map[string]interface{}, 0, 30) // Limit to last 30 days
+	for _, session := range sessions {
+		duration := int(session.MaxTime.Sub(session.MinTime).Seconds())
+		totalDuration += duration
 
-	for _, data := range sessionMetrics {
-		// Validate session data
-		if data.TotalSessions < 0 || data.DAU < 0 || data.WAU < 0 || data.MAU < 0 {
-			log.Printf("Warning: Invalid session metrics data for project %s on date %s", projectID, data.Date.Format("2006-01-02"))
-			continue
+		if session.Events == 1 {
+			singleEventSessions++
 		}
 
-		totalSessions += data.TotalSessions
-		dau += data.DAU
-		wau += data.WAU
-		mau += data.MAU
-		totalDuration += data.AvgSessionDuration * data.TotalSessions
-		bounceRateSum += data.BounceRate
-		returnRateSum += data.ReturnUserRate
-		stickinessSum += data.StickinessRatio
-		sessionFreqSum += data.AvgSessionsPerUser
-		validCount++
+		returningUsers[session.UserID]++
+	}
 
-		// Build time series (limit to last 30 days)
-		if len(timeSeries) < 30 {
-			// Format duration for display
-			durationStr := fmt.Sprintf("%d seconds", data.AvgSessionDuration)
-			if data.AvgSessionDuration >= 60 {
-				minutes := data.AvgSessionDuration / 60
-				seconds := data.AvgSessionDuration % 60
-				durationStr = fmt.Sprintf("%dm %ds", minutes, seconds)
-			}
+	avgDuration := 0
+	if len(sessions) > 0 {
+		avgDuration = totalDuration / len(sessions)
+	}
 
+	bounceRate := 0.0
+	if len(sessions) > 0 {
+		bounceRate = (float64(singleEventSessions) / float64(len(sessions))) * 100
+	}
+
+	// Calculate return visitor rate
+	returnCount := 0
+	for _, count := range returningUsers {
+		if count > 1 {
+			returnCount++
+		}
+	}
+	returnRate := 0.0
+	if len(returningUsers) > 0 {
+		returnRate = (float64(returnCount) / float64(len(returningUsers))) * 100
+	}
+
+	// Calculate DAU (last day of range)
+	dayStart := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, end.Location())
+	dayEnd := dayStart.Add(24*time.Hour - time.Nanosecond)
+	var dau int64
+	eas.db.Model(&Event{}).
+		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, dayStart, dayEnd).
+		Distinct("user_id").
+		Count(&dau)
+
+	// Calculate WAU (last 7 days)
+	weekStart := end.AddDate(0, 0, -6) // 7 days including today
+	var wau int64
+	eas.db.Model(&Event{}).
+		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, weekStart, endOfDay).
+		Distinct("user_id").
+		Count(&wau)
+
+	// Calculate MAU (last 30 days)
+	monthStart := end.AddDate(0, 0, -29) // 30 days including today
+	var mau int64
+	eas.db.Model(&Event{}).
+		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, monthStart, endOfDay).
+		Distinct("user_id").
+		Count(&mau)
+
+	// Calculate stickiness ratio (DAU/MAU)
+	stickinessRatio := 0.0
+	if mau > 0 {
+		stickinessRatio = (float64(dau) / float64(mau))
+	}
+
+	// Calculate session frequency
+	sessionFreq := 0.0
+	if uniqueUsers > 0 {
+		sessionFreq = float64(totalSessions) / float64(uniqueUsers)
+	}
+
+	// Build time series (daily breakdown)
+	timeSeries := make([]map[string]interface{}, 0)
+	current := start
+	for current.Before(end) || current.Equal(end) {
+		dayStart := time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, current.Location())
+		dayEnd := dayStart.Add(24*time.Hour - time.Nanosecond)
+
+		var daySessions int64
+		eas.db.Model(&Event{}).
+			Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, dayStart, dayEnd).
+			Distinct("session_id").
+			Count(&daySessions)
+
+		var dayUsers int64
+		eas.db.Model(&Event{}).
+			Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, dayStart, dayEnd).
+			Distinct("user_id").
+			Count(&dayUsers)
+
+		if daySessions > 0 || dayUsers > 0 {
 			timeSeries = append(timeSeries, map[string]interface{}{
-				"date":         data.Date.Format("2006-01-02"),
-				"sessions":     data.TotalSessions,
-				"users":        data.DAU,
-				"avg_duration": durationStr,
+				"date":     current.Format("2006-01-02"),
+				"sessions": daySessions,
+				"users":    dayUsers,
 			})
 		}
-	}
 
-	// Calculate averages
-	avgDuration := 0
-	if totalSessions > 0 {
-		avgDuration = totalDuration / totalSessions
-		// Get unique users from MAU (most recent)
-		if len(sessionMetrics) > 0 {
-			uniqueUsers = sessionMetrics[0].MAU
-		}
-	}
-
-	avgBounceRate := 0.0
-	avgReturnRate := 0.0
-	avgStickiness := 0.0
-	avgSessionFreq := 0.0
-	if validCount > 0 {
-		avgBounceRate = bounceRateSum / float64(validCount)
-		avgReturnRate = returnRateSum / float64(validCount)
-		avgStickiness = stickinessSum / float64(validCount)
-		avgSessionFreq = sessionFreqSum / float64(validCount)
-		// Use average DAU/WAU/MAU
-		dau = dau / validCount
-		wau = wau / validCount
-		mau = mau / validCount
+		current = current.AddDate(0, 0, 1)
 	}
 
 	// Format average duration for display
@@ -1202,23 +1269,25 @@ func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, s
 			"total_sessions":       totalSessions,
 			"unique_users":         uniqueUsers,
 			"avg_session_duration": avgDurationStr,
-			"bounce_rate":          fmt.Sprintf("%.2f%%", avgBounceRate),
-			"return_visitor_rate":  fmt.Sprintf("%.2f%%", avgReturnRate),
+			"bounce_rate":          fmt.Sprintf("%.2f%%", bounceRate),
+			"return_visitor_rate":  fmt.Sprintf("%.2f%%", returnRate),
 		},
 		"engagement": map[string]interface{}{
 			"dau":               dau,
 			"wau":               wau,
 			"mau":               mau,
-			"stickiness_ratio":  fmt.Sprintf("%.2f%%", avgStickiness*100), // Convert to percentage
-			"session_frequency": fmt.Sprintf("%.2f", avgSessionFreq),
+			"stickiness_ratio":  fmt.Sprintf("%.2f%%", stickinessRatio*100),
+			"session_frequency": fmt.Sprintf("%.2f", sessionFreq),
 		},
 		"time_series": timeSeries,
 		"meta": map[string]interface{}{
-			"date_range":  fmt.Sprintf("%s to %s", start.Format("2006-01-02"), end.Format("2006-01-02")),
-			"data_points": validCount,
+			"date_range":   fmt.Sprintf("%s to %s", start.Format("2006-01-02"), end.Format("2006-01-02")),
+			"data_points":  len(timeSeries),
+			"total_events": len(sessions),
 		},
 	}
 
-	log.Printf("Returning session metrics for project %s: %d sessions, %d unique users", projectID, totalSessions, uniqueUsers)
+	log.Printf("Returning session metrics for project %s: %d sessions, %d unique users, DAU: %d, WAU: %d, MAU: %d",
+		projectID, totalSessions, uniqueUsers, dau, wau, mau)
 	return sessionData, nil
 }

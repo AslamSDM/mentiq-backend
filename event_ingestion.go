@@ -81,6 +81,16 @@ func (as *AnalyticsService) ingestEventHandler(c *gin.Context) {
 	event.Country = country
 	event.City = city
 
+	// Extract channel and email from properties
+	if event.Properties != nil {
+		if channel, ok := event.Properties["channel"].(string); ok && channel != "" {
+			event.Channel = channel
+		}
+		if email, ok := event.Properties["email"].(string); ok && email != "" {
+			event.Email = email
+		}
+	}
+
 	// Validate required fields
 	if event.EventType == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "event_type is required"})
@@ -202,6 +212,16 @@ func (as *AnalyticsService) batchIngestHandler(c *gin.Context) {
 			}
 			if event.City == "" {
 				event.City = city
+			}
+		}
+
+		// Extract channel and email from properties
+		if event.Properties != nil {
+			if channel, ok := event.Properties["channel"].(string); ok && channel != "" && event.Channel == "" {
+				event.Channel = channel
+			}
+			if email, ok := event.Properties["email"].(string); ok && email != "" && event.Email == "" {
+				event.Email = email
 			}
 		}
 	}

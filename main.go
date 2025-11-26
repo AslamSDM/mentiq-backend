@@ -48,6 +48,8 @@ type Event struct {
 	Device     string                 `gorm:"index" json:"device,omitempty"`
 	OS         string                 `gorm:"index" json:"os,omitempty"`
 	Browser    string                 `gorm:"index" json:"browser,omitempty"`
+	Channel    string                 `gorm:"index" json:"channel,omitempty"`
+	Email      string                 `gorm:"index" json:"email,omitempty"`
 	CreatedAt  time.Time              `gorm:"autoCreateTime" json:"created_at"`
 }
 
@@ -353,6 +355,7 @@ func main() {
 		apiV1.GET("/analytics/errors", server.analyticsService.GetErrorAnalyticsHandler)
 		apiV1.GET("/sessions/:session_id", server.analyticsService.GetSessionAnalyticsHandler)
 		apiV1.GET("/analytics/retention", server.analyticsService.GetRetentionCohortsHandler)
+		apiV1.GET("/analytics/churn-by-channel", server.analyticsService.GetChurnByChannelHandler)
 
 		// Session Recording routes
 		apiV1.POST("/sessions/:session_id/recordings", server.ingestRecordingHandler)
@@ -368,6 +371,7 @@ func main() {
 		// Project and API Key management
 		apiV1.POST("/projects", server.createProjectHandler)
 		apiV1.GET("/projects", server.listProjectsHandler)
+		apiV1.GET("/projects/:project_id/events", server.analyticsService.GetEventsHandler)
 		apiV1.POST("/projects/:project_id/apikeys", server.createApiKeyHandler)
 		apiV1.GET("/projects/:project_id/apikeys", server.listApiKeysHandler)
 		apiV1.PUT("/projects/:project_id/apikeys/:key_id", server.updateApiKeyHandler)

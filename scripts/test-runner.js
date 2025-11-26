@@ -234,7 +234,7 @@ class AnalyticsTestRunner {
     const improvement = times[0] > times[times.length - 1];
 
     console.log(
-      `   ${colors.cyan}Average response time: ${avgTime.toFixed(2)}ms${
+      `   ${colors.cyan}Average response time: ${avgTime?.toFixed(2)}ms${
         colors.reset
       }`
     );
@@ -260,7 +260,7 @@ class AnalyticsTestRunner {
       `   ${colors.red}❌ Failed: ${this.stats.failed}${colors.reset}`
     );
 
-    const successRate = ((this.stats.passed / this.stats.total) * 100).toFixed(
+    const successRate = ((this.stats.passed / this.stats.total) * 100)?.toFixed(
       1
     );
     console.log(`   Success Rate: ${successRate}%`);
@@ -268,7 +268,7 @@ class AnalyticsTestRunner {
     console.log(`\n${colors.cyan}📋 Suite Breakdown:${colors.reset}`);
     Object.entries(this.stats.suites).forEach(([suite, stats]) => {
       const total = stats.passed + stats.failed;
-      const rate = ((stats.passed / total) * 100).toFixed(1);
+      const rate = ((stats.passed / total) * 100)?.toFixed(1);
       console.log(`   ${suite}: ${stats.passed}/${total} (${rate}%)`);
     });
 

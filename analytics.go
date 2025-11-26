@@ -55,6 +55,69 @@ type ResponseMeta struct {
 	CacheHit       bool          `json:"cache_hit,omitempty"`
 }
 
+// GetEventsHandler returns raw events for a project
+func (as *AnalyticsService) GetEventsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Project ID is required"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Parse query parameters
+	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -7).Format("2006-01-02"))
+	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+	eventType := c.Query("event_type")
+	limit := 100
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if l, err := fmt.Sscanf(limitStr, "%d", &limit); err == nil && l > 0 {
+			if limit > 1000 {
+				limit = 1000 // Cap at 1000 events
+			}
+		}
+	}
+
+	// Fetch events
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	if err != nil {
+		log.Printf("Error fetching events: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
+		return
+	}
+
+	// Filter by event type if specified
+	var filteredEvents []Event
+	if eventType != "" {
+		for _, e := range events {
+			if e.EventType == eventType {
+				filteredEvents = append(filteredEvents, e)
+			}
+		}
+	} else {
+		filteredEvents = events
+	}
+
+	// Apply limit
+	if len(filteredEvents) > limit {
+		filteredEvents = filteredEvents[:limit]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"events": filteredEvents,
+		"meta": gin.H{
+			"total":      len(filteredEvents),
+			"start_date": startDate,
+			"end_date":   endDate,
+		},
+	})
+}
+
 func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 	start := time.Now()
 
@@ -272,13 +335,40 @@ func (as *AnalyticsService) calculateMetrics(events []Event, extendedEvents []Ev
 			})
 
 		case "dau":
-			today := time.Now().UTC().Format("2006-01-02")
-			todayUsers := make(map[string]bool)
+			// Daily Active Users - unique users per day in the date range
+			dailyUsers := make(map[string]map[string]bool) // date -> user_id -> bool
 
 			for _, event := range events {
+				if event.UserID == "" {
+					continue
+				}
 				eventDate := event.Timestamp.Format("2006-01-02")
-				if eventDate == today && event.UserID != "" {
-					todayUsers[event.UserID] = true
+				if dailyUsers[eventDate] == nil {
+					dailyUsers[eventDate] = make(map[string]bool)
+				}
+				dailyUsers[eventDate][event.UserID] = true
+			}
+
+			// Get the latest date's user count as current DAU (or average DAU if no specific day)
+			var latestDate string
+			var currentDAU int
+			for date := range dailyUsers {
+				if date > latestDate {
+					latestDate = date
+					currentDAU = len(dailyUsers[date])
+				}
+			}
+
+			// If no data, calculate from end date
+			if currentDAU == 0 && query.EndDate != "" {
+				endDate, err := time.Parse("2006-01-02", query.EndDate)
+				if err == nil {
+					endDateStr := endDate.Format("2006-01-02")
+					for _, event := range events {
+						if event.UserID != "" && event.Timestamp.Format("2006-01-02") == endDateStr {
+							currentDAU++
+						}
+					}
 				}
 			}
 
@@ -291,16 +381,28 @@ func (as *AnalyticsService) calculateMetrics(events []Event, extendedEvents []Ev
 
 			results = append(results, MetricResult{
 				Metric:     "dau",
-				Value:      len(todayUsers),
+				Value:      currentDAU,
 				TimeSeries: timeSeries,
 			})
 
 		case "wau":
-			sevenDaysAgo := time.Now().UTC().AddDate(0, 0, -7)
+			// Weekly Active Users - unique users in the last 7 days from end of date range
+			var endDate time.Time
+			var err error
+			if query.EndDate != "" {
+				endDate, err = time.Parse("2006-01-02", query.EndDate)
+			}
+			if err != nil || query.EndDate == "" {
+				endDate = time.Now().UTC()
+			}
+
+			sevenDaysAgo := endDate.AddDate(0, 0, -7)
 			weeklyUsers := make(map[string]bool)
 
 			for _, event := range events {
-				if event.Timestamp.After(sevenDaysAgo) && event.UserID != "" {
+				if event.Timestamp.After(sevenDaysAgo) &&
+					event.Timestamp.Before(endDate.AddDate(0, 0, 1)) &&
+					event.UserID != "" {
 					weeklyUsers[event.UserID] = true
 				}
 			}
@@ -319,11 +421,23 @@ func (as *AnalyticsService) calculateMetrics(events []Event, extendedEvents []Ev
 			})
 
 		case "mau":
-			thirtyDaysAgo := time.Now().UTC().AddDate(0, 0, -30)
+			// Monthly Active Users - unique users in the last 30 days from end of date range
+			var endDate time.Time
+			var err error
+			if query.EndDate != "" {
+				endDate, err = time.Parse("2006-01-02", query.EndDate)
+			}
+			if err != nil || query.EndDate == "" {
+				endDate = time.Now().UTC()
+			}
+
+			thirtyDaysAgo := endDate.AddDate(0, 0, -30)
 			monthlyUsers := make(map[string]bool)
 
 			for _, event := range events {
-				if event.Timestamp.After(thirtyDaysAgo) && event.UserID != "" {
+				if event.Timestamp.After(thirtyDaysAgo) &&
+					event.Timestamp.Before(endDate.AddDate(0, 0, 1)) &&
+					event.UserID != "" {
 					monthlyUsers[event.UserID] = true
 				}
 			}
@@ -1566,4 +1680,134 @@ func (as *AnalyticsService) GetRetentionCohortsHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, retentionData)
+}
+
+// GetChurnByChannelHandler returns churn analysis segmented by acquisition channel
+func (as *AnalyticsService) GetChurnByChannelHandler(c *gin.Context) {
+	accountID, _ := c.Get("account_id")
+	projectID, _ := c.Get("project_id")
+
+	accountIDStr, ok1 := accountID.(string)
+	projectIDStr, ok2 := projectID.(string)
+
+	if !ok1 || !ok2 || accountIDStr == "" || projectIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Get date range parameters
+	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -30).Format("2006-01-02"))
+	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+
+	type AtRiskUser struct {
+		UserID       string  `json:"user_id"`
+		Email        string  `json:"email,omitempty"`
+		LastActivity string  `json:"last_activity"`
+		DaysSince    int     `json:"days_since"`
+		RiskScore    float64 `json:"risk_score"`
+	}
+
+	type ChannelMetrics struct {
+		Channel      string       `json:"channel"`
+		TotalUsers   int          `json:"total_users"`
+		ActiveUsers  int          `json:"active_users"`
+		ChurnedUsers int          `json:"churned_users"`
+		ChurnRate    float64      `json:"churn_rate"`
+		AtRiskUsers  []AtRiskUser `json:"at_risk_users"`
+	}
+
+	// Query events grouped by channel
+	var channelData []struct {
+		Channel      string
+		UserID       string
+		Email        string
+		LastActivity time.Time
+	}
+
+	err := as.db.Raw(`
+		SELECT DISTINCT ON (channel, user_id)
+			COALESCE(NULLIF(channel, ''), 'direct') as channel,
+			user_id,
+			email,
+			MAX(timestamp) as last_activity
+		FROM events
+		WHERE account_id = ? 
+			AND project_id = ?
+			AND user_id IS NOT NULL 
+			AND user_id != ''
+			AND timestamp BETWEEN ? AND ?
+		GROUP BY channel, user_id, email
+		ORDER BY channel, user_id, last_activity DESC
+	`, accountIDStr, projectIDStr, startDate, endDate).Scan(&channelData).Error
+
+	if err != nil {
+		log.Printf("Error querying channel data: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch channel data"})
+		return
+	}
+
+	// Group users by channel and calculate metrics
+	channelMap := make(map[string]*ChannelMetrics)
+	now := time.Now()
+
+	for _, data := range channelData {
+		channel := data.Channel
+		if channel == "" {
+			channel = "direct"
+		}
+
+		if _, exists := channelMap[channel]; !exists {
+			channelMap[channel] = &ChannelMetrics{
+				Channel:     channel,
+				AtRiskUsers: []AtRiskUser{},
+			}
+		}
+
+		metrics := channelMap[channel]
+		metrics.TotalUsers++
+
+		daysSince := int(now.Sub(data.LastActivity).Hours() / 24)
+
+		// Consider users inactive if no activity in last 7 days
+		if daysSince <= 7 {
+			metrics.ActiveUsers++
+		} else {
+			metrics.ChurnedUsers++
+		}
+
+		// Calculate risk score for users inactive 3-14 days (at risk window)
+		if daysSince >= 3 && daysSince <= 14 {
+			riskScore := float64(daysSince-3) / 11.0 * 100 // 0-100 scale
+			metrics.AtRiskUsers = append(metrics.AtRiskUsers, AtRiskUser{
+				UserID:       data.UserID,
+				Email:        data.Email,
+				LastActivity: data.LastActivity.Format("2006-01-02 15:04:05"),
+				DaysSince:    daysSince,
+				RiskScore:    riskScore,
+			})
+		}
+	}
+
+	// Calculate churn rate for each channel
+	channels := make([]ChannelMetrics, 0, len(channelMap))
+	for _, metrics := range channelMap {
+		if metrics.TotalUsers > 0 {
+			metrics.ChurnRate = float64(metrics.ChurnedUsers) / float64(metrics.TotalUsers) * 100
+		}
+		channels = append(channels, *metrics)
+	}
+
+	// Sort channels by total users (descending)
+	sort.Slice(channels, func(i, j int) bool {
+		return channels[i].TotalUsers > channels[j].TotalUsers
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": gin.H{
+			"channels":   channels,
+			"start_date": startDate,
+			"end_date":   endDate,
+		},
+	})
 }

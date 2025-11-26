@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,16 +14,142 @@ import (
 	"gorm.io/gorm"
 )
 
-// StripeService handles all Stripe-related operations
+// StripeService handles all Stripe-related operations with live data fetching
 type StripeService struct {
-	db *gorm.DB
+	db    *gorm.DB
+	cache *StripeCache
 }
+
+// StripeCache provides in-memory caching for Stripe data
+type StripeCache struct {
+	mu      sync.RWMutex
+	entries map[string]*StripeCacheEntry
+}
+
+// StripeCacheEntry represents a cached Stripe data entry
+type StripeCacheEntry struct {
+	Data      interface{}
+	ExpiresAt time.Time
+}
+
+// Cache TTL constants
+const (
+	StripeCacheTTL        = 5 * time.Minute  // Live metrics cache
+	StripeCustomersTTL    = 10 * time.Minute // Customer list cache
+	StripeSubscriptionTTL = 5 * time.Minute  // Subscription cache
+)
 
 // NewStripeService creates a new StripeService instance
 func NewStripeService(db *gorm.DB) *StripeService {
 	return &StripeService{
 		db: db,
+		cache: &StripeCache{
+			entries: make(map[string]*StripeCacheEntry),
+		},
 	}
+}
+
+// getFromCache retrieves data from cache if valid
+func (c *StripeCache) get(key string) (interface{}, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.entries[key]
+	if !exists || time.Now().After(entry.ExpiresAt) {
+		return nil, false
+	}
+	return entry.Data, true
+}
+
+// setCache stores data in cache with TTL
+func (c *StripeCache) set(key string, data interface{}, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries[key] = &StripeCacheEntry{
+		Data:      data,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+}
+
+// invalidate removes a specific cache entry
+func (c *StripeCache) invalidate(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
+
+// invalidateProject removes all cache entries for a project
+func (c *StripeCache) invalidateProject(projectID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key := range c.entries {
+		// Delete keys that start with the project ID
+		if len(key) > len(projectID) && key[:len(projectID)] == projectID {
+			delete(c.entries, key)
+		}
+	}
+}
+
+// StripeMetrics represents calculated revenue metrics from live Stripe data
+type StripeMetrics struct {
+	MRR                      float64   `json:"mrr"`
+	ARR                      float64   `json:"arr"`
+	TotalRevenue             float64   `json:"total_revenue"`
+	ActiveSubscriptions      int       `json:"active_subscriptions"`
+	CanceledSubscriptions    int       `json:"canceled_subscriptions"`
+	PastDueSubscriptions     int       `json:"past_due_subscriptions"`
+	TrialingSubscriptions    int       `json:"trialing_subscriptions"`
+	TotalCustomers           int       `json:"total_customers"`
+	ActiveCustomers          int       `json:"active_customers"`
+	ChurnRate                float64   `json:"churn_rate"`
+	ARPU                     float64   `json:"arpu"`
+	TrialToPayConversionRate float64   `json:"trial_to_pay_conversion_rate"`
+	LastUpdated              time.Time `json:"last_updated"`
+}
+
+// StripeCustomerInfo represents customer data from Stripe
+type StripeCustomerInfo struct {
+	ID            string    `json:"id"`
+	Email         string    `json:"email"`
+	Name          string    `json:"name"`
+	Created       time.Time `json:"created"`
+	MRR           float64   `json:"mrr"`
+	Status        string    `json:"status"`
+	Subscriptions int       `json:"subscriptions"`
+}
+
+// StripeSubscriptionInfo represents subscription data from Stripe
+type StripeSubscriptionInfo struct {
+	ID                 string    `json:"id"`
+	CustomerID         string    `json:"customer_id"`
+	CustomerEmail      string    `json:"customer_email"`
+	Status             string    `json:"status"`
+	CurrentPeriodStart time.Time `json:"current_period_start"`
+	CurrentPeriodEnd   time.Time `json:"current_period_end"`
+	Amount             float64   `json:"amount"`
+	Currency           string    `json:"currency"`
+	Interval           string    `json:"interval"`
+	ProductName        string    `json:"product_name"`
+	Created            time.Time `json:"created"`
+	CancelAtPeriodEnd  bool      `json:"cancel_at_period_end"`
+}
+
+// getStripeClient returns a Stripe client for the project
+func (s *StripeService) getStripeClient(projectID string) (*client.API, error) {
+	var project Project
+	if err := s.db.Where("id = ?", projectID).First(&project).Error; err != nil {
+		return nil, fmt.Errorf("project not found")
+	}
+
+	if project.StripeAPIKey == "" {
+		return nil, fmt.Errorf("stripe API key not configured")
+	}
+
+	sc := &client.API{}
+	sc.Init(project.StripeAPIKey, nil)
+	return sc, nil
 }
 
 // UpdateStripeAPIKeyRequest represents the request to update Stripe API key
@@ -40,7 +167,7 @@ func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 		return
 	}
 
-	// Validate Stripe API key format (accept both secret and restricted keys)
+	// Validate Stripe API key format
 	if len(req.ApiKey) < 8 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid API key format"})
 		return
@@ -61,7 +188,7 @@ func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 		return
 	}
 
-	// Test the API key by making a simple API call
+	// Test the API key
 	stripe.Key = req.ApiKey
 	iter := customer.List(&stripe.CustomerListParams{
 		ListParams: stripe.ListParams{Limit: stripe.Int64(1)},
@@ -77,583 +204,630 @@ func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 		return
 	}
 
+	// Invalidate cache for this project
+	s.cache.invalidateProject(projectID)
+
 	c.JSON(http.StatusOK, gin.H{"message": "Stripe API key updated successfully"})
 }
 
-// SyncStripeDataHandler synchronizes Stripe data for a project
-func (s *StripeService) SyncStripeDataHandler(c *gin.Context) {
-	projectID := c.Param("project_id")
-
-	// Get project with Stripe API key
-	var project Project
-	if err := s.db.Where("id = ?", projectID).First(&project).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
-		return
-	}
-
-	if project.StripeAPIKey == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Stripe API key not configured for this project"})
-		return
-	}
-
-	// Initialize Stripe client with project's API key
-	sc := &client.API{}
-	sc.Init(project.StripeAPIKey, nil)
-
-	// Sync customers, subscriptions, invoices, and charges
-	results := make(map[string]interface{})
-
-	customerCount, err := s.syncCustomers(sc, projectID)
-	if err != nil {
-		log.Printf("Error syncing customers: %v", err)
-		results["customers_error"] = err.Error()
-	} else {
-		results["customers_synced"] = customerCount
-	}
-
-	subscriptionCount, err := s.syncSubscriptions(sc, projectID)
-	if err != nil {
-		log.Printf("Error syncing subscriptions: %v", err)
-		results["subscriptions_error"] = err.Error()
-	} else {
-		results["subscriptions_synced"] = subscriptionCount
-	}
-
-	invoiceCount, err := s.syncInvoices(sc, projectID)
-	if err != nil {
-		log.Printf("Error syncing invoices: %v", err)
-		results["invoices_error"] = err.Error()
-	} else {
-		results["invoices_synced"] = invoiceCount
-	}
-
-	chargeCount, err := s.syncCharges(sc, projectID)
-	if err != nil {
-		log.Printf("Error syncing charges: %v", err)
-		results["charges_error"] = err.Error()
-	} else {
-		results["charges_synced"] = chargeCount
-	}
-
-	// Calculate and cache revenue metrics
-	if err := s.calculateRevenueMetrics(projectID); err != nil {
-		log.Printf("Error calculating revenue metrics: %v", err)
-		results["metrics_error"] = err.Error()
-	} else {
-		results["metrics_calculated"] = true
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Stripe data sync completed",
-		"results": results,
-	})
-}
-
-// syncCustomers fetches and stores Stripe customers
-func (s *StripeService) syncCustomers(sc *client.API, projectID string) (int, error) {
-	params := &stripe.CustomerListParams{}
-	params.Limit = stripe.Int64(100)
-
-	count := 0
-	i := sc.Customers.List(params)
-	for i.Next() {
-		stripeCustomer := i.Customer()
-
-		// Convert to our model
-		customerModel := StripeCustomer{
-			ID:         stripeCustomer.ID,
-			ProjectID:  projectID,
-			Email:      stripeCustomer.Email,
-			Name:       stripeCustomer.Name,
-			Delinquent: stripeCustomer.Delinquent,
-			Balance:    stripeCustomer.Balance,
-			Currency:   string(stripeCustomer.Currency),
-			Created:    time.Unix(stripeCustomer.Created, 0),
-			Deleted:    stripeCustomer.Deleted,
-			LastSyncAt: time.Now(),
-		}
-
-		// Upsert customer (create or update)
-		if err := s.db.Save(&customerModel).Error; err != nil {
-			return count, fmt.Errorf("failed to save customer %s: %v", stripeCustomer.ID, err)
-		}
-		count++
-	}
-
-	if err := i.Err(); err != nil {
-		return count, fmt.Errorf("stripe API error: %v", err)
-	}
-
-	return count, nil
-}
-
-// syncSubscriptions fetches and stores Stripe subscriptions
-func (s *StripeService) syncSubscriptions(sc *client.API, projectID string) (int, error) {
-	params := &stripe.SubscriptionListParams{}
-	params.Limit = stripe.Int64(100)
-	// Remove status filter to get all subscriptions
-
-	count := 0
-	i := sc.Subscriptions.List(params)
-	for i.Next() {
-		stripeSub := i.Subscription()
-
-		// Get the first price/product info (subscriptions can have multiple items)
-		var priceID, productID string
-		var unitAmount int64 = 0
-		var currency string
-		var interval string
-		var intervalCount int64 = 1
-		var quantity int64 = 1
-
-		if len(stripeSub.Items.Data) > 0 {
-			item := stripeSub.Items.Data[0]
-			priceID = item.Price.ID
-			productID = item.Price.Product.ID
-			unitAmount = item.Price.UnitAmount
-			currency = string(item.Price.Currency)
-			interval = string(item.Price.Recurring.Interval)
-			intervalCount = item.Price.Recurring.IntervalCount
-			quantity = item.Quantity
-		}
-
-		// Convert to our model
-		subModel := StripeSubscription{
-			ID:                 stripeSub.ID,
-			CustomerID:         stripeSub.Customer.ID,
-			ProjectID:          projectID,
-			Status:             string(stripeSub.Status),
-			CurrentPeriodStart: time.Unix(stripeSub.CurrentPeriodStart, 0),
-			CurrentPeriodEnd:   time.Unix(stripeSub.CurrentPeriodEnd, 0),
-			StartDate:          time.Unix(stripeSub.StartDate, 0),
-			Created:            time.Unix(stripeSub.Created, 0),
-			PriceID:            priceID,
-			ProductID:          productID,
-			UnitAmount:         unitAmount,
-			Currency:           currency,
-			Quantity:           quantity,
-			Interval:           interval,
-			IntervalCount:      intervalCount,
-			LastSyncAt:         time.Now(),
-		}
-
-		// Handle optional dates (Stripe uses 0 for null timestamps)
-		if stripeSub.TrialStart != 0 {
-			trialStart := time.Unix(stripeSub.TrialStart, 0)
-			subModel.TrialStart = &trialStart
-		}
-		if stripeSub.TrialEnd != 0 {
-			trialEnd := time.Unix(stripeSub.TrialEnd, 0)
-			subModel.TrialEnd = &trialEnd
-		}
-		if stripeSub.CanceledAt != 0 {
-			canceledAt := time.Unix(stripeSub.CanceledAt, 0)
-			subModel.CanceledAt = &canceledAt
-		}
-		if stripeSub.EndedAt != 0 {
-			endedAt := time.Unix(stripeSub.EndedAt, 0)
-			subModel.EndedAt = &endedAt
-		}
-
-		// Upsert subscription
-		if err := s.db.Save(&subModel).Error; err != nil {
-			return count, fmt.Errorf("failed to save subscription %s: %v", stripeSub.ID, err)
-		}
-		count++
-	}
-
-	if err := i.Err(); err != nil {
-		return count, fmt.Errorf("stripe API error: %v", err)
-	}
-
-	return count, nil
-}
-
-// syncInvoices fetches and stores Stripe invoices
-func (s *StripeService) syncInvoices(sc *client.API, projectID string) (int, error) {
-	params := &stripe.InvoiceListParams{}
-	params.Limit = stripe.Int64(100)
-
-	count := 0
-	i := sc.Invoices.List(params)
-	for i.Next() {
-		stripeInvoice := i.Invoice()
-
-		// Convert to our model
-		invoiceModel := StripeInvoice{
-			ID:          stripeInvoice.ID,
-			CustomerID:  stripeInvoice.Customer.ID,
-			ProjectID:   projectID,
-			Status:      string(stripeInvoice.Status),
-			AmountPaid:  stripeInvoice.AmountPaid,
-			AmountDue:   stripeInvoice.AmountDue,
-			Subtotal:    stripeInvoice.Subtotal,
-			Total:       stripeInvoice.Total,
-			Currency:    string(stripeInvoice.Currency),
-			PeriodStart: time.Unix(stripeInvoice.PeriodStart, 0),
-			PeriodEnd:   time.Unix(stripeInvoice.PeriodEnd, 0),
-			Created:     time.Unix(stripeInvoice.Created, 0),
-			LastSyncAt:  time.Now(),
-		}
-
-		// Handle optional fields
-		if stripeInvoice.Subscription != nil {
-			invoiceModel.SubscriptionID = &stripeInvoice.Subscription.ID
-		}
-		if stripeInvoice.DueDate != 0 {
-			dueDate := time.Unix(stripeInvoice.DueDate, 0)
-			invoiceModel.DueDate = &dueDate
-		}
-		if stripeInvoice.StatusTransitions.PaidAt != 0 {
-			paidAt := time.Unix(stripeInvoice.StatusTransitions.PaidAt, 0)
-			invoiceModel.PaidAt = &paidAt
-		}
-
-		// Upsert invoice
-		if err := s.db.Save(&invoiceModel).Error; err != nil {
-			return count, fmt.Errorf("failed to save invoice %s: %v", stripeInvoice.ID, err)
-		}
-		count++
-	}
-
-	if err := i.Err(); err != nil {
-		return count, fmt.Errorf("stripe API error: %v", err)
-	}
-
-	return count, nil
-}
-
-// syncCharges fetches and stores Stripe charges
-func (s *StripeService) syncCharges(sc *client.API, projectID string) (int, error) {
-	params := &stripe.ChargeListParams{}
-	params.Limit = stripe.Int64(100)
-
-	count := 0
-	i := sc.Charges.List(params)
-	for i.Next() {
-		stripeCharge := i.Charge()
-
-		// Convert to our model
-		chargeModel := StripeCharge{
-			ID:             stripeCharge.ID,
-			ProjectID:      projectID,
-			Amount:         stripeCharge.Amount,
-			AmountCaptured: stripeCharge.AmountCaptured,
-			AmountRefunded: stripeCharge.AmountRefunded,
-			Currency:       string(stripeCharge.Currency),
-			Status:         string(stripeCharge.Status),
-			Paid:           stripeCharge.Paid,
-			Refunded:       stripeCharge.Refunded,
-			Created:        time.Unix(stripeCharge.Created, 0),
-			LastSyncAt:     time.Now(),
-		}
-
-		// Handle optional fields
-		if stripeCharge.Customer != nil {
-			chargeModel.CustomerID = &stripeCharge.Customer.ID
-		}
-		if stripeCharge.Invoice != nil {
-			chargeModel.InvoiceID = &stripeCharge.Invoice.ID
-		}
-
-		// Upsert charge
-		if err := s.db.Save(&chargeModel).Error; err != nil {
-			return count, fmt.Errorf("failed to save charge %s: %v", stripeCharge.ID, err)
-		}
-		count++
-	}
-
-	if err := i.Err(); err != nil {
-		return count, fmt.Errorf("stripe API error: %v", err)
-	}
-
-	return count, nil
-}
-
-// calculateRevenueMetrics calculates and stores revenue metrics for a project
-func (s *StripeService) calculateRevenueMetrics(projectID string) error {
-	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-
-	// Calculate MRR from active subscriptions
-	var activeSubscriptions []StripeSubscription
-	if err := s.db.Where("project_id = ? AND status = ?", projectID, "active").Find(&activeSubscriptions).Error; err != nil {
-		return fmt.Errorf("failed to fetch active subscriptions: %v", err)
-	}
-
-	var mrr int64 = 0
-	for _, sub := range activeSubscriptions {
-		monthlyAmount := sub.UnitAmount * sub.Quantity
-
-		// Convert to monthly amount based on interval
-		switch sub.Interval {
-		case "year":
-			monthlyAmount = monthlyAmount / 12
-		case "week":
-			monthlyAmount = monthlyAmount * 4
-		case "day":
-			monthlyAmount = monthlyAmount * 30
-			// "month" stays as is
-		}
-
-		mrr += monthlyAmount
-	}
-
-	// Calculate other metrics
-	arr := mrr * 12
-
-	// Count subscriptions by status
-	var subscriptionCounts struct {
-		Active   int64
-		Canceled int64
-		NewToday int64
-		Churned  int64
-	}
-
-	s.db.Model(&StripeSubscription{}).Where("project_id = ? AND status = ?", projectID, "active").Count(&subscriptionCounts.Active)
-	s.db.Model(&StripeSubscription{}).Where("project_id = ? AND status = ?", projectID, "canceled").Count(&subscriptionCounts.Canceled)
-	s.db.Model(&StripeSubscription{}).Where("project_id = ? AND DATE(created) = ?", projectID, today.Format("2006-01-02")).Count(&subscriptionCounts.NewToday)
-	s.db.Model(&StripeSubscription{}).Where("project_id = ? AND DATE(canceled_at) = ?", projectID, today.Format("2006-01-02")).Count(&subscriptionCounts.Churned)
-
-	// Calculate total revenue from paid invoices
-	var totalRevenue int64
-	s.db.Model(&StripeInvoice{}).Where("project_id = ? AND status = ?", projectID, "paid").Select("COALESCE(SUM(amount_paid), 0)").Scan(&totalRevenue)
-
-	// Calculate churn rate
-	var churnRate float64
-	if subscriptionCounts.Active > 0 {
-		churnRate = float64(subscriptionCounts.Canceled) / float64(subscriptionCounts.Active+subscriptionCounts.Canceled) * 100
-	}
-
-	// Calculate ARPU (Average Revenue Per User)
-	var arpu int64
-	if subscriptionCounts.Active > 0 {
-		arpu = mrr / subscriptionCounts.Active
-	}
-
-	// Calculate trial to paid conversion rate
-	var trialToPaidRate float64
-	var totalTrials, convertedTrials int64
-	s.db.Model(&StripeSubscription{}).Where("project_id = ? AND trial_start IS NOT NULL", projectID).Count(&totalTrials)
-	s.db.Model(&StripeSubscription{}).Where("project_id = ? AND trial_start IS NOT NULL AND status = ?", projectID, "active").Count(&convertedTrials)
-
-	if totalTrials > 0 {
-		trialToPaidRate = float64(convertedTrials) / float64(totalTrials) * 100
-	}
-
-	// Create or update revenue metrics
-	metrics := RevenueMetrics{
-		ProjectID:                projectID,
-		Date:                     today,
-		MRR:                      mrr,
-		ARR:                      arr,
-		TotalRevenue:             totalRevenue,
-		ActiveSubscriptions:      int(subscriptionCounts.Active),
-		CanceledSubscriptions:    int(subscriptionCounts.Canceled),
-		NewSubscriptions:         int(subscriptionCounts.NewToday),
-		ChurnedSubscriptions:     int(subscriptionCounts.Churned),
-		ChurnRate:                churnRate,
-		ARPU:                     arpu,
-		TrialToPayConversionRate: trialToPaidRate,
-	}
-
-	// Upsert metrics (update if exists for today, create if not)
-	if err := s.db.Where("project_id = ? AND date = ?", projectID, today).Save(&metrics).Error; err != nil {
-		return fmt.Errorf("failed to save revenue metrics: %v", err)
-	}
-
-	return nil
-}
-
-// GetRevenueMetricsHandler returns revenue metrics for a project
+// GetRevenueMetricsHandler returns live revenue metrics from Stripe
 func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	// Get date parameter or use today
-	dateParam := c.DefaultQuery("date", time.Now().Format("2006-01-02"))
-	date, err := time.Parse("2006-01-02", dateParam)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format. Use YYYY-MM-DD"})
+	// Check cache first
+	cacheKey := projectID + ":metrics"
+	if cached, ok := s.cache.get(cacheKey); ok {
+		log.Printf("✅ Stripe metrics cache hit for project %s", projectID)
+		c.JSON(http.StatusOK, gin.H{
+			"status": "success",
+			"data":   cached,
+			"cached": true,
+		})
 		return
 	}
 
-	// Get metrics for the specified date
-	var metrics RevenueMetrics
-	if err := s.db.Where("project_id = ? AND date = ?", projectID, date).First(&metrics).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			// Return empty metrics instead of error
-			metrics = RevenueMetrics{
-				ProjectID: projectID,
-				Date:      date,
-			}
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch revenue metrics"})
-			return
-		}
+	// Get Stripe client
+	sc, err := s.getStripeClient(projectID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status": "error",
+			"error":  err.Error(),
+			"data": map[string]interface{}{
+				"configured": err.Error() != "stripe API key not configured",
+			},
+		})
+		return
 	}
 
-	// Convert cents to dollars for display
-	response := map[string]interface{}{
-		"date":                         metrics.Date.Format("2006-01-02"),
-		"mrr":                          float64(metrics.MRR) / 100,
-		"arr":                          float64(metrics.ARR) / 100,
-		"total_revenue":                float64(metrics.TotalRevenue) / 100,
-		"active_subscriptions":         metrics.ActiveSubscriptions,
-		"canceled_subscriptions":       metrics.CanceledSubscriptions,
-		"new_subscriptions":            metrics.NewSubscriptions,
-		"churned_subscriptions":        metrics.ChurnedSubscriptions,
-		"expansion_revenue":            float64(metrics.ExpansionRevenue) / 100,
-		"contraction_revenue":          float64(metrics.ContractionRevenue) / 100,
-		"net_revenue":                  float64(metrics.NetRevenue) / 100,
-		"churn_rate":                   metrics.ChurnRate,
-		"growth_rate":                  metrics.GrowthRate,
-		"arpu":                         float64(metrics.ARPU) / 100,
-		"customer_lifetime_value":      float64(metrics.CustomerLifetimeValue) / 100,
-		"trial_to_pay_conversion_rate": metrics.TrialToPayConversionRate,
-		"last_updated":                 metrics.UpdatedAt,
+	log.Printf("📡 Fetching live Stripe metrics for project %s", projectID)
+
+	// Fetch live data from Stripe
+	metrics, err := s.fetchLiveMetrics(sc)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "error",
+			"error":  fmt.Sprintf("Failed to fetch Stripe data: %v", err),
+		})
+		return
 	}
+
+	// Cache the results
+	s.cache.set(cacheKey, metrics, StripeCacheTTL)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
-		"data":   response,
+		"data":   metrics,
+		"cached": false,
 	})
 }
 
-// GetRevenueAnalyticsHandler returns comprehensive revenue analytics
-func (s *StripeService) GetRevenueAnalyticsHandler(c *gin.Context) {
+// fetchLiveMetrics fetches and calculates metrics directly from Stripe API
+func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error) {
+	metrics := &StripeMetrics{
+		LastUpdated: time.Now(),
+	}
+
+	// Fetch all subscriptions
+	subParams := &stripe.SubscriptionListParams{}
+	subParams.Limit = stripe.Int64(100)
+
+	var mrr int64 = 0
+	activeCount := 0
+	canceledCount := 0
+	pastDueCount := 0
+	trialingCount := 0
+	activeCustomers := make(map[string]bool)
+
+	subIter := sc.Subscriptions.List(subParams)
+	for subIter.Next() {
+		sub := subIter.Subscription()
+
+		switch sub.Status {
+		case stripe.SubscriptionStatusActive:
+			activeCount++
+			activeCustomers[sub.Customer.ID] = true
+
+			// Calculate MRR from active subscriptions
+			if len(sub.Items.Data) > 0 {
+				item := sub.Items.Data[0]
+				amount := item.Price.UnitAmount * item.Quantity
+
+				// Normalize to monthly
+				switch item.Price.Recurring.Interval {
+				case stripe.PriceRecurringIntervalYear:
+					amount = amount / 12
+				case stripe.PriceRecurringIntervalWeek:
+					amount = amount * 4
+				case stripe.PriceRecurringIntervalDay:
+					amount = amount * 30
+				}
+				mrr += amount
+			}
+
+		case stripe.SubscriptionStatusCanceled:
+			canceledCount++
+
+		case stripe.SubscriptionStatusPastDue:
+			pastDueCount++
+			activeCustomers[sub.Customer.ID] = true
+
+		case stripe.SubscriptionStatusTrialing:
+			trialingCount++
+			activeCustomers[sub.Customer.ID] = true
+		}
+	}
+
+	if err := subIter.Err(); err != nil {
+		return nil, fmt.Errorf("failed to fetch subscriptions: %v", err)
+	}
+
+	// Fetch customer count
+	customerParams := &stripe.CustomerListParams{}
+	customerParams.Limit = stripe.Int64(100)
+
+	totalCustomers := 0
+	custIter := sc.Customers.List(customerParams)
+	for custIter.Next() {
+		totalCustomers++
+	}
+
+	if err := custIter.Err(); err != nil {
+		return nil, fmt.Errorf("failed to fetch customers: %v", err)
+	}
+
+	// Fetch total revenue from charges (last 30 days)
+	chargeParams := &stripe.ChargeListParams{}
+	chargeParams.Limit = stripe.Int64(100)
+	thirtyDaysAgo := time.Now().AddDate(0, 0, -30).Unix()
+	chargeParams.Created = &thirtyDaysAgo
+
+	var totalRevenue int64 = 0
+	chargeIter := sc.Charges.List(chargeParams)
+	for chargeIter.Next() {
+		charge := chargeIter.Charge()
+		if charge.Paid && !charge.Refunded {
+			totalRevenue += charge.Amount - charge.AmountRefunded
+		}
+	}
+
+	if err := chargeIter.Err(); err != nil {
+		log.Printf("Warning: Failed to fetch charges: %v", err)
+		// Continue without charge data
+	}
+
+	// Calculate derived metrics
+	metrics.MRR = float64(mrr) / 100
+	metrics.ARR = metrics.MRR * 12
+	metrics.TotalRevenue = float64(totalRevenue) / 100
+	metrics.ActiveSubscriptions = activeCount
+	metrics.CanceledSubscriptions = canceledCount
+	metrics.PastDueSubscriptions = pastDueCount
+	metrics.TrialingSubscriptions = trialingCount
+	metrics.TotalCustomers = totalCustomers
+	metrics.ActiveCustomers = len(activeCustomers)
+
+	// Churn rate calculation
+	totalSubs := activeCount + canceledCount
+	if totalSubs > 0 {
+		metrics.ChurnRate = float64(canceledCount) / float64(totalSubs) * 100
+	}
+
+	// ARPU calculation
+	if metrics.ActiveCustomers > 0 {
+		metrics.ARPU = metrics.MRR / float64(metrics.ActiveCustomers)
+	}
+
+	// Trial conversion rate
+	convertedTrials := activeCount // Simplified: active subs that had trials
+	totalTrials := trialingCount + convertedTrials
+	if totalTrials > 0 {
+		metrics.TrialToPayConversionRate = float64(convertedTrials) / float64(totalTrials) * 100
+	}
+
+	return metrics, nil
+}
+
+// GetCustomersHandler returns customer list from Stripe
+func (s *StripeService) GetCustomersHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	// Get date range parameters
-	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, -1, 0).Format("2006-01-02"))
-	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+	// Check cache
+	cacheKey := projectID + ":customers"
+	if cached, ok := s.cache.get(cacheKey); ok {
+		log.Printf("✅ Stripe customers cache hit for project %s", projectID)
+		c.JSON(http.StatusOK, gin.H{
+			"status": "success",
+			"data":   cached,
+			"cached": true,
+		})
+		return
+	}
 
-	start, err := time.Parse("2006-01-02", startDate)
+	sc, err := s.getStripeClient(projectID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid start_date format. Use YYYY-MM-DD"})
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
 		return
 	}
 
-	end, err := time.Parse("2006-01-02", endDate)
+	log.Printf("📡 Fetching live Stripe customers for project %s", projectID)
+
+	customers, err := s.fetchLiveCustomers(sc)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid end_date format. Use YYYY-MM-DD"})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "error",
+			"error":  fmt.Sprintf("Failed to fetch customers: %v", err),
+		})
 		return
 	}
 
-	// Get metrics for date range
-	var metrics []RevenueMetrics
-	if err := s.db.Where("project_id = ? AND date BETWEEN ? AND ?", projectID, start, end).
-		Order("date ASC").Find(&metrics).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch revenue analytics"})
-		return
+	// Cache results
+	s.cache.set(cacheKey, customers, StripeCustomersTTL)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": map[string]interface{}{
+			"customers":       customers,
+			"total_customers": len(customers),
+		},
+		"cached": false,
+	})
+}
+
+// fetchLiveCustomers fetches customers and their subscription info from Stripe
+func (s *StripeService) fetchLiveCustomers(sc *client.API) ([]StripeCustomerInfo, error) {
+	var customers []StripeCustomerInfo
+
+	// Fetch all subscriptions first to calculate MRR per customer
+	customerMRR := make(map[string]float64)
+	customerSubCount := make(map[string]int)
+	customerStatus := make(map[string]string)
+
+	subParams := &stripe.SubscriptionListParams{}
+	subParams.Limit = stripe.Int64(100)
+
+	subIter := sc.Subscriptions.List(subParams)
+	for subIter.Next() {
+		sub := subIter.Subscription()
+		custID := sub.Customer.ID
+
+		if sub.Status == stripe.SubscriptionStatusActive {
+			customerStatus[custID] = "active"
+			customerSubCount[custID]++
+
+			if len(sub.Items.Data) > 0 {
+				item := sub.Items.Data[0]
+				amount := float64(item.Price.UnitAmount*item.Quantity) / 100
+
+				// Normalize to monthly
+				switch item.Price.Recurring.Interval {
+				case stripe.PriceRecurringIntervalYear:
+					amount = amount / 12
+				case stripe.PriceRecurringIntervalWeek:
+					amount = amount * 4
+				case stripe.PriceRecurringIntervalDay:
+					amount = amount * 30
+				}
+				customerMRR[custID] += amount
+			}
+		} else if customerStatus[custID] == "" {
+			customerStatus[custID] = string(sub.Status)
+		}
 	}
 
-	// Format response
-	var timeSeries []map[string]interface{}
-	for _, metric := range metrics {
-		timeSeries = append(timeSeries, map[string]interface{}{
-			"date":                 metric.Date.Format("2006-01-02"),
-			"mrr":                  float64(metric.MRR) / 100,
-			"arr":                  float64(metric.ARR) / 100,
-			"active_subscriptions": metric.ActiveSubscriptions,
-			"churn_rate":           metric.ChurnRate,
-			"arpu":                 float64(metric.ARPU) / 100,
+	if err := subIter.Err(); err != nil {
+		return nil, err
+	}
+
+	// Fetch customers
+	custParams := &stripe.CustomerListParams{}
+	custParams.Limit = stripe.Int64(100)
+
+	custIter := sc.Customers.List(custParams)
+	for custIter.Next() {
+		cust := custIter.Customer()
+
+		status := customerStatus[cust.ID]
+		if status == "" {
+			status = "free"
+		}
+
+		customers = append(customers, StripeCustomerInfo{
+			ID:            cust.ID,
+			Email:         cust.Email,
+			Name:          cust.Name,
+			Created:       time.Unix(cust.Created, 0),
+			MRR:           customerMRR[cust.ID],
+			Status:        status,
+			Subscriptions: customerSubCount[cust.ID],
 		})
 	}
 
-	// Get latest metrics for summary
-	var latestMetrics RevenueMetrics
-	if len(metrics) > 0 {
-		latestMetrics = metrics[len(metrics)-1]
+	if err := custIter.Err(); err != nil {
+		return nil, err
+	}
+
+	return customers, nil
+}
+
+// GetSubscriptionsHandler returns subscription list from Stripe
+func (s *StripeService) GetSubscriptionsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	status := c.DefaultQuery("status", "") // Optional filter
+
+	// Check cache
+	cacheKey := projectID + ":subscriptions:" + status
+	if cached, ok := s.cache.get(cacheKey); ok {
+		log.Printf("✅ Stripe subscriptions cache hit for project %s", projectID)
+		c.JSON(http.StatusOK, gin.H{
+			"status": "success",
+			"data":   cached,
+			"cached": true,
+		})
+		return
+	}
+
+	sc, err := s.getStripeClient(projectID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	log.Printf("📡 Fetching live Stripe subscriptions for project %s", projectID)
+
+	subscriptions, err := s.fetchLiveSubscriptions(sc, status)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "error",
+			"error":  fmt.Sprintf("Failed to fetch subscriptions: %v", err),
+		})
+		return
+	}
+
+	// Cache results
+	s.cache.set(cacheKey, subscriptions, StripeSubscriptionTTL)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": map[string]interface{}{
+			"subscriptions":       subscriptions,
+			"total_subscriptions": len(subscriptions),
+		},
+		"cached": false,
+	})
+}
+
+// fetchLiveSubscriptions fetches subscriptions from Stripe
+func (s *StripeService) fetchLiveSubscriptions(sc *client.API, statusFilter string) ([]StripeSubscriptionInfo, error) {
+	var subscriptions []StripeSubscriptionInfo
+
+	params := &stripe.SubscriptionListParams{}
+	params.Limit = stripe.Int64(100)
+
+	if statusFilter != "" {
+		params.Status = statusFilter
+	}
+
+	iter := sc.Subscriptions.List(params)
+	for iter.Next() {
+		sub := iter.Subscription()
+
+		var amount float64
+		var currency, interval, productName string
+
+		if len(sub.Items.Data) > 0 {
+			item := sub.Items.Data[0]
+			amount = float64(item.Price.UnitAmount*item.Quantity) / 100
+			currency = string(item.Price.Currency)
+			interval = string(item.Price.Recurring.Interval)
+
+			if item.Price.Product != nil {
+				productName = item.Price.Product.Name
+			}
+		}
+
+		subscriptions = append(subscriptions, StripeSubscriptionInfo{
+			ID:                 sub.ID,
+			CustomerID:         sub.Customer.ID,
+			CustomerEmail:      "", // Would need additional API call to get
+			Status:             string(sub.Status),
+			CurrentPeriodStart: time.Unix(sub.CurrentPeriodStart, 0),
+			CurrentPeriodEnd:   time.Unix(sub.CurrentPeriodEnd, 0),
+			Amount:             amount,
+			Currency:           currency,
+			Interval:           interval,
+			ProductName:        productName,
+			Created:            time.Unix(sub.Created, 0),
+			CancelAtPeriodEnd:  sub.CancelAtPeriodEnd,
+		})
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	return subscriptions, nil
+}
+
+// GetRevenueAnalyticsHandler returns revenue analytics with time series
+func (s *StripeService) GetRevenueAnalyticsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	days := 30 // Default to 30 days
+
+	// Check cache
+	cacheKey := fmt.Sprintf("%s:analytics:%d", projectID, days)
+	if cached, ok := s.cache.get(cacheKey); ok {
+		log.Printf("✅ Stripe analytics cache hit for project %s", projectID)
+		c.JSON(http.StatusOK, gin.H{
+			"status": "success",
+			"data":   cached,
+			"cached": true,
+		})
+		return
+	}
+
+	sc, err := s.getStripeClient(projectID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	log.Printf("📡 Fetching live Stripe analytics for project %s", projectID)
+
+	// Get current metrics
+	metrics, err := s.fetchLiveMetrics(sc)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "error",
+			"error":  fmt.Sprintf("Failed to fetch metrics: %v", err),
+		})
+		return
+	}
+
+	// Fetch daily revenue from charges
+	timeSeries, err := s.fetchDailyRevenue(sc, days)
+	if err != nil {
+		log.Printf("Warning: Failed to fetch daily revenue: %v", err)
+		timeSeries = []map[string]interface{}{} // Empty array on error
 	}
 
 	response := map[string]interface{}{
-		"summary": map[string]interface{}{
-			"current_mrr":           float64(latestMetrics.MRR) / 100,
-			"current_arr":           float64(latestMetrics.ARR) / 100,
-			"active_subscriptions":  latestMetrics.ActiveSubscriptions,
-			"churn_rate":            latestMetrics.ChurnRate,
-			"arpu":                  float64(latestMetrics.ARPU) / 100,
-			"trial_conversion_rate": latestMetrics.TrialToPayConversionRate,
-		},
+		"summary":     metrics,
 		"time_series": timeSeries,
 		"date_range": map[string]string{
-			"start": startDate,
-			"end":   endDate,
+			"start": time.Now().AddDate(0, 0, -days).Format("2006-01-02"),
+			"end":   time.Now().Format("2006-01-02"),
 		},
 	}
+
+	// Cache results
+	s.cache.set(cacheKey, response, StripeCacheTTL)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data":   response,
+		"cached": false,
 	})
+}
+
+// fetchDailyRevenue fetches daily revenue from charges
+func (s *StripeService) fetchDailyRevenue(sc *client.API, days int) ([]map[string]interface{}, error) {
+	startDate := time.Now().AddDate(0, 0, -days)
+
+	// Group revenue by day
+	dailyRevenue := make(map[string]int64)
+
+	params := &stripe.ChargeListParams{}
+	params.Limit = stripe.Int64(100)
+	created := startDate.Unix()
+	params.Created = &created
+
+	iter := sc.Charges.List(params)
+	for iter.Next() {
+		charge := iter.Charge()
+		if charge.Paid && !charge.Refunded {
+			day := time.Unix(charge.Created, 0).Format("2006-01-02")
+			dailyRevenue[day] += charge.Amount - charge.AmountRefunded
+		}
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	// Convert to sorted time series
+	var timeSeries []map[string]interface{}
+	for i := 0; i < days; i++ {
+		day := startDate.AddDate(0, 0, i).Format("2006-01-02")
+		revenue := float64(dailyRevenue[day]) / 100
+
+		timeSeries = append(timeSeries, map[string]interface{}{
+			"date":    day,
+			"revenue": revenue,
+		})
+	}
+
+	return timeSeries, nil
 }
 
 // GetCustomerAnalyticsHandler returns customer-focused analytics
 func (s *StripeService) GetCustomerAnalyticsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	// Customer segmentation by revenue
-	type CustomerSegment struct {
-		CustomerID string  `json:"customer_id"`
-		Email      string  `json:"email"`
-		Name       string  `json:"name"`
-		MRR        float64 `json:"mrr"`
-		Status     string  `json:"status"`
-		Created    string  `json:"created"`
-	}
-
-	var segments []CustomerSegment
-	query := `
-		SELECT 
-			c.id as customer_id,
-			c.email,
-			c.name,
-			COALESCE(SUM(s.unit_amount * s.quantity), 0) / 100.0 as mrr,
-			CASE WHEN COUNT(s.id) > 0 THEN 'subscribed' ELSE 'free' END as status,
-			c.created
-		FROM stripe_customers c
-		LEFT JOIN stripe_subscriptions s ON c.id = s.customer_id AND s.status = 'active'
-		WHERE c.project_id = ?
-		GROUP BY c.id, c.email, c.name, c.created
-		ORDER BY mrr DESC
-	`
-
-	if err := s.db.Raw(query, projectID).Scan(&segments).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch customer analytics"})
+	// Check cache
+	cacheKey := projectID + ":customer_analytics"
+	if cached, ok := s.cache.get(cacheKey); ok {
+		log.Printf("✅ Stripe customer analytics cache hit for project %s", projectID)
+		c.JSON(http.StatusOK, gin.H{
+			"status": "success",
+			"data":   cached,
+			"cached": true,
+		})
 		return
 	}
 
-	// Calculate totals
-	totalCustomers := len(segments)
+	sc, err := s.getStripeClient(projectID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	log.Printf("📡 Fetching live customer analytics for project %s", projectID)
+
+	customers, err := s.fetchLiveCustomers(sc)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "error",
+			"error":  fmt.Sprintf("Failed to fetch customers: %v", err),
+		})
+		return
+	}
+
+	// Calculate analytics
+	totalCustomers := len(customers)
 	paidCustomers := 0
 	totalMRR := 0.0
 
-	for _, segment := range segments {
-		if segment.MRR > 0 {
+	for _, cust := range customers {
+		if cust.MRR > 0 {
 			paidCustomers++
-			totalMRR += segment.MRR
+			totalMRR += cust.MRR
 		}
 	}
 
-	// Calculate conversion rate (avoid division by zero)
+	freeCustomers := totalCustomers - paidCustomers
 	conversionRate := 0.0
 	if totalCustomers > 0 {
 		conversionRate = float64(paidCustomers) / float64(totalCustomers) * 100
+	}
+
+	avgMRR := 0.0
+	if paidCustomers > 0 {
+		avgMRR = totalMRR / float64(paidCustomers)
 	}
 
 	response := map[string]interface{}{
 		"summary": map[string]interface{}{
 			"total_customers": totalCustomers,
 			"paid_customers":  paidCustomers,
-			"free_customers":  totalCustomers - paidCustomers,
+			"free_customers":  freeCustomers,
 			"total_mrr":       totalMRR,
+			"avg_mrr":         avgMRR,
 			"conversion_rate": conversionRate,
 		},
-		"customer_segments": segments,
+		"customers": customers,
 	}
+
+	// Cache results
+	s.cache.set(cacheKey, response, StripeCustomersTTL)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data":   response,
+		"cached": false,
+	})
+}
+
+// RefreshCacheHandler forces a cache refresh for Stripe data
+func (s *StripeService) RefreshCacheHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	// Invalidate all caches for this project
+	s.cache.invalidateProject(projectID)
+
+	log.Printf("🗑️ Cleared Stripe cache for project %s", projectID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Stripe cache cleared. Next request will fetch fresh data.",
+	})
+}
+
+// SyncStripeDataHandler - Legacy handler, now just verifies connection and clears cache
+func (s *StripeService) SyncStripeDataHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	// Verify project has Stripe API key configured
+	sc, err := s.getStripeClient(projectID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Test connection by fetching one customer
+	params := &stripe.CustomerListParams{}
+	params.Limit = stripe.Int64(1)
+	iter := sc.Customers.List(params)
+	if iter.Err() != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Failed to connect to Stripe. Please check your API key.",
+		})
+		return
+	}
+
+	// Clear cache to force fresh data
+	s.cache.invalidateProject(projectID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Stripe connection verified. Data is now fetched live from Stripe API with caching.",
+		"note":    "Manual sync is no longer needed. Metrics are calculated in real-time.",
 	})
 }
