@@ -313,21 +313,35 @@ func (s *Server) GetExperiment(c *gin.Context) {
 }
 
 func (s *Server) GetAssignment(c *gin.Context) {
-	var req GetAssignmentRequest
-	if err := c.ShouldBindQuery(&req); err != nil {
+	experimentKey := c.Param("experimentKey")
+
+	// Parse JSON body for POST request
+	var reqBody struct {
+		UserID      string `json:"userId"`
+		AnonymousID string `json:"anonymousId"`
+	}
+
+	if err := c.ShouldBindJSON(&reqBody); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if req.UserID == "" && req.AnonymousID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id or anonymous_id is required"})
+	if reqBody.UserID == "" && reqBody.AnonymousID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "userId or anonymousId is required"})
+		return
+	}
+
+	// Get projectId from auth context
+	projectID, exists := c.Get("project_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "project_id not found in context"})
 		return
 	}
 
 	// Fetch experiment and variants
 	var experiment Experiment
 	if err := s.db.Preload("Variants").
-		Where("key = ? AND project_id = ? AND status = ?", req.ExperimentKey, req.ProjectID, "RUNNING").
+		Where("key = ? AND project_id = ? AND status = ?", experimentKey, projectID, "RUNNING").
 		First(&experiment).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Experiment not found"})
@@ -340,10 +354,10 @@ func (s *Server) GetAssignment(c *gin.Context) {
 	// Check if user is already assigned
 	var assignment ExperimentAssignment
 	query := s.db.Where("experiment_id = ?", experiment.ID)
-	if req.UserID != "" {
-		query = query.Where("user_id = ?", req.UserID)
+	if reqBody.UserID != "" {
+		query = query.Where("user_id = ?", reqBody.UserID)
 	} else {
-		query = query.Where("anonymous_id = ?", req.AnonymousID)
+		query = query.Where("anonymous_id = ?", reqBody.AnonymousID)
 	}
 
 	err := query.First(&assignment).Error
@@ -354,7 +368,18 @@ func (s *Server) GetAssignment(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get assigned variant"})
 			return
 		}
-		c.JSON(http.StatusOK, variant)
+
+		// Return assignment response with full details
+		response := AssignmentResponse{
+			ExperimentId: experiment.ID,
+			VariantId:    variant.ID,
+			VariantKey:   variant.Key,
+			VariantName:  variant.Name,
+			IsControl:    variant.IsControl,
+			AssignedAt:   assignment.CreatedAt,
+		}
+
+		c.JSON(http.StatusOK, response)
 		return
 	}
 
@@ -364,7 +389,7 @@ func (s *Server) GetAssignment(c *gin.Context) {
 	}
 
 	// Assign user to a variant
-	selectedVariant := assignVariant(req.UserID, req.AnonymousID, experiment.Variants)
+	selectedVariant := assignVariant(reqBody.UserID, reqBody.AnonymousID, experiment.Variants)
 
 	// Create assignment
 	newAssignment := ExperimentAssignment{
@@ -373,11 +398,11 @@ func (s *Server) GetAssignment(c *gin.Context) {
 		VariantID:    selectedVariant.ID,
 	}
 
-	if req.UserID != "" {
-		newAssignment.UserID = &req.UserID
+	if reqBody.UserID != "" {
+		newAssignment.UserID = &reqBody.UserID
 	}
-	if req.AnonymousID != "" {
-		newAssignment.AnonymousID = &req.AnonymousID
+	if reqBody.AnonymousID != "" {
+		newAssignment.AnonymousID = &reqBody.AnonymousID
 	}
 
 	if err := s.db.Create(&newAssignment).Error; err != nil {
@@ -385,7 +410,17 @@ func (s *Server) GetAssignment(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, selectedVariant)
+	// Return assignment response with full details
+	response := AssignmentResponse{
+		ExperimentId: experiment.ID,
+		VariantId:    selectedVariant.ID,
+		VariantKey:   selectedVariant.Key,
+		VariantName:  selectedVariant.Name,
+		IsControl:    selectedVariant.IsControl,
+		AssignedAt:   newAssignment.CreatedAt,
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func (s *Server) TrackConversion(c *gin.Context) {
