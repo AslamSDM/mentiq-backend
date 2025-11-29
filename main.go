@@ -98,6 +98,13 @@ type Server struct {
 	stripeService            *StripeService
 	enhancedAnalyticsService *EnhancedAnalyticsService
 	sessionStorage           *SessionStorageService
+
+	// Entity caches with TTL
+	projectCache     map[string]*CacheEntry // Key: projectID
+	accountCache     map[string]*CacheEntry // Key: accountID
+	apiKeyCache      map[string]*CacheEntry // Key: apiKey token
+	recordingCache   map[string]*CacheEntry // Key: recordingID
+	entityCacheMutex sync.RWMutex
 }
 
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
@@ -111,13 +118,22 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		sessionStorage = nil
 	}
 
-	return &Server{
+	server := &Server{
 		db:                       db,
 		analyticsService:         analyticsService,
 		stripeService:            stripeService,
 		enhancedAnalyticsService: enhancedAnalyticsService,
 		sessionStorage:           sessionStorage,
+		projectCache:             make(map[string]*CacheEntry),
+		accountCache:             make(map[string]*CacheEntry),
+		apiKeyCache:              make(map[string]*CacheEntry),
+		recordingCache:           make(map[string]*CacheEntry),
 	}
+
+	// Start entity cache cleanup (every 15 minutes)
+	go server.startEntityCacheCleanup()
+
+	return server
 }
 
 func (s *Server) Connect() error {
@@ -269,6 +285,144 @@ func ValidateJWT(tokenString string) (*JWTClaims, error) {
 	}
 
 	return &claims, nil
+}
+
+// Entity cache helper methods
+
+func (s *Server) getCachedEntity(cacheKey string, cacheMap map[string]*CacheEntry) (interface{}, bool) {
+	s.entityCacheMutex.RLock()
+	defer s.entityCacheMutex.RUnlock()
+
+	entry, exists := cacheMap[cacheKey]
+	if !exists {
+		return nil, false
+	}
+
+	if time.Now().After(entry.ExpiresAt) {
+		return nil, false
+	}
+
+	return entry.Data, true
+}
+
+func (s *Server) setCachedEntity(cacheKey string, data interface{}, ttl time.Duration, cacheMap map[string]*CacheEntry) {
+	s.entityCacheMutex.Lock()
+	defer s.entityCacheMutex.Unlock()
+
+	cacheMap[cacheKey] = &CacheEntry{
+		Data:      data,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+}
+
+func (s *Server) invalidateCachedEntity(cacheKey string, cacheMap map[string]*CacheEntry) {
+	s.entityCacheMutex.Lock()
+	defer s.entityCacheMutex.Unlock()
+
+	delete(cacheMap, cacheKey)
+}
+
+func (s *Server) startEntityCacheCleanup() {
+	cleanupTicker := time.NewTicker(15 * time.Minute)
+	defer cleanupTicker.Stop()
+
+	for range cleanupTicker.C {
+		s.cleanExpiredEntityCache()
+	}
+}
+
+func (s *Server) cleanExpiredEntityCache() {
+	s.entityCacheMutex.Lock()
+	defer s.entityCacheMutex.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+
+	for key, entry := range s.projectCache {
+		if now.After(entry.ExpiresAt) {
+			delete(s.projectCache, key)
+			cleaned++
+		}
+	}
+
+	for key, entry := range s.accountCache {
+		if now.After(entry.ExpiresAt) {
+			delete(s.accountCache, key)
+			cleaned++
+		}
+	}
+
+	for key, entry := range s.apiKeyCache {
+		if now.After(entry.ExpiresAt) {
+			delete(s.apiKeyCache, key)
+			cleaned++
+		}
+	}
+
+	for key, entry := range s.recordingCache {
+		if now.After(entry.ExpiresAt) {
+			delete(s.recordingCache, key)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("Entity cache cleanup: removed %d expired entries", cleaned)
+	}
+}
+
+// Cached entity retrieval methods
+
+func (s *Server) getCachedProject(projectID string) (*Project, bool) {
+	if data, found := s.getCachedEntity(projectID, s.projectCache); found {
+		return data.(*Project), true
+	}
+	return nil, false
+}
+
+func (s *Server) setCachedProject(project *Project) {
+	s.setCachedEntity(project.ID, project, 30*time.Minute, s.projectCache)
+}
+
+func (s *Server) invalidateProjectCache(projectID string) {
+	s.invalidateCachedEntity(projectID, s.projectCache)
+}
+
+func (s *Server) getCachedAccount(accountID string) (*Account, bool) {
+	if data, found := s.getCachedEntity(accountID, s.accountCache); found {
+		return data.(*Account), true
+	}
+	return nil, false
+}
+
+func (s *Server) setCachedAccount(account *Account) {
+	s.setCachedEntity(account.ID, account, 30*time.Minute, s.accountCache)
+}
+
+func (s *Server) getCachedAPIKey(token string) (*APIKey, bool) {
+	if data, found := s.getCachedEntity(token, s.apiKeyCache); found {
+		return data.(*APIKey), true
+	}
+	return nil, false
+}
+
+func (s *Server) setCachedAPIKey(apiKey *APIKey) {
+	s.setCachedEntity(apiKey.Key, apiKey, 30*time.Minute, s.apiKeyCache)
+}
+
+func (s *Server) invalidateAPIKeyCache(token string) {
+	s.invalidateCachedEntity(token, s.apiKeyCache)
+}
+
+func (s *Server) getCachedRecording(recordingID string) (*SessionRecording, bool) {
+	if data, found := s.getCachedEntity(recordingID, s.recordingCache); found {
+		return data.(*SessionRecording), true
+	}
+	return nil, false
+}
+
+func (s *Server) setCachedRecording(recording *SessionRecording) {
+	s.setCachedEntity(recording.ID, recording, 15*time.Minute, s.recordingCache)
 }
 
 func main() {
@@ -933,16 +1087,23 @@ func (s *Server) getRecordingHandler(c *gin.Context) {
 	recordingID := c.Param("recordingId")
 	projectID := c.Param("project_id")
 
-	// Fetch recording metadata from database and verify it belongs to the project
+	// Try to get from cache first
 	var recording SessionRecording
-	if err := s.db.Where("id = ? AND project_id = ?", recordingID, projectID).First(&recording).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found"})
+	if cachedRecording, found := s.getCachedRecording(recordingID); found && cachedRecording.ProjectID == projectID {
+		recording = *cachedRecording
+	} else {
+		// Fetch recording metadata from database and verify it belongs to the project
+		if err := s.db.Where("id = ? AND project_id = ?", recordingID, projectID).First(&recording).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found"})
+				return
+			}
+			log.Printf("Failed to fetch recording: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording"})
 			return
 		}
-		log.Printf("Failed to fetch recording: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording"})
-		return
+		// Cache for future requests
+		s.setCachedRecording(&recording)
 	}
 
 	var events []map[string]interface{}
@@ -1456,14 +1617,44 @@ func (s *Server) authMiddleware(c *gin.Context) {
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	token = strings.TrimPrefix(token, "ApiKey ")
 
-	// First, try to find by API key
+	// First, try to find by API key (check cache first)
+	if cachedKey, found := s.getCachedAPIKey(token); found && cachedKey.IsActive {
+		// Get project from cache or DB
+		var project *Project
+		if cachedProject, found := s.getCachedProject(cachedKey.ProjectID); found {
+			project = cachedProject
+		} else {
+			var proj Project
+			if err := s.db.Where("id = ?", cachedKey.ProjectID).First(&proj).Error; err != nil {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
+				return
+			}
+			project = &proj
+			s.setCachedProject(project)
+		}
+		c.Set("account_id", project.AccountID)
+		c.Set("project_id", cachedKey.ProjectID)
+		c.Set("api_key_id", cachedKey.ID)
+		c.Next()
+		return
+	}
+
+	// Not in cache, query database
 	var apiKey APIKey
 	if err := s.db.Where("key = ? AND is_active = ?", token, true).First(&apiKey).Error; err == nil {
+		// Cache the API key for future requests
+		s.setCachedAPIKey(&apiKey)
+
 		// Valid API key found - get the associated account through project
 		var project Project
-		if err := s.db.Where("id = ?", apiKey.ProjectID).First(&project).Error; err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
-			return
+		if cachedProject, found := s.getCachedProject(apiKey.ProjectID); found {
+			project = *cachedProject
+		} else {
+			if err := s.db.Where("id = ?", apiKey.ProjectID).First(&project).Error; err != nil {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
+				return
+			}
+			s.setCachedProject(&project)
 		}
 		c.Set("account_id", project.AccountID)
 		c.Set("project_id", apiKey.ProjectID)
@@ -1501,11 +1692,32 @@ func (s *Server) authMiddleware(c *gin.Context) {
 func (s *Server) listProjectsHandler(c *gin.Context) {
 	accountID, _ := c.Get("account_id")
 
+	// Try to get from cache first
+	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
+	if data, found := s.getCachedEntity(cacheKey, s.projectCache); found {
+		projects := data.([]Project)
+		var response []gin.H
+		for _, project := range projects {
+			response = append(response, gin.H{
+				"id":        project.ID,
+				"name":      project.Name,
+				"accountId": project.AccountID,
+				"createdAt": project.CreatedAt,
+				"updatedAt": project.UpdatedAt,
+			})
+		}
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
 	var projects []Project
 	if err := s.db.Where("account_id = ?", accountID.(string)).Find(&projects).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch projects"})
 		return
 	}
+
+	// Cache the projects list
+	s.setCachedEntity(cacheKey, projects, 10*time.Minute, s.projectCache)
 
 	// Convert to response format
 	var response []gin.H
@@ -1541,6 +1753,11 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create project"})
 		return
 	}
+
+	// Cache the new project and invalidate account projects list
+	s.setCachedProject(&project)
+	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
+	s.invalidateCachedEntity(cacheKey, s.projectCache)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"id":        project.ID,
@@ -1583,6 +1800,9 @@ func (s *Server) createApiKeyHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create API key"})
 		return
 	}
+
+	// Cache the new API key
+	s.setCachedAPIKey(&apiKey)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"id":          apiKey.ID,
@@ -1675,6 +1895,8 @@ func (s *Server) updateApiKeyHandler(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update API key"})
 			return
 		}
+		// Invalidate the cache for this API key
+		s.invalidateAPIKeyCache(apiKey.Key)
 	}
 
 	// Fetch the updated key
@@ -1705,6 +1927,13 @@ func (s *Server) deleteApiKeyHandler(c *gin.Context) {
 	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
+	}
+
+	// Fetch the API key to get the token before deleting
+	var apiKeyToDelete APIKey
+	if err := s.db.Where("id = ? AND project_id = ?", keyID, projectID).First(&apiKeyToDelete).Error; err == nil {
+		// Invalidate cache before deleting
+		s.invalidateAPIKeyCache(apiKeyToDelete.Key)
 	}
 
 	// Delete the API key

@@ -136,10 +136,15 @@ func (eas *EnhancedAnalyticsService) DeviceAnalyticsHandler(c *gin.Context) {
 // RetentionCohortHandler provides cohort retention analysis
 func (eas *EnhancedAnalyticsService) RetentionCohortHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
-	months := c.DefaultQuery("months", "12")
 
-	monthsInt, _ := strconv.Atoi(months)
-	cohortData, err := eas.calculateRetentionCohorts(projectID, monthsInt)
+	// Parse date range
+	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -30).Format("2006-01-02"))
+	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+
+	start, _ := time.Parse("2006-01-02", startDate)
+	end, _ := time.Parse("2006-01-02", endDate)
+
+	cohortData, err := eas.calculateRetentionCohorts(projectID, start, end)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -147,7 +152,8 @@ func (eas *EnhancedAnalyticsService) RetentionCohortHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"project_id": projectID,
-		"months":     monthsInt,
+		"start_date": startDate,
+		"end_date":   endDate,
 		"cohorts":    cohortData,
 	})
 }
@@ -491,100 +497,117 @@ func (eas *EnhancedAnalyticsService) calculateDeviceAnalytics(projectID string, 
 	}, nil
 }
 
-// calculateRetentionCohorts calculates user retention by signup cohorts
-func (eas *EnhancedAnalyticsService) calculateRetentionCohorts(projectID string, months int) ([]map[string]interface{}, error) {
-	// Validate input parameters
-	if months <= 0 || months > 24 {
-		months = 12 // Default to 12 months
-		log.Printf("Warning: Invalid months parameter, defaulting to 12 for project %s", projectID)
+// calculateRetentionCohorts calculates user retention by signup cohorts (Daily)
+func (eas *EnhancedAnalyticsService) calculateRetentionCohorts(projectID string, start, end time.Time) ([]map[string]interface{}, error) {
+	// Struct to hold query results
+	type RetentionResult struct {
+		Cohort      string
+		TotalUsers  int
+		DayNumber   int
+		ActiveUsers int
 	}
 
-	// Query UserCohortMetrics from database with proper error handling
-	startDate := time.Now().AddDate(0, -months, 0)
+	var results []RetentionResult
 
-	var cohortData []UserCohortMetrics
-	err := eas.db.Where("project_id = ? AND cohort_month >= ?", projectID, startDate).
-		Order("cohort_month DESC, period_number ASC").
-		Find(&cohortData).Error
+	// SQL query to calculate daily retention
+	query := `
+		WITH user_cohorts AS (
+			SELECT user_id, date_trunc('day', MIN(timestamp)) as cohort_date
+			FROM events
+			WHERE project_id = ?
+			GROUP BY user_id
+		),
+		cohort_sizes AS (
+			SELECT cohort_date, COUNT(DISTINCT user_id) as total_users
+			FROM user_cohorts
+			GROUP BY cohort_date
+		),
+		user_activity AS (
+			SELECT DISTINCT user_id, date_trunc('day', timestamp) as activity_date
+			FROM events
+			WHERE project_id = ?
+			AND timestamp >= ?
+		)
+		SELECT
+			to_char(uc.cohort_date, 'YYYY-MM-DD') as cohort,
+			cs.total_users,
+			CAST(EXTRACT(DAY FROM (ua.activity_date - uc.cohort_date)) AS INTEGER) as day_number,
+			COUNT(DISTINCT uc.user_id) as active_users
+		FROM user_cohorts uc
+		JOIN cohort_sizes cs ON uc.cohort_date = cs.cohort_date
+		JOIN user_activity ua ON uc.user_id = ua.user_id
+		WHERE uc.cohort_date BETWEEN ? AND ?
+		GROUP BY 1, 2, 3
+		ORDER BY 1, 3
+	`
 
+	// Execute query
+	// We need start date for user_activity filter to optimize, let's use start date of cohorts
+	err := eas.db.Raw(query, projectID, projectID, start, start, end).Scan(&results).Error
 	if err != nil {
-		log.Printf("Error fetching retention cohorts for project %s: %v", projectID, err)
-		return nil, fmt.Errorf("failed to fetch retention cohorts: %v", err)
+		log.Printf("Error calculating retention cohorts for project %s: %v", projectID, err)
+		return nil, fmt.Errorf("failed to calculate retention cohorts: %v", err)
 	}
 
-	log.Printf("Found %d cohort records for project %s", len(cohortData), projectID)
+	log.Printf("Calculated daily retention from %d records for project %s", len(results), projectID)
 
-	// Return empty array if no data found
-	if len(cohortData) == 0 {
-		return []map[string]interface{}{}, nil
-	}
-
-	// Group by cohort month with improved validation
+	// Group by cohort date
 	cohortMap := make(map[string]map[string]interface{})
 
-	for _, data := range cohortData {
-		// Validate cohort data
-		if data.UsersInCohort <= 0 {
-			log.Printf("Warning: Invalid user count in cohort for project %s, cohort %s", projectID, data.CohortMonth.Format("2006-01"))
-			continue
-		}
-
-		if data.RetentionRate < 0 || data.RetentionRate > 100 {
-			log.Printf("Warning: Invalid retention rate %.2f%% for project %s", data.RetentionRate, projectID)
-			continue
-		}
-
-		cohortKey := data.CohortMonth.Format("2006-01")
-
-		if _, exists := cohortMap[cohortKey]; !exists {
-			cohortMap[cohortKey] = map[string]interface{}{
-				"cohort_month": cohortKey,
-				"users":        data.UsersInCohort,
-				"retention":    make(map[string]float64),
+	for _, res := range results {
+		if _, exists := cohortMap[res.Cohort]; !exists {
+			cohortMap[res.Cohort] = map[string]interface{}{
+				"cohort_date": res.Cohort,
+				"users":       res.TotalUsers,
+				"retention":   make(map[string]float64),
 			}
 		}
 
-		retention := cohortMap[cohortKey]["retention"].(map[string]float64)
-		periodKey := "month_" + strconv.Itoa(data.PeriodNumber)
-		retention[periodKey] = data.RetentionRate
+		if res.TotalUsers > 0 {
+			// Calculate retention rate
+			rate := (float64(res.ActiveUsers) / float64(res.TotalUsers)) * 100
+
+			// Store in map
+			retention := cohortMap[res.Cohort]["retention"].(map[string]float64)
+			retention[fmt.Sprintf("day_%d", res.DayNumber)] = rate
+		}
 	}
 
 	// Convert to slice with additional metrics
 	cohorts := make([]map[string]interface{}, 0, len(cohortMap))
 	for _, cohort := range cohortMap {
-		// Calculate cohort health metrics
+		// Calculate cohort health metrics (Day 1 retention is key)
 		retention := cohort["retention"].(map[string]float64)
+
+		// Add calculated metrics
+		if val, ok := retention["day_1"]; ok {
+			cohort["day_1_retention"] = val
+		} else {
+			cohort["day_1_retention"] = 0.0
+		}
+
+		// Calculate average retention
 		avgRetention := 0.0
 		retentionCount := 0
-
 		for _, rate := range retention {
 			avgRetention += rate
 			retentionCount++
 		}
-
 		if retentionCount > 0 {
 			avgRetention = avgRetention / float64(retentionCount)
 		}
-
-		// Add calculated metrics
 		cohort["avg_retention"] = fmt.Sprintf("%.2f%%", avgRetention)
-		cohort["retention_periods"] = retentionCount
 
 		cohorts = append(cohorts, cohort)
 	}
 
-	// Improved sorting by cohort month (newest first) with error handling
-	for i := 0; i < len(cohorts)-1; i++ {
-		for j := i + 1; j < len(cohorts); j++ {
-			month1, ok1 := cohorts[i]["cohort_month"].(string)
-			month2, ok2 := cohorts[j]["cohort_month"].(string)
-			if ok1 && ok2 && month1 < month2 {
-				cohorts[i], cohorts[j] = cohorts[j], cohorts[i]
-			}
-		}
-	}
+	// Sort by cohort date (newest first)
+	sort.Slice(cohorts, func(i, j int) bool {
+		date1, _ := cohorts[i]["cohort_date"].(string)
+		date2, _ := cohorts[j]["cohort_date"].(string)
+		return date1 > date2
+	})
 
-	log.Printf("Returning %d cohorts for project %s", len(cohorts), projectID)
 	return cohorts, nil
 }
 
