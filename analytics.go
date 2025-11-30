@@ -1474,10 +1474,8 @@ func (as *AnalyticsService) GetHeatmapHandler(c *gin.Context) {
 	}
 
 	// Aggregate click data (merge clicks at same coordinates)
-	aggregatedHeatmaps := make([]map[string]interface{}, 0)
-	for page, clicks := range pageHeatmaps {
-		clickCounts := make(map[string]map[string]interface{})
-
+	clickCounts := make(map[string]map[string]interface{})
+	for _, clicks := range pageHeatmaps {
 		for _, click := range clicks {
 			key := fmt.Sprintf("%v,%v", click["x"], click["y"])
 			if existing, exists := clickCounts[key]; exists {
@@ -1490,56 +1488,63 @@ func (as *AnalyticsService) GetHeatmapHandler(c *gin.Context) {
 				}
 			}
 		}
-
-		// Convert to slice
-		aggregatedClicks := make([]map[string]interface{}, 0)
-		for _, clickData := range clickCounts {
-			aggregatedClicks = append(aggregatedClicks, clickData)
-		}
-
-		// Sort by count (highest first)
-		sort.Slice(aggregatedClicks, func(i, j int) bool {
-			return aggregatedClicks[i]["count"].(int) > aggregatedClicks[j]["count"].(int)
-		})
-
-		aggregatedHeatmaps = append(aggregatedHeatmaps, map[string]interface{}{
-			"page":   page,
-			"clicks": aggregatedClicks,
-		})
 	}
 
-	// Calculate scroll depth statistics
-	scrollStats := make(map[string]float64)
+	// Convert to slice
+	aggregatedClicks := make([]map[string]interface{}, 0)
+	for _, clickData := range clickCounts {
+		aggregatedClicks = append(aggregatedClicks, clickData)
+	}
+
+	// Sort by count (highest first)
+	sort.Slice(aggregatedClicks, func(i, j int) bool {
+		return aggregatedClicks[i]["count"].(int) > aggregatedClicks[j]["count"].(int)
+	})
+
+	// Calculate scroll depth statistics in format expected by frontend
+	scrollStats := make([]map[string]interface{}, 0)
 	if len(scrollData) > 0 {
-		// Combine all scroll data
+		// Combine all scroll data from all pages
 		allScrolls := make([]float64, 0)
 		for _, scrolls := range scrollData {
 			allScrolls = append(allScrolls, scrolls...)
 		}
 
 		if len(allScrolls) > 0 {
-			sort.Float64s(allScrolls)
+			totalSessions := len(allScrolls)
 
 			// Calculate percentages of users who reached certain depths
-			total := float64(len(allScrolls))
-			scrollStats["25%"] = float64(len(filterScrolls(allScrolls, 0.25))) / total
-			scrollStats["50%"] = float64(len(filterScrolls(allScrolls, 0.50))) / total
-			scrollStats["75%"] = float64(len(filterScrolls(allScrolls, 0.75))) / total
-			scrollStats["100%"] = float64(len(filterScrolls(allScrolls, 1.0))) / total
+			depths := []int{25, 50, 75, 100}
+			for _, depth := range depths {
+				threshold := float64(depth) / 100.0
+				usersReached := len(filterScrolls(allScrolls, threshold))
+				percentage := float64(usersReached) / float64(totalSessions) * 100
+
+				scrollStats = append(scrollStats, map[string]interface{}{
+					"depth":      depth,
+					"count":      usersReached,
+					"percentage": percentage,
+				})
+			}
 		}
 	}
 
+	// Count total sessions (unique session IDs)
+	sessionIDs := make(map[string]bool)
+	for _, event := range events {
+		if event.SessionID != "" {
+			sessionIDs[event.SessionID] = true
+		}
+	}
+
+	// Return data in format expected by frontend
 	heatmapData := map[string]interface{}{
-		"status": "success",
-		"data": map[string]interface{}{
-			"page_heatmaps": aggregatedHeatmaps,
-			"scroll_depth":  scrollStats,
-			"date_range": map[string]string{
-				"start": startDate,
-				"end":   endDate,
-			},
-			"total_events": len(events),
-		},
+		"url":           pageURL,
+		"clicks":        aggregatedClicks,
+		"scrolls":       scrollStats,
+		"mouseMoves":    []interface{}{}, // Empty for now, can be populated if mouse tracking is enabled
+		"viewport":      map[string]interface{}{"width": 1920, "height": 1080, "deviceType": "desktop"},
+		"totalSessions": len(sessionIDs),
 	}
 
 	c.JSON(http.StatusOK, heatmapData)
