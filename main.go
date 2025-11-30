@@ -565,6 +565,11 @@ func main() {
 		apiV1.GET("/subscriptions/:account_id", server.getSubscriptionHandler)
 		apiV1.POST("/payments", server.createPaymentHandler)
 		apiV1.GET("/payments/:account_id", server.listPaymentsHandler)
+
+		// Feature Tracking & Onboarding routes
+		apiV1.GET("/projects/:project_id/features/usage", server.getFeatureUsageHandler)
+		apiV1.GET("/projects/:project_id/onboarding/stats", server.getOnboardingStatsHandler)
+		apiV1.GET("/projects/:project_id/users/:user_id/journey", server.getUserFeatureJourneyHandler)
 	}
 
 	// Setup graceful shutdown
