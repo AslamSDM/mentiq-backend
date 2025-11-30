@@ -13,9 +13,13 @@ type Account struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
+	// Stripe customer info for Mentiq subscriptions
+	StripeCustomerID string `json:"stripe_customer_id" gorm:"index"`
+
 	// Relations
-	Users    []User    `gorm:"foreignKey:AccountID" json:"users,omitempty"`
-	Projects []Project `gorm:"foreignKey:AccountID" json:"projects,omitempty"`
+	Users               []User               `gorm:"foreignKey:AccountID" json:"users,omitempty"`
+	Projects            []Project            `gorm:"foreignKey:AccountID" json:"projects,omitempty"`
+	AccountSubscription *AccountSubscription `gorm:"foreignKey:AccountID" json:"subscription,omitempty"`
 }
 
 // User represents a user in an account
@@ -197,6 +201,92 @@ type SessionRecording struct {
 
 func (SessionRecording) TableName() string {
 	return "session_recording"
+}
+
+// AccountSubscription represents a Mentiq subscription for an account
+type AccountSubscription struct {
+	ID        string `gorm:"primaryKey" json:"id"`
+	AccountID string `gorm:"uniqueIndex;not null" json:"account_id"` // One subscription per account
+
+	// Subscription details
+	Tier         string `json:"tier" gorm:"index"`                    // launch, traction, momentum, scale, expansion, enterprise
+	Status       string `json:"status" gorm:"index;default:'active'"` // active, trialing, past_due, canceled, paused
+	UserCount    int    `json:"user_count"`                           // Selected user count
+	MonthlyPrice int64  `json:"monthly_price"`                        // Price in cents
+
+	// Stripe subscription details
+	StripeSubscriptionID string `json:"stripe_subscription_id" gorm:"index"`
+	StripePriceID        string `json:"stripe_price_id"`
+	StripeProductID      string `json:"stripe_product_id"`
+
+	// Billing cycle
+	CurrentPeriodStart time.Time `json:"current_period_start"`
+	CurrentPeriodEnd   time.Time `json:"current_period_end"`
+	BillingCycleAnchor time.Time `json:"billing_cycle_anchor"`
+
+	// Trial information
+	TrialStart *time.Time `json:"trial_start"`
+	TrialEnd   *time.Time `json:"trial_end"`
+
+	// Cancellation
+	CancelAtPeriodEnd  bool       `json:"cancel_at_period_end"`
+	CanceledAt         *time.Time `json:"canceled_at"`
+	CancellationReason *string    `json:"cancellation_reason"`
+
+	// Metadata
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	// Relations
+	Account        Account          `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+	PaymentHistory []PaymentHistory `gorm:"foreignKey:SubscriptionID" json:"payment_history,omitempty"`
+}
+
+func (AccountSubscription) TableName() string {
+	return "account_subscription"
+}
+
+// PaymentHistory represents payment transactions for account subscriptions
+type PaymentHistory struct {
+	ID             string `gorm:"primaryKey" json:"id"`
+	SubscriptionID string `gorm:"index;not null" json:"subscription_id"`
+	AccountID      string `gorm:"index;not null" json:"account_id"`
+
+	// Payment details
+	Amount   int64  `json:"amount"` // Amount in cents
+	Currency string `json:"currency" gorm:"default:'usd'"`
+	Status   string `json:"status" gorm:"index"` // succeeded, failed, pending, refunded
+
+	// Stripe details
+	StripeInvoiceID string `json:"stripe_invoice_id" gorm:"index"`
+	StripeChargeID  string `json:"stripe_charge_id" gorm:"index"`
+	StripePaymentID string `json:"stripe_payment_id"`
+
+	// Payment metadata
+	Description   string `json:"description"`
+	InvoiceNumber string `json:"invoice_number"`
+	InvoicePDF    string `json:"invoice_pdf"` // URL to invoice PDF
+
+	// Dates
+	PaidAt     *time.Time `json:"paid_at"`
+	FailedAt   *time.Time `json:"failed_at"`
+	RefundedAt *time.Time `json:"refunded_at"`
+
+	// Refund details
+	RefundAmount int64   `json:"refund_amount"` // Amount refunded in cents
+	RefundReason *string `json:"refund_reason"`
+
+	// Metadata
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	// Relations
+	Account      Account             `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+	Subscription AccountSubscription `gorm:"foreignKey:SubscriptionID;references:ID" json:"subscription,omitempty"`
+}
+
+func (PaymentHistory) TableName() string {
+	return "payment_history"
 }
 
 // StripeCustomer represents a Stripe customer record

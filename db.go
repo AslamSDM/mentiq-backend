@@ -30,7 +30,10 @@ func MigrateDB(db *gorm.DB) error {
 		&ExperimentAssignment{},
 		&ConversionEvent{},
 		&SessionRecording{},
-		// Stripe revenue models
+		// Mentiq subscription models
+		&AccountSubscription{},
+		&PaymentHistory{},
+		// Stripe revenue models (for customer analytics)
 		&StripeCustomer{},
 		&StripeSubscription{},
 		&StripeInvoice{},
@@ -99,6 +102,17 @@ func CreateIndices(db *gorm.DB) error {
 		{&SessionRecording{}, "idx_recording_account_id", "account_id"},
 		{&SessionRecording{}, "idx_recording_project_id", "project_id"},
 		{&SessionRecording{}, "idx_recording_created_at", "created_at"},
+		// AccountSubscription indices
+		{&AccountSubscription{}, "idx_account_subscription_account_id", "account_id"},
+		{&AccountSubscription{}, "idx_account_subscription_tier", "tier"},
+		{&AccountSubscription{}, "idx_account_subscription_status", "status"},
+		{&AccountSubscription{}, "idx_account_subscription_stripe_id", "stripe_subscription_id"},
+		// PaymentHistory indices
+		{&PaymentHistory{}, "idx_payment_history_subscription_id", "subscription_id"},
+		{&PaymentHistory{}, "idx_payment_history_account_id", "account_id"},
+		{&PaymentHistory{}, "idx_payment_history_status", "status"},
+		{&PaymentHistory{}, "idx_payment_history_stripe_invoice_id", "stripe_invoice_id"},
+		{&PaymentHistory{}, "idx_payment_history_created_at", "created_at"},
 		// Stripe indices
 		{&StripeCustomer{}, "idx_stripe_customer_project_id", "project_id"},
 		{&StripeCustomer{}, "idx_stripe_customer_email", "email"},

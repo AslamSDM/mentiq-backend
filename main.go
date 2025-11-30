@@ -559,6 +559,12 @@ func main() {
 		apiV1.POST("/experiments/:experimentKey/assignment", server.GetAssignment)
 		apiV1.POST("/experiments/track", server.TrackConversion)
 		apiV1.PUT("/experiments/:id/status", server.UpdateExperimentStatus)
+
+		// Mentiq Subscription Management routes
+		apiV1.POST("/subscriptions", server.createOrUpdateSubscriptionHandler)
+		apiV1.GET("/subscriptions/:account_id", server.getSubscriptionHandler)
+		apiV1.POST("/payments", server.createPaymentHandler)
+		apiV1.GET("/payments/:account_id", server.listPaymentsHandler)
 	}
 
 	// Setup graceful shutdown
