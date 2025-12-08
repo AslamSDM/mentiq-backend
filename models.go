@@ -203,6 +203,23 @@ func (SessionRecording) TableName() string {
 	return "session_recording"
 }
 
+// RefreshToken represents a refresh token for an account
+type RefreshToken struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	Token     string    `gorm:"uniqueIndex;not null" json:"token"`
+	AccountID string    `gorm:"index;not null" json:"account_id"`
+	ExpiresAt time.Time `gorm:"not null;index" json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
+	IsRevoked bool      `gorm:"default:false;index" json:"is_revoked"`
+
+	// Relations
+	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+}
+
+func (RefreshToken) TableName() string {
+	return "refresh_token"
+}
+
 // AccountSubscription represents a Mentiq subscription for an account
 type AccountSubscription struct {
 	ID        string `gorm:"primaryKey" json:"id"`

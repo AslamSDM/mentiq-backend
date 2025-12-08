@@ -173,6 +173,15 @@ type CreateProjectRequest struct {
 	Name string `json:"name" binding:"required"`
 }
 
+type UpdateProjectRequest struct {
+	Name        *string `json:"name"`
+	Description *string `json:"description"`
+}
+
+type RefreshTokenRequest struct {
+	RefreshToken string `json:"refresh_token" binding:"required"`
+}
+
 type CreateApiKeyRequest struct {
 	Name        string   `json:"name" binding:"required"`
 	Permissions []string `json:"permissions"`
@@ -188,12 +197,13 @@ type JWTClaims struct {
 	Email     string `json:"email"`
 	ProjectID string `json:"project_id,omitempty"`
 	APIKeyID  string `json:"api_key_id,omitempty"`
-	Exp       int64  `json:"exp"` // Expiration time
-	Iat       int64  `json:"iat"` // Issued at time
+	Type      string `json:"type"` // "access" or "refresh"
+	Exp       int64  `json:"exp"`  // Expiration time
+	Iat       int64  `json:"iat"`  // Issued at time
 }
 
 // GenerateJWT generates a JWT token for an account with HMAC-SHA256 signing
-func GenerateJWT(accountID, email string, expiresInHours int) (string, error) {
+func GenerateJWT(accountID, email, tokenType string, expiresInHours int) (string, error) {
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		return "", fmt.Errorf("JWT_SECRET must be configured")
@@ -205,6 +215,7 @@ func GenerateJWT(accountID, email string, expiresInHours int) (string, error) {
 	claims := JWTClaims{
 		AccountID: accountID,
 		Email:     email,
+		Type:      tokenType,
 		Exp:       expiryTime,
 		Iat:       now,
 	}
@@ -484,6 +495,7 @@ func main() {
 	// Public routes
 	router.POST("/signup", server.signupHandler)
 	router.POST("/login", server.loginHandler)
+	router.POST("/refresh", server.refreshTokenHandler)
 	router.GET("/health", healthCheckHandler)
 
 	// Serve static dashboard
@@ -525,6 +537,8 @@ func main() {
 		// Project and API Key management
 		apiV1.POST("/projects", server.createProjectHandler)
 		apiV1.GET("/projects", server.listProjectsHandler)
+		apiV1.PUT("/projects/:project_id", server.updateProjectHandler)
+		apiV1.DELETE("/projects/:project_id", server.deleteProjectHandler)
 		apiV1.GET("/projects/:project_id/events", server.analyticsService.GetEventsHandler)
 		apiV1.POST("/projects/:project_id/apikeys", server.createApiKeyHandler)
 		apiV1.GET("/projects/:project_id/apikeys", server.listApiKeysHandler)
@@ -543,6 +557,11 @@ func main() {
 		apiV1.GET("/projects/:project_id/analytics/devices", server.enhancedAnalyticsService.DeviceAnalyticsHandler)
 		apiV1.GET("/projects/:project_id/analytics/cohorts", server.enhancedAnalyticsService.RetentionCohortHandler)
 		apiV1.GET("/projects/:project_id/analytics/features", server.enhancedAnalyticsService.FeatureAdoptionHandler)
+
+		// Subscription Analytics routes (for paid user tracking and churn)
+		apiV1.GET("/projects/:project_id/analytics/paid-users", server.analyticsService.GetPaidUsersMetricsHandler)
+		apiV1.GET("/projects/:project_id/analytics/churn-metrics", server.analyticsService.GetChurnMetricsHandler)
+		apiV1.GET("/projects/:project_id/analytics/subscription-health", server.analyticsService.GetSubscriptionHealthHandler)
 		apiV1.GET("/projects/:project_id/analytics/churn", server.enhancedAnalyticsService.ChurnRiskHandler)
 		apiV1.GET("/projects/:project_id/analytics/funnels", server.enhancedAnalyticsService.ConversionFunnelHandler)
 		apiV1.GET("/projects/:project_id/analytics/sessions", server.enhancedAnalyticsService.SessionAnalyticsHandler)
@@ -1598,15 +1617,45 @@ func (s *Server) loginHandler(c *gin.Context) {
 		return
 	}
 
-	// Generate JWT token (24 hour expiration)
-	token, err := GenerateJWT(account.ID, account.Email, 24)
+	// Generate access token (1 hour expiration) and refresh token (7 days expiration)
+	accessToken, err := GenerateJWT(account.ID, account.Email, "access", 1)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
 		return
 	}
 
+	refreshToken, err := GenerateJWT(account.ID, account.Email, "refresh", 24*7)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
+		return
+	}
+
+	// Store refresh token in database
+	refreshTokenRecord := RefreshToken{
+		ID:        uuid.New().String(),
+		Token:     refreshToken,
+		AccountID: account.ID,
+		ExpiresAt: time.Now().Add(24 * 7 * time.Hour),
+		IsRevoked: false,
+	}
+
+	if err := s.db.Create(&refreshTokenRecord).Error; err != nil {
+		log.Printf("Failed to store refresh token: %v", err)
+		// Continue even if storage fails
+	}
+
+	// Get user's projects to return the first project ID
+	var projects []Project
+	var projectID string
+	if err := s.db.Where("account_id = ?", account.ID).Find(&projects).Error; err == nil && len(projects) > 0 {
+		projectID = projects[0].ID
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"token": token,
+		"accessToken":  accessToken,
+		"refreshToken": refreshToken,
+		"expiresIn":    3600, // 1 hour in seconds
+		"projectId":    projectID,
 		"user": gin.H{
 			"id":    account.ID,
 			"name":  account.Name,
@@ -1754,6 +1803,30 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 
 	accountID, _ := c.Get("account_id")
 
+	// Check existing project count for non-enterprise users
+	var existingProjects []Project
+	if err := s.db.Where("account_id = ?", accountID.(string)).Find(&existingProjects).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check existing projects"})
+		return
+	}
+
+	// Get account subscription to check tier
+	var subscription AccountSubscription
+	isEnterprise := false
+	if err := s.db.Where("account_id = ?", accountID.(string)).First(&subscription).Error; err == nil {
+		isEnterprise = subscription.Tier == "enterprise"
+	}
+
+	// Limit non-enterprise users to 1 project
+	if !isEnterprise && len(existingProjects) >= 1 {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "Project limit reached. Upgrade to Enterprise plan to create multiple projects.",
+			"limit":   1,
+			"current": len(existingProjects),
+		})
+		return
+	}
+
 	project := Project{
 		ID:        uuid.New().String(),
 		Name:      req.Name,
@@ -1776,6 +1849,149 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 		"accountId": project.AccountID,
 		"createdAt": project.CreatedAt,
 		"updatedAt": project.UpdatedAt,
+	})
+}
+
+func (s *Server) updateProjectHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	accountID, _ := c.Get("account_id")
+
+	var req UpdateProjectRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify project exists and belongs to user
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	// Update fields if provided
+	if req.Name != nil {
+		project.Name = *req.Name
+	}
+
+	if err := s.db.Save(&project).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update project"})
+		return
+	}
+
+	// Invalidate caches
+	s.invalidateProjectCache(project.ID)
+	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
+	s.invalidateCachedEntity(cacheKey, s.projectCache)
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":        project.ID,
+		"name":      project.Name,
+		"accountId": project.AccountID,
+		"createdAt": project.CreatedAt,
+		"updatedAt": project.UpdatedAt,
+	})
+}
+
+func (s *Server) deleteProjectHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	accountID, _ := c.Get("account_id")
+
+	// Verify project exists and belongs to user
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	// Delete associated API keys first
+	if err := s.db.Where("project_id = ?", projectID).Delete(&APIKey{}).Error; err != nil {
+		log.Printf("Failed to delete API keys for project %s: %v", projectID, err)
+	}
+
+	// Delete the project
+	if err := s.db.Delete(&project).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete project"})
+		return
+	}
+
+	// Invalidate caches
+	s.invalidateProjectCache(projectID)
+	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
+	s.invalidateCachedEntity(cacheKey, s.projectCache)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Project deleted successfully"})
+}
+
+func (s *Server) refreshTokenHandler(c *gin.Context) {
+	var req RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate refresh token
+	claims, err := ValidateJWT(req.RefreshToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token"})
+		return
+	}
+
+	// Ensure it's a refresh token
+	if claims.Type != "refresh" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token type"})
+		return
+	}
+
+	// Check if refresh token exists and is not revoked
+	var refreshTokenRecord RefreshToken
+	if err := s.db.Where("token = ? AND is_revoked = ?", req.RefreshToken, false).First(&refreshTokenRecord).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Refresh token not found or revoked"})
+		return
+	}
+
+	// Check if refresh token is expired
+	if time.Now().After(refreshTokenRecord.ExpiresAt) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Refresh token expired"})
+		return
+	}
+
+	// Generate new access token
+	newAccessToken, err := GenerateJWT(claims.AccountID, claims.Email, "access", 1)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
+		return
+	}
+
+	// Optionally generate new refresh token (refresh token rotation)
+	newRefreshToken, err := GenerateJWT(claims.AccountID, claims.Email, "refresh", 24*7)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
+		return
+	}
+
+	// Revoke old refresh token
+	if err := s.db.Model(&refreshTokenRecord).Update("is_revoked", true).Error; err != nil {
+		log.Printf("Failed to revoke old refresh token: %v", err)
+	}
+
+	// Store new refresh token
+	newRefreshTokenRecord := RefreshToken{
+		ID:        uuid.New().String(),
+		Token:     newRefreshToken,
+		AccountID: claims.AccountID,
+		ExpiresAt: time.Now().Add(24 * 7 * time.Hour),
+		IsRevoked: false,
+	}
+
+	if err := s.db.Create(&newRefreshTokenRecord).Error; err != nil {
+		log.Printf("Failed to store new refresh token: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"accessToken":  newAccessToken,
+		"refreshToken": newRefreshToken,
+		"expiresIn":    3600, // 1 hour in seconds
 	})
 }
 

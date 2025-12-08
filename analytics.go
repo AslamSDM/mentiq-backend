@@ -1816,3 +1816,421 @@ func (as *AnalyticsService) GetChurnByChannelHandler(c *gin.Context) {
 		},
 	})
 }
+
+// GetPaidUsersMetricsHandler returns paid vs free user metrics and MRR breakdown
+func (as *AnalyticsService) GetPaidUsersMetricsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Project ID is required"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Parse query parameters
+	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -30).Format("2006-01-02"))
+	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+	subscriptionStatus := c.Query("subscription_status") // optional filter
+
+	// Fetch events
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	if err != nil {
+		log.Printf("Error fetching events: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
+		return
+	}
+
+	// Aggregate user subscription data
+	userSubscriptions := make(map[string]map[string]interface{})
+	for _, event := range events {
+		if event.UserID == "" {
+			continue
+		}
+
+		// Extract subscription properties from event
+		props := event.Properties
+		if props != nil {
+			if _, exists := userSubscriptions[event.UserID]; !exists {
+				userSubscriptions[event.UserID] = make(map[string]interface{})
+			}
+
+			// Update with latest subscription data
+			if status, ok := props["subscription_status"].(string); ok {
+				userSubscriptions[event.UserID]["status"] = status
+			}
+			if plan, ok := props["subscription_plan"]; ok {
+				userSubscriptions[event.UserID]["plan"] = plan
+			}
+			if mrr, ok := props["subscription_mrr"]; ok {
+				userSubscriptions[event.UserID]["mrr"] = mrr
+			}
+			if provider, ok := props["subscription_provider"]; ok {
+				userSubscriptions[event.UserID]["provider"] = provider
+			}
+			if isPaid, ok := props["is_paid_user"].(bool); ok {
+				userSubscriptions[event.UserID]["is_paid"] = isPaid
+			}
+		}
+	}
+
+	// Calculate metrics
+	var totalUsers, paidUsers, freeUsers, trialingUsers int
+	var totalMRR float64
+	planBreakdown := make(map[string]int)
+	providerBreakdown := make(map[string]int)
+
+	for _, sub := range userSubscriptions {
+		totalUsers++
+
+		isPaid, _ := sub["is_paid"].(bool)
+		status, _ := sub["status"].(string)
+
+		// Apply subscription status filter if provided
+		if subscriptionStatus != "" && status != subscriptionStatus {
+			continue
+		}
+
+		if isPaid {
+			paidUsers++
+		} else {
+			freeUsers++
+		}
+
+		if status == "trialing" {
+			trialingUsers++
+		}
+
+		// Aggregate MRR
+		if mrr, ok := sub["mrr"].(float64); ok {
+			totalMRR += mrr / 100 // Convert cents to dollars
+		}
+
+		// Plan breakdown
+		if plan, ok := sub["plan"].(string); ok && plan != "" {
+			planBreakdown[plan]++
+		}
+
+		// Provider breakdown
+		if provider, ok := sub["provider"].(string); ok && provider != "" {
+			providerBreakdown[provider]++
+		}
+	}
+
+	// Calculate derived metrics
+	paidPercentage := 0.0
+	arpu := 0.0
+	if totalUsers > 0 {
+		paidPercentage = float64(paidUsers) / float64(totalUsers) * 100
+	}
+	if paidUsers > 0 {
+		arpu = totalMRR / float64(paidUsers)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": gin.H{
+			"summary": gin.H{
+				"total_users":      totalUsers,
+				"paid_users":       paidUsers,
+				"free_users":       freeUsers,
+				"trialing_users":   trialingUsers,
+				"paid_percentage":  paidPercentage,
+				"total_mrr":        totalMRR,
+				"arr":              totalMRR * 12,
+				"arpu":             arpu,
+			},
+			"breakdowns": gin.H{
+				"by_plan":     planBreakdown,
+				"by_provider": providerBreakdown,
+			},
+			"date_range": gin.H{
+				"start": startDate,
+				"end":   endDate,
+			},
+		},
+	})
+}
+
+// GetChurnMetricsHandler returns churn rates and MRR churn metrics
+func (as *AnalyticsService) GetChurnMetricsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Project ID is required"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Parse query parameters
+	startDate := c.DefaultQuery("start_date", time.Now().AddDate(0, 0, -30).Format("2006-01-02"))
+	endDate := c.DefaultQuery("end_date", time.Now().Format("2006-01-02"))
+
+	// Fetch events
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	if err != nil {
+		log.Printf("Error fetching events: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
+		return
+	}
+
+	// Track subscription events
+	var subscriptionStarted, subscriptionCanceled, subscriptionUpgraded, subscriptionDowngraded int
+	var mrrStarted, mrrCanceled, mrrUpgrade, mrrDowngrade float64
+
+	for _, event := range events {
+		props := event.Properties
+		if props == nil {
+			continue
+		}
+
+		mrr := 0.0
+		if mrrVal, ok := props["mrr"].(float64); ok {
+			mrr = mrrVal / 100 // Convert cents to dollars
+		}
+
+		switch event.EventType {
+		case "subscription_started":
+			subscriptionStarted++
+			mrrStarted += mrr
+		case "subscription_canceled":
+			subscriptionCanceled++
+			mrrCanceled += mrr
+		case "subscription_upgraded":
+			subscriptionUpgraded++
+			if prevMRR, ok := props["previous_mrr"].(float64); ok {
+				mrrUpgrade += (mrr - prevMRR/100)
+			}
+		case "subscription_downgraded":
+			subscriptionDowngraded++
+			if prevMRR, ok := props["previous_mrr"].(float64); ok {
+				mrrDowngrade += (prevMRR/100 - mrr)
+			}
+		}
+	}
+
+	// Calculate churn rates
+	customerChurnRate := 0.0
+	if subscriptionStarted > 0 {
+		customerChurnRate = float64(subscriptionCanceled) / float64(subscriptionStarted) * 100
+	}
+
+	grossMRRChurn := mrrCanceled + mrrDowngrade
+	netMRRChurn := grossMRRChurn - mrrUpgrade
+	mrrChurnRate := 0.0
+	netMRRChurnRate := 0.0
+	if mrrStarted > 0 {
+		mrrChurnRate = (grossMRRChurn / mrrStarted) * 100
+		netMRRChurnRate = (netMRRChurn / mrrStarted) * 100
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": gin.H{
+			"customer_churn": gin.H{
+				"subscriptions_started":   subscriptionStarted,
+				"subscriptions_canceled":  subscriptionCanceled,
+				"subscriptions_upgraded":  subscriptionUpgraded,
+				"subscriptions_downgraded": subscriptionDowngraded,
+				"churn_rate":              customerChurnRate,
+			},
+			"mrr_churn": gin.H{
+				"mrr_started":       mrrStarted,
+				"mrr_canceled":      mrrCanceled,
+				"mrr_upgrade":       mrrUpgrade,
+				"mrr_downgrade":     mrrDowngrade,
+				"gross_mrr_churn":   grossMRRChurn,
+				"net_mrr_churn":     netMRRChurn,
+				"mrr_churn_rate":    mrrChurnRate,
+				"net_mrr_churn_rate": netMRRChurnRate,
+			},
+			"date_range": gin.H{
+				"start": startDate,
+				"end":   endDate,
+			},
+		},
+	})
+}
+
+// GetSubscriptionHealthHandler returns subscription health scores per user
+func (as *AnalyticsService) GetSubscriptionHealthHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	if projectID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Project ID is required"})
+		return
+	}
+
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Parse query parameters
+	limit := 100
+	if limitStr := c.Query("limit"); limitStr != "" {
+		fmt.Sscanf(limitStr, "%d", &limit)
+	}
+
+	// Fetch recent events (last 30 days)
+	endDate := time.Now().Format("2006-01-02")
+	startDate := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+
+	events, err := as.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	if err != nil {
+		log.Printf("Error fetching events: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
+		return
+	}
+
+	// Calculate health scores per user
+	type UserHealth struct {
+		UserID              string                 `json:"user_id"`
+		Email               string                 `json:"email,omitempty"`
+		SubscriptionStatus  string                 `json:"subscription_status"`
+		SubscriptionPlan    string                 `json:"subscription_plan,omitempty"`
+		MRR                 float64                `json:"mrr"`
+		HealthScore         float64                `json:"health_score"`
+		RiskCategory        string                 `json:"risk_category"`
+		DaysSinceLastActive int                    `json:"days_since_last_active"`
+		EventCount          int                    `json:"event_count"`
+		LastActivity        string                 `json:"last_activity"`
+		AtRisk              bool                   `json:"at_risk"`
+		Factors             map[string]interface{} `json:"factors"`
+	}
+
+	userHealthMap := make(map[string]*UserHealth)
+
+	for _, event := range events {
+		if event.UserID == "" {
+			continue
+		}
+
+		if _, exists := userHealthMap[event.UserID]; !exists {
+			userHealthMap[event.UserID] = &UserHealth{
+				UserID:      event.UserID,
+				Email:       event.Email,
+				EventCount:  0,
+				Factors:     make(map[string]interface{}),
+			}
+		}
+
+		health := userHealthMap[event.UserID]
+		health.EventCount++
+		health.LastActivity = event.Timestamp.Format("2006-01-02 15:04:05")
+
+		// Extract subscription properties
+		props := event.Properties
+		if props != nil {
+			if status, ok := props["subscription_status"].(string); ok {
+				health.SubscriptionStatus = status
+			}
+			if plan, ok := props["subscription_plan"].(string); ok {
+				health.SubscriptionPlan = plan
+			}
+			if mrr, ok := props["subscription_mrr"].(float64); ok {
+				health.MRR = mrr / 100 // Convert cents to dollars
+			}
+		}
+	}
+
+	// Calculate health scores
+	now := time.Now()
+	healthScores := make([]UserHealth, 0, len(userHealthMap))
+
+	for _, health := range userHealthMap {
+		// Calculate days since last active
+		if health.LastActivity != "" {
+			lastActive, _ := time.Parse("2006-01-02 15:04:05", health.LastActivity)
+			health.DaysSinceLastActive = int(now.Sub(lastActive).Hours() / 24)
+		}
+
+		// Calculate health score (0-100, higher is better)
+		healthScore := 100.0
+
+		// Activity factor (max -40 points)
+		if health.DaysSinceLastActive > 30 {
+			healthScore -= 40
+		} else if health.DaysSinceLastActive > 14 {
+			healthScore -= 25
+		} else if health.DaysSinceLastActive > 7 {
+			healthScore -= 15
+		}
+
+		// Engagement factor (max -30 points)
+		avgEventsPerDay := float64(health.EventCount) / 30.0
+		if avgEventsPerDay < 1 {
+			healthScore -= 30
+		} else if avgEventsPerDay < 5 {
+			healthScore -= 20
+		} else if avgEventsPerDay < 10 {
+			healthScore -= 10
+		}
+
+		// Subscription status factor (max -30 points)
+		if health.SubscriptionStatus == "past_due" {
+			healthScore -= 30
+		} else if health.SubscriptionStatus == "canceled" {
+			healthScore -= 40
+		} else if health.SubscriptionStatus == "paused" {
+			healthScore -= 20
+		}
+
+		health.HealthScore = healthScore
+
+		// Determine risk category
+		if healthScore >= 80 {
+			health.RiskCategory = "healthy"
+		} else if healthScore >= 60 {
+			health.RiskCategory = "at_risk"
+		} else if healthScore >= 40 {
+			health.RiskCategory = "critical"
+		} else {
+			health.RiskCategory = "churn_imminent"
+		}
+
+		health.AtRisk = healthScore < 60
+
+		// Add detailed factors
+		health.Factors["activity_score"] = 100 - float64(health.DaysSinceLastActive)*2
+		health.Factors["engagement_score"] = avgEventsPerDay * 10
+		health.Factors["subscription_health"] = map[string]interface{}{
+			"status": health.SubscriptionStatus,
+			"mrr":    health.MRR,
+		}
+
+		healthScores = append(healthScores, *health)
+	}
+
+	// Sort by health score (ascending - most at risk first)
+	sort.Slice(healthScores, func(i, j int) bool {
+		return healthScores[i].HealthScore < healthScores[j].HealthScore
+	})
+
+	// Apply limit
+	if len(healthScores) > limit {
+		healthScores = healthScores[:limit]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": gin.H{
+			"users":       healthScores,
+			"total_users": len(userHealthMap),
+			"date_range": gin.H{
+				"start": startDate,
+				"end":   endDate,
+			},
+		},
+	})
+}
