@@ -210,9 +210,10 @@ func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Stripe API key updated successfully"})
 }
 
-// GetRevenueMetricsHandler returns live revenue metrics from Stripe
+// GetRevenueMetricsHandler returns live revenue metrics from Stripe with time series data
 func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
+	days := 30 // Default to 30 days for time series
 
 	// Check cache first
 	cacheKey := projectID + ":metrics"
@@ -241,7 +242,7 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 
 	log.Printf("📡 Fetching live Stripe metrics for project %s", projectID)
 
-	// Fetch live data from Stripe
+	// Fetch live summary metrics from Stripe
 	metrics, err := s.fetchLiveMetrics(sc)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -251,12 +252,45 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 		return
 	}
 
+	// Fetch daily revenue for time series graph
+	timeSeries, err := s.fetchDailyRevenue(sc, days)
+	if err != nil {
+		log.Printf("Warning: Failed to fetch daily revenue: %v", err)
+		timeSeries = []map[string]interface{}{} // Empty array on error
+	}
+
+	// Construct response with both summary metrics and time series
+	response := map[string]interface{}{
+		"mrr":                          metrics.MRR,
+		"arr":                          metrics.ARR,
+		"total_revenue":                metrics.TotalRevenue,
+		"active_subscriptions":         metrics.ActiveSubscriptions,
+		"canceled_subscriptions":       metrics.CanceledSubscriptions,
+		"past_due_subscriptions":       metrics.PastDueSubscriptions,
+		"trialing_subscriptions":       metrics.TrialingSubscriptions,
+		"total_customers":              metrics.TotalCustomers,
+		"active_customers":             metrics.ActiveCustomers,
+		"churn_rate":                   metrics.ChurnRate,
+		"arpu":                         metrics.ARPU,
+		"trial_to_pay_conversion_rate": metrics.TrialToPayConversionRate,
+		"last_updated":                 metrics.LastUpdated,
+		"time_series":                  timeSeries,
+		"date_range": map[string]string{
+			"start": time.Now().AddDate(0, 0, -days).Format("2006-01-02"),
+			"end":   time.Now().Format("2006-01-02"),
+		},
+		// Additional fields for dashboard compatibility
+		"growth_rate":           0.0, // Could be calculated with historical data
+		"new_subscriptions":     0,   // Could be calculated from subscription creation dates
+		"churned_subscriptions": metrics.CanceledSubscriptions,
+	}
+
 	// Cache the results
-	s.cache.set(cacheKey, metrics, StripeCacheTTL)
+	s.cache.set(cacheKey, response, StripeCacheTTL)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
-		"data":   metrics,
+		"data":   response,
 		"cached": false,
 	})
 }

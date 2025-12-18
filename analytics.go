@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,7 +77,8 @@ func (as *AnalyticsService) GetEventsHandler(c *gin.Context) {
 	eventType := c.Query("event_type")
 	limit := 100
 	if limitStr := c.Query("limit"); limitStr != "" {
-		if l, err := fmt.Sscanf(limitStr, "%d", &limit); err == nil && l > 0 {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
 			if limit > 1000 {
 				limit = 1000 // Cap at 1000 events
 			}

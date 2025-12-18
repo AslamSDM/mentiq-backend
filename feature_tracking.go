@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 
@@ -120,7 +119,7 @@ func (s *Server) getFeatureUsageHandler(c *gin.Context) {
 	oneDayAgo := now.Add(-24 * time.Hour)
 	oneWeekAgo := now.Add(-7 * 24 * time.Hour)
 	oneMonthAgo := now.Add(-30 * 24 * time.Hour)
-	fmt.Printf("events are 	%v\n", events)
+
 	for _, event := range events {
 		feature, ok := event.Properties["feature_name"].(string)
 		if !ok || feature == "" {
