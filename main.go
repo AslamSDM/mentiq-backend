@@ -195,6 +195,7 @@ type UpdateStripeApiKeyRequest struct {
 type JWTClaims struct {
 	AccountID string `json:"account_id"`
 	Email     string `json:"email"`
+	IsAdmin   bool   `json:"is_admin"`
 	ProjectID string `json:"project_id,omitempty"`
 	APIKeyID  string `json:"api_key_id,omitempty"`
 	Type      string `json:"type"` // "access" or "refresh"
@@ -203,7 +204,7 @@ type JWTClaims struct {
 }
 
 // GenerateJWT generates a JWT token for an account with HMAC-SHA256 signing
-func GenerateJWT(accountID, email, tokenType string, expiresInHours int) (string, error) {
+func GenerateJWT(accountID, email, tokenType string, isAdmin bool, expiresInHours int) (string, error) {
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		return "", fmt.Errorf("JWT_SECRET must be configured")
@@ -215,6 +216,7 @@ func GenerateJWT(accountID, email, tokenType string, expiresInHours int) (string
 	claims := JWTClaims{
 		AccountID: accountID,
 		Email:     email,
+		IsAdmin:   isAdmin,
 		Type:      tokenType,
 		Exp:       expiryTime,
 		Iat:       now,
@@ -589,6 +591,24 @@ func main() {
 		apiV1.GET("/projects/:project_id/features/usage", server.getFeatureUsageHandler)
 		apiV1.GET("/projects/:project_id/onboarding/stats", server.getOnboardingStatsHandler)
 		apiV1.GET("/projects/:project_id/users/:user_id/journey", server.getUserFeatureJourneyHandler)
+	}
+
+	// Admin routes - require admin authentication
+	adminAPI := router.Group("/api/v1/admin")
+	adminAPI.Use(server.authMiddleware)
+	adminAPI.Use(server.adminMiddleware)
+	{
+		adminAPI.GET("/accounts", server.adminListAccountsHandler)
+		adminAPI.GET("/accounts/:account_id", server.adminGetAccountHandler)
+		adminAPI.GET("/accounts/:account_id/projects", server.adminListAccountProjectsHandler)
+		adminAPI.GET("/accounts/:account_id/users", server.adminListAccountUsersHandler)
+		adminAPI.GET("/projects", server.adminListAllProjectsHandler)
+		adminAPI.GET("/events", server.adminListAllEventsHandler)
+		adminAPI.GET("/users/:user_id/data", server.adminGetUserDataHandler)
+		adminAPI.GET("/users/:user_id/projects", server.adminGetUserProjectsHandler)
+		adminAPI.GET("/users-with-projects", server.adminGetAllUsersWithProjectsHandler)
+		adminAPI.GET("/projects/:project_id/data", server.adminGetProjectDataHandler)
+		adminAPI.PUT("/accounts/:account_id/admin", server.adminToggleAdminHandler)
 	}
 
 	// Setup graceful shutdown
@@ -1618,13 +1638,13 @@ func (s *Server) loginHandler(c *gin.Context) {
 	}
 
 	// Generate access token (1 hour expiration) and refresh token (7 days expiration)
-	accessToken, err := GenerateJWT(account.ID, account.Email, "access", 1)
+	accessToken, err := GenerateJWT(account.ID, account.Email, "access", account.IsAdmin, 1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
 		return
 	}
 
-	refreshToken, err := GenerateJWT(account.ID, account.Email, "refresh", 24*7)
+	refreshToken, err := GenerateJWT(account.ID, account.Email, "refresh", account.IsAdmin, 24*7)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
 		return
@@ -1651,15 +1671,30 @@ func (s *Server) loginHandler(c *gin.Context) {
 		projectID = projects[0].ID
 	}
 
+	// Check subscription status
+	var subscription AccountSubscription
+	hasActiveSubscription := false
+	subscriptionStatus := "none"
+	if err := s.db.Where("account_id = ?", account.ID).First(&subscription).Error; err == nil {
+		subscriptionStatus = subscription.Status
+		// Consider active, trialing, or developer tier as having subscription
+		if subscription.Status == "active" || subscription.Status == "trialing" || subscription.Tier == "developer" {
+			hasActiveSubscription = true
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"accessToken":  accessToken,
 		"refreshToken": refreshToken,
 		"expiresIn":    3600, // 1 hour in seconds
 		"projectId":    projectID,
 		"user": gin.H{
-			"id":    account.ID,
-			"name":  account.Name,
-			"email": account.Email,
+			"id":                    account.ID,
+			"name":                  account.Name,
+			"email":                 account.Email,
+			"isAdmin":               account.IsAdmin,
+			"hasActiveSubscription": hasActiveSubscription,
+			"subscriptionStatus":    subscriptionStatus,
 		},
 	})
 }
@@ -1692,9 +1727,32 @@ func (s *Server) authMiddleware(c *gin.Context) {
 			project = &proj
 			s.setCachedProject(project)
 		}
+
+		// Check if this account is an admin (check cache first)
+		isAdmin := false
+		if cachedAccount, found := s.getCachedAccount(project.AccountID); found {
+			isAdmin = cachedAccount.IsAdmin
+		} else {
+			var acc Account
+			if err := s.db.Where("id = ?", project.AccountID).First(&acc).Error; err == nil {
+				isAdmin = acc.IsAdmin
+				s.setCachedAccount(&acc)
+			}
+		}
+
+		if isAdmin {
+			c.Set("is_admin", true)
+		}
+
 		c.Set("account_id", project.AccountID)
-		c.Set("project_id", cachedKey.ProjectID)
 		c.Set("api_key_id", cachedKey.ID)
+
+		// If admin and X-Project-ID header is provided, allow access to that project
+		if isAdmin && projectID != "" {
+			c.Set("project_id", projectID)
+		} else {
+			c.Set("project_id", cachedKey.ProjectID)
+		}
 		c.Next()
 		return
 	}
@@ -1716,9 +1774,32 @@ func (s *Server) authMiddleware(c *gin.Context) {
 			}
 			s.setCachedProject(&project)
 		}
+
+		// Check if this account is an admin (check cache first)
+		isAdmin := false
+		if cachedAccount, found := s.getCachedAccount(project.AccountID); found {
+			isAdmin = cachedAccount.IsAdmin
+		} else {
+			var account Account
+			if err := s.db.Where("id = ?", project.AccountID).First(&account).Error; err == nil {
+				isAdmin = account.IsAdmin
+				s.setCachedAccount(&account)
+			}
+		}
+
+		if isAdmin {
+			c.Set("is_admin", true)
+		}
+
 		c.Set("account_id", project.AccountID)
-		c.Set("project_id", apiKey.ProjectID)
 		c.Set("api_key_id", apiKey.ID)
+
+		// If admin and X-Project-ID header is provided, allow access to that project
+		if isAdmin && projectID != "" {
+			c.Set("project_id", projectID)
+		} else {
+			c.Set("project_id", apiKey.ProjectID)
+		}
 		c.Next()
 		return
 	}
@@ -1729,7 +1810,30 @@ func (s *Server) authMiddleware(c *gin.Context) {
 		// Valid JWT token
 		c.Set("account_id", claims.AccountID)
 		c.Set("email", claims.Email)
-		if projectID != "" {
+
+		// Verify admin status (check cache first, then database)
+		isAdmin := false
+		if cachedAccount, found := s.getCachedAccount(claims.AccountID); found {
+			isAdmin = cachedAccount.IsAdmin
+		} else {
+			var account Account
+			if err := s.db.Where("id = ?", claims.AccountID).First(&account).Error; err == nil {
+				isAdmin = account.IsAdmin
+				s.setCachedAccount(&account)
+			} else {
+				// Fallback to JWT claim if account not found
+				isAdmin = claims.IsAdmin
+			}
+		}
+
+		if isAdmin {
+			c.Set("is_admin", true)
+		}
+
+		// If admin and X-Project-ID header is provided, allow access to that project
+		if isAdmin && projectID != "" {
+			c.Set("project_id", projectID)
+		} else if projectID != "" {
 			c.Set("project_id", projectID)
 		}
 		c.Next()
@@ -1746,6 +1850,16 @@ func (s *Server) authMiddleware(c *gin.Context) {
 	c.Set("account_id", account.ID)
 	c.Set("email", account.Email)
 	c.Set("project_id", projectID)
+	c.Next()
+}
+
+// adminMiddleware checks if the authenticated user is an admin
+func (s *Server) adminMiddleware(c *gin.Context) {
+	isAdmin, exists := c.Get("is_admin")
+	if !exists || !isAdmin.(bool) {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+		return
+	}
 	c.Next()
 }
 
@@ -1957,14 +2071,14 @@ func (s *Server) refreshTokenHandler(c *gin.Context) {
 	}
 
 	// Generate new access token
-	newAccessToken, err := GenerateJWT(claims.AccountID, claims.Email, "access", 1)
+	newAccessToken, err := GenerateJWT(claims.AccountID, claims.Email, "access", claims.IsAdmin, 1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
 		return
 	}
 
 	// Optionally generate new refresh token (refresh token rotation)
-	newRefreshToken, err := GenerateJWT(claims.AccountID, claims.Email, "refresh", 24*7)
+	newRefreshToken, err := GenerateJWT(claims.AccountID, claims.Email, "refresh", claims.IsAdmin, 24*7)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
 		return
@@ -2204,5 +2318,440 @@ func (s *Server) dashboardHandler(c *gin.Context) {
 			"totalApiKeys":  apiKeyCount,
 			"activeUsers":   234, // Mock data for now
 		},
+	})
+}
+
+// Admin Handlers
+
+// adminListAccountsHandler lists all accounts (admin only)
+func (s *Server) adminListAccountsHandler(c *gin.Context) {
+	var accounts []Account
+	if err := s.db.Find(&accounts).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch accounts"})
+		return
+	}
+
+	// Don't expose passwords in response - initialize to empty slice to return [] instead of null
+	response := make([]gin.H, 0, len(accounts))
+	for _, account := range accounts {
+		response = append(response, gin.H{
+			"id":               account.ID,
+			"name":             account.Name,
+			"email":            account.Email,
+			"isAdmin":          account.IsAdmin,
+			"stripeCustomerId": account.StripeCustomerID,
+			"createdAt":        account.CreatedAt,
+			"updatedAt":        account.UpdatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// adminGetAccountHandler gets a specific account (admin only)
+func (s *Server) adminGetAccountHandler(c *gin.Context) {
+	accountID := c.Param("account_id")
+
+	var account Account
+	if err := s.db.Where("id = ?", accountID).First(&account).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Account not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":               account.ID,
+		"name":             account.Name,
+		"email":            account.Email,
+		"isAdmin":          account.IsAdmin,
+		"stripeCustomerId": account.StripeCustomerID,
+		"createdAt":        account.CreatedAt,
+		"updatedAt":        account.UpdatedAt,
+	})
+}
+
+// adminListAccountProjectsHandler lists all projects for a specific account (admin only)
+func (s *Server) adminListAccountProjectsHandler(c *gin.Context) {
+	accountID := c.Param("account_id")
+
+	var projects []Project
+	if err := s.db.Where("account_id = ?", accountID).Find(&projects).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch projects"})
+		return
+	}
+
+	response := make([]gin.H, 0, len(projects))
+	for _, project := range projects {
+		response = append(response, gin.H{
+			"id":        project.ID,
+			"name":      project.Name,
+			"accountId": project.AccountID,
+			"createdAt": project.CreatedAt,
+			"updatedAt": project.UpdatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// adminListAccountUsersHandler lists all users for a specific account (admin only)
+// In this system, each account IS a user, so we return the account itself
+func (s *Server) adminListAccountUsersHandler(c *gin.Context) {
+	accountID := c.Param("account_id")
+
+	var account Account
+	if err := s.db.Where("id = ?", accountID).First(&account).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch account"})
+		return
+	}
+
+	// Return the account as a user (account = user in this system)
+	response := []gin.H{
+		{
+			"id":         account.ID,
+			"email":      account.Email,
+			"account_id": account.ID,
+			"created_at": account.CreatedAt,
+			"updated_at": account.UpdatedAt,
+		},
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// adminListAllProjectsHandler lists all projects across all accounts (admin only)
+func (s *Server) adminListAllProjectsHandler(c *gin.Context) {
+	var projects []Project
+	if err := s.db.Preload("Account").Find(&projects).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch projects"})
+		return
+	}
+
+	response := make([]gin.H, 0, len(projects))
+	for _, project := range projects {
+		response = append(response, gin.H{
+			"id":        project.ID,
+			"name":      project.Name,
+			"accountId": project.AccountID,
+			"account": gin.H{
+				"id":    project.Account.ID,
+				"name":  project.Account.Name,
+				"email": project.Account.Email,
+			},
+			"createdAt": project.CreatedAt,
+			"updatedAt": project.UpdatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// adminListAllEventsHandler lists events with pagination (admin only)
+func (s *Server) adminListAllEventsHandler(c *gin.Context) {
+	// Get pagination parameters
+	limit := 100
+	offset := 0
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if offsetStr := c.Query("offset"); offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
+	// Optional filters
+	accountID := c.Query("account_id")
+	projectID := c.Query("project_id")
+	eventType := c.Query("event_type")
+
+	query := s.db.Model(&Event{})
+	if accountID != "" {
+		query = query.Where("account_id = ?", accountID)
+	}
+	if projectID != "" {
+		query = query.Where("project_id = ?", projectID)
+	}
+	if eventType != "" {
+		query = query.Where("event_type = ?", eventType)
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count events"})
+		return
+	}
+
+	var events []Event
+	if err := query.Order("timestamp DESC").Limit(limit).Offset(offset).Find(&events).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"events": events,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// adminToggleAdminHandler toggles admin status for an account (admin only)
+func (s *Server) adminToggleAdminHandler(c *gin.Context) {
+	accountID := c.Param("account_id")
+
+	type ToggleAdminRequest struct {
+		IsAdmin bool `json:"is_admin"`
+	}
+
+	var req ToggleAdminRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var account Account
+	if err := s.db.Where("id = ?", accountID).First(&account).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Account not found"})
+		return
+	}
+
+	// Update admin status
+	if err := s.db.Model(&account).Update("is_admin", req.IsAdmin).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update admin status"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":      account.ID,
+		"email":   account.Email,
+		"isAdmin": req.IsAdmin,
+		"message": "Admin status updated successfully",
+	})
+}
+
+// adminGetUserDataHandler gets all data for a specific user (admin only)
+func (s *Server) adminGetUserDataHandler(c *gin.Context) {
+	userID := c.Param("user_id")
+
+	// Get user events
+	var events []Event
+	if err := s.db.Where("user_id = ?", userID).Order("timestamp DESC").Limit(100).Find(&events).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch user events"})
+		return
+	}
+
+	// Get user info from events (assuming user_id is tracked)
+	var eventCount int64
+	s.db.Model(&Event{}).Where("user_id = ?", userID).Count(&eventCount)
+
+	// Get unique sessions
+	var sessions []struct {
+		SessionID string
+		Count     int64
+	}
+	s.db.Model(&Event{}).
+		Select("session_id, COUNT(*) as count").
+		Where("user_id = ? AND session_id IS NOT NULL AND session_id != ''", userID).
+		Group("session_id").
+		Find(&sessions)
+
+	// Get event types breakdown
+	var eventTypes []struct {
+		EventType string
+		Count     int64
+	}
+	s.db.Model(&Event{}).
+		Select("event_type, COUNT(*) as count").
+		Where("user_id = ?", userID).
+		Group("event_type").
+		Order("count DESC").
+		Find(&eventTypes)
+
+	c.JSON(http.StatusOK, gin.H{
+		"userId":         userID,
+		"totalEvents":    eventCount,
+		"totalSessions":  len(sessions),
+		"recentEvents":   events,
+		"sessions":       sessions,
+		"eventBreakdown": eventTypes,
+	})
+}
+
+// adminGetUserProjectsHandler gets all projects for a specific user/account (admin only)
+func (s *Server) adminGetUserProjectsHandler(c *gin.Context) {
+	userID := c.Param("user_id")
+
+	// user_id is actually account_id in our system
+	var projects []Project
+	if err := s.db.Where("account_id = ?", userID).Find(&projects).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch user projects"})
+		return
+	}
+
+	c.JSON(http.StatusOK, projects)
+}
+
+// adminGetAllUsersWithProjectsHandler gets all users with their projects in a single efficient call (admin only)
+func (s *Server) adminGetAllUsersWithProjectsHandler(c *gin.Context) {
+	// Get all accounts
+	var accounts []Account
+	if err := s.db.Find(&accounts).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch accounts"})
+		return
+	}
+
+	// Get all projects
+	var allProjects []Project
+	if err := s.db.Find(&allProjects).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch projects"})
+		return
+	}
+
+	// Group projects by account_id
+	projectsByAccount := make(map[string][]Project)
+	for _, project := range allProjects {
+		projectsByAccount[project.AccountID] = append(projectsByAccount[project.AccountID], project)
+	}
+
+	// Build response with users and their projects
+	type UserWithProjects struct {
+		ID        string    `json:"id"`
+		Email     string    `json:"email"`
+		AccountID string    `json:"account_id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Projects  []Project `json:"projects"`
+	}
+
+	response := make([]UserWithProjects, 0, len(accounts))
+	for _, account := range accounts {
+		projects := projectsByAccount[account.ID]
+		if projects == nil {
+			projects = []Project{}
+		}
+		response = append(response, UserWithProjects{
+			ID:        account.ID,
+			Email:     account.Email,
+			AccountID: account.ID,
+			CreatedAt: account.CreatedAt,
+			UpdatedAt: account.UpdatedAt,
+			Projects:  projects,
+		})
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// adminGetProjectDataHandler gets detailed analytics data for a specific project (admin only)
+func (s *Server) adminGetProjectDataHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	// Get project info
+	var project Project
+	if err := s.db.Where("id = ?", projectID).First(&project).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	// Get date range from query params (default to last 30 days)
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	if startDate == "" {
+		startDate = time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+	}
+	if endDate == "" {
+		endDate = time.Now().Format("2006-01-02")
+	}
+
+	// Get events for this project
+	var events []Event
+	if err := s.db.Where("project_id = ? AND timestamp >= ? AND timestamp <= ?",
+		projectID, startDate+" 00:00:00", endDate+" 23:59:59").
+		Order("timestamp DESC").Limit(1000).Find(&events).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch project events"})
+		return
+	}
+
+	// Calculate metrics
+	totalEvents := len(events)
+	uniqueUsers := make(map[string]bool)
+	uniqueSessions := make(map[string]bool)
+	eventTypeMap := make(map[string]int)
+	deviceMap := make(map[string]int)
+	browserMap := make(map[string]int)
+	countryMap := make(map[string]int)
+
+	for _, event := range events {
+		if event.UserID != "" {
+			uniqueUsers[event.UserID] = true
+		}
+		if event.SessionID != "" {
+			uniqueSessions[event.SessionID] = true
+		}
+		eventTypeMap[event.EventType]++
+		if event.Device != "" {
+			deviceMap[event.Device]++
+		}
+		if event.Browser != "" {
+			browserMap[event.Browser]++
+		}
+		if event.Country != "" {
+			countryMap[event.Country]++
+		}
+	}
+
+	// Convert maps to arrays
+	var eventBreakdown []map[string]interface{}
+	for eventType, count := range eventTypeMap {
+		eventBreakdown = append(eventBreakdown, map[string]interface{}{
+			"event_type": eventType,
+			"count":      count,
+		})
+	}
+
+	var deviceBreakdown []map[string]interface{}
+	for device, count := range deviceMap {
+		deviceBreakdown = append(deviceBreakdown, map[string]interface{}{
+			"device": device,
+			"count":  count,
+		})
+	}
+
+	var browserBreakdown []map[string]interface{}
+	for browser, count := range browserMap {
+		browserBreakdown = append(browserBreakdown, map[string]interface{}{
+			"browser": browser,
+			"count":   count,
+		})
+	}
+
+	var countryBreakdown []map[string]interface{}
+	for country, count := range countryMap {
+		countryBreakdown = append(countryBreakdown, map[string]interface{}{
+			"country": country,
+			"count":   count,
+		})
+	}
+
+	// Get recent events (limit to 50)
+	recentEventsLimit := 50
+	if len(events) < recentEventsLimit {
+		recentEventsLimit = len(events)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"project":           project,
+		"total_events":      totalEvents,
+		"unique_users":      len(uniqueUsers),
+		"unique_sessions":   len(uniqueSessions),
+		"event_breakdown":   eventBreakdown,
+		"device_breakdown":  deviceBreakdown,
+		"browser_breakdown": browserBreakdown,
+		"country_breakdown": countryBreakdown,
+		"recent_events":     events[:recentEventsLimit],
+		"start_date":        startDate,
+		"end_date":          endDate,
 	})
 }
