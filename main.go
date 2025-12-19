@@ -548,6 +548,13 @@ func main() {
 		apiV1.DELETE("/projects/:project_id/apikeys/:key_id", server.deleteApiKeyHandler)
 		apiV1.PUT("/projects/:project_id/stripe-key", server.updateProjectStripeApiKeyHandler)
 
+		// Project Member management
+		apiV1.POST("/projects/:id/members", server.addProjectMemberHandler)
+		apiV1.GET("/projects/:id/members", server.listProjectMembersHandler)
+		apiV1.PUT("/projects/:id/members/:member_id", server.updateProjectMemberHandler)
+		apiV1.DELETE("/projects/:id/members/:member_id", server.removeProjectMemberHandler)
+		apiV1.GET("/users/:user_id/projects", server.getUserProjectsHandler)
+
 		// Stripe Revenue Analytics routes
 		apiV1.POST("/projects/:project_id/stripe/sync", server.stripeService.SyncStripeDataHandler)
 		apiV1.GET("/projects/:project_id/stripe/metrics", server.stripeService.GetRevenueMetricsHandler)

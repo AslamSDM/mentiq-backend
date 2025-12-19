@@ -4,12 +4,12 @@ import (
 	"time"
 )
 
-// Account represents a user account
+// Account represents an organization/company account (main billing entity)
 type Account struct {
 	ID        string    `gorm:"primaryKey" json:"id"`
-	Name      string    `json:"name"`
-	Email     string    `gorm:"uniqueIndex" json:"email"`
-	Password  string    `json:"password"`
+	Name      string    `json:"name"` // Company/Organization name
+	Email     string    `gorm:"uniqueIndex" json:"email"` // Primary contact email
+	Password  string    `json:"-"` // Keep for backward compatibility during migration
 	IsAdmin   bool      `gorm:"default:false" json:"is_admin"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -23,34 +23,60 @@ type Account struct {
 	AccountSubscription *AccountSubscription `gorm:"foreignKey:AccountID" json:"subscription,omitempty"`
 }
 
-// User represents a user in an account
+// User represents an individual team member within an account
 type User struct {
 	ID        string    `gorm:"primaryKey" json:"id"`
 	Email     string    `gorm:"uniqueIndex" json:"email"`
 	Password  string    `json:"-"` // Don't expose password in JSON
+	FullName  string    `json:"full_name"`
+	Role      string    `json:"role" gorm:"default:'member'"` // owner, admin, member, viewer
+	IsActive  bool      `gorm:"default:true" json:"is_active"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
 	// Foreign keys
-	AccountID string  `json:"account_id"`
+	AccountID string  `json:"account_id" gorm:"index"`
 	Account   Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+
+	// Relations
+	ProjectMemberships []ProjectMember `gorm:"foreignKey:UserID" json:"project_memberships,omitempty"`
 }
 
-// Project represents a project
+// ProjectMember represents a user's membership and permissions in a specific project
+type ProjectMember struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	ProjectID string    `json:"project_id" gorm:"index"`
+	UserID    string    `json:"user_id" gorm:"index"`
+	Role      string    `json:"role" gorm:"default:'member'"` // owner, admin, member, viewer
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	// Relations
+	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+	User    User    `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"`
+}
+
+func (ProjectMember) TableName() string {
+	return "project_members"
+}
+
+// Project represents a project within an account
 type Project struct {
 	ID           string    `gorm:"primaryKey" json:"id"`
 	Name         string    `json:"name"`
+	Description  string    `json:"description"`
 	StripeAPIKey string    `json:"-" gorm:"column:stripe_api_key"` // Don't expose in JSON for security
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 
 	// Foreign keys
-	AccountID string  `json:"account_id"`
+	AccountID string  `json:"account_id" gorm:"index"`
 	Account   Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
 
 	// Relations
-	APIKeys     []APIKey     `gorm:"foreignKey:ProjectID" json:"api_keys,omitempty"`
-	Experiments []Experiment `gorm:"foreignKey:ProjectID" json:"experiments,omitempty"`
+	APIKeys     []APIKey        `gorm:"foreignKey:ProjectID" json:"api_keys,omitempty"`
+	Experiments []Experiment    `gorm:"foreignKey:ProjectID" json:"experiments,omitempty"`
+	Members     []ProjectMember `gorm:"foreignKey:ProjectID" json:"members,omitempty"`
 }
 
 // APIKey represents an API key for a project

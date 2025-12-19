@@ -23,6 +23,7 @@ func MigrateDB(db *gorm.DB) error {
 	err := db.AutoMigrate(
 		&Account{},
 		&User{},
+		&ProjectMember{},
 		&Project{},
 		&APIKey{},
 		&Experiment{},
