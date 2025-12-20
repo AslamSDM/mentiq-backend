@@ -585,3 +585,32 @@ type ChurnAnalytics struct {
 	// Relations
 	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
 }
+
+// OnboardingStatus tracks the onboarding progress for an account
+type OnboardingStatus struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	AccountID string    `gorm:"uniqueIndex" json:"account_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	// Onboarding steps
+	DataConnectionShown bool       `gorm:"default:false" json:"data_connection_shown"` // Ready to connect? screen shown
+	DataConnected       bool       `gorm:"default:false" json:"data_connected"`        // User chose "Yes" or uploaded data
+	PlatformSelected    string     `json:"platform_selected"`                          // web, mobile, etc.
+	SDKInstalled        bool       `gorm:"default:false" json:"sdk_installed"`         // SDK integration completed
+	FirstEventTracked   bool       `gorm:"default:false" json:"first_event_tracked"`   // First user event received
+	StripeConnected     bool       `gorm:"default:false" json:"stripe_connected"`      // Stripe API key added
+	TeamMembersInvited  bool       `gorm:"default:false" json:"team_members_invited"`  // At least one team member invited
+	OnboardingComplete  bool       `gorm:"default:false" json:"onboarding_complete"`   // All tasks completed
+	CompletedAt         *time.Time `json:"completed_at"`
+
+	// Timestamps for each step
+	DataConnectedAt      *time.Time `json:"data_connected_at"`
+	SDKInstalledAt       *time.Time `json:"sdk_installed_at"`
+	FirstEventTrackedAt  *time.Time `json:"first_event_tracked_at"`
+	StripeConnectedAt    *time.Time `json:"stripe_connected_at"`
+	TeamMembersInvitedAt *time.Time `json:"team_members_invited_at"`
+
+	// Relations
+	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+}

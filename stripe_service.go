@@ -137,10 +137,13 @@ type StripeSubscriptionInfo struct {
 }
 
 // getStripeClient returns a Stripe client for the project
-func (s *StripeService) getStripeClient(projectID string) (*client.API, error) {
+// SECURITY: Validates that the project belongs to the specified account
+func (s *StripeService) getStripeClient(projectID, accountID string) (*client.API, error) {
 	var project Project
-	if err := s.db.Where("id = ?", projectID).First(&project).Error; err != nil {
-		return nil, fmt.Errorf("project not found")
+	// SECURITY: Validate project belongs to the authenticated account
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Stripe access attempt - Account: %s, Project: %s - project not found or access denied", accountID, projectID)
+		return nil, fmt.Errorf("project not found or access denied")
 	}
 
 	if project.StripeAPIKey == "" {
@@ -160,8 +163,23 @@ type UpdateStripeAPIKeyRequest struct {
 // UpdateStripeAPIKeyHandler updates the Stripe API key for a project
 func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
-	var req UpdateStripeAPIKeyRequest
 
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// SECURITY: Validate project belongs to this account BEFORE any updates
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Unauthorized Stripe API key update attempt - Account: %s, Project: %s", accountID, projectID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+		return
+	}
+
+	var req UpdateStripeAPIKeyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -198,8 +216,8 @@ func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 		return
 	}
 
-	// Update project with Stripe API key
-	if err := s.db.Model(&Project{}).Where("id = ?", projectID).Update("stripe_api_key", req.ApiKey).Error; err != nil {
+	// Update project with Stripe API key - SECURITY: Already validated ownership above
+	if err := s.db.Model(&Project{}).Where("id = ? AND account_id = ?", projectID, accountID.(string)).Update("stripe_api_key", req.ApiKey).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update Stripe API key"})
 		return
 	}
@@ -215,6 +233,13 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	days := 30 // Default to 30 days for time series
 
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Check cache first
 	cacheKey := projectID + ":metrics"
 	if cached, ok := s.cache.get(cacheKey); ok {
@@ -227,8 +252,8 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 		return
 	}
 
-	// Get Stripe client
-	sc, err := s.getStripeClient(projectID)
+	// Get Stripe client - SECURITY: validates project ownership
+	sc, err := s.getStripeClient(projectID, accountID.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"status": "error",
@@ -425,6 +450,13 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 func (s *StripeService) GetCustomersHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Check cache
 	cacheKey := projectID + ":customers"
 	if cached, ok := s.cache.get(cacheKey); ok {
@@ -437,7 +469,8 @@ func (s *StripeService) GetCustomersHandler(c *gin.Context) {
 		return
 	}
 
-	sc, err := s.getStripeClient(projectID)
+	// SECURITY: validates project ownership
+	sc, err := s.getStripeClient(projectID, accountID.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
 		return
@@ -548,6 +581,13 @@ func (s *StripeService) GetSubscriptionsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	status := c.DefaultQuery("status", "") // Optional filter
 
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Check cache
 	cacheKey := projectID + ":subscriptions:" + status
 	if cached, ok := s.cache.get(cacheKey); ok {
@@ -560,7 +600,8 @@ func (s *StripeService) GetSubscriptionsHandler(c *gin.Context) {
 		return
 	}
 
-	sc, err := s.getStripeClient(projectID)
+	// SECURITY: validates project ownership
+	sc, err := s.getStripeClient(projectID, accountID.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
 		return
@@ -647,6 +688,13 @@ func (s *StripeService) GetRevenueAnalyticsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	days := 30 // Default to 30 days
 
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Check cache
 	cacheKey := fmt.Sprintf("%s:analytics:%d", projectID, days)
 	if cached, ok := s.cache.get(cacheKey); ok {
@@ -659,7 +707,8 @@ func (s *StripeService) GetRevenueAnalyticsHandler(c *gin.Context) {
 		return
 	}
 
-	sc, err := s.getStripeClient(projectID)
+	// SECURITY: validates project ownership
+	sc, err := s.getStripeClient(projectID, accountID.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
 		return
@@ -747,6 +796,13 @@ func (s *StripeService) fetchDailyRevenue(sc *client.API, days int) ([]map[strin
 func (s *StripeService) GetCustomerAnalyticsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
 	// Check cache
 	cacheKey := projectID + ":customer_analytics"
 	if cached, ok := s.cache.get(cacheKey); ok {
@@ -759,7 +815,8 @@ func (s *StripeService) GetCustomerAnalyticsHandler(c *gin.Context) {
 		return
 	}
 
-	sc, err := s.getStripeClient(projectID)
+	// SECURITY: validates project ownership
+	sc, err := s.getStripeClient(projectID, accountID.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
 		return
@@ -825,6 +882,21 @@ func (s *StripeService) GetCustomerAnalyticsHandler(c *gin.Context) {
 func (s *StripeService) RefreshCacheHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// SECURITY: Validate project belongs to this account
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Unauthorized cache refresh attempt - Account: %s, Project: %s", accountID, projectID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+		return
+	}
+
 	// Invalidate all caches for this project
 	s.cache.invalidateProject(projectID)
 
@@ -839,8 +911,15 @@ func (s *StripeService) RefreshCacheHandler(c *gin.Context) {
 func (s *StripeService) SyncStripeDataHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	// Verify project has Stripe API key configured
-	sc, err := s.getStripeClient(projectID)
+	// SECURITY: Get and validate account ID
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// SECURITY: validates project ownership
+	sc, err := s.getStripeClient(projectID, accountID.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
