@@ -483,6 +483,9 @@ func main() {
 	}
 	defer server.Disconnect()
 
+	// Initialize webhook secret
+	InitWebhookSecret()
+
 	// Setup Gin router
 	router := gin.Default()
 
@@ -500,6 +503,13 @@ func main() {
 	router.POST("/refresh", server.refreshTokenHandler)
 	router.GET("/health", healthCheckHandler)
 
+	// Webhook routes (no authentication - secured by signature validation)
+	webhookRoutes := router.Group("/webhook")
+	{
+		webhookRoutes.POST("/subscription", server.webhookSubscriptionHandler)
+		webhookRoutes.POST("/payment", server.webhookPaymentHandler)
+	}
+
 	// Serve static dashboard
 	router.Static("/static", "./")
 	router.GET("/", func(c *gin.Context) {
@@ -511,6 +521,9 @@ func main() {
 
 	apiV1.Use(server.authMiddleware) // Apply auth middleware to all v1 routes
 	{
+		// User endpoints
+		apiV1.GET("/me", server.getMeHandler)
+
 		apiV1.POST("/events", server.analyticsService.ingestEventHandler)
 		apiV1.POST("/events/batch", server.analyticsService.batchIngestHandler)
 		apiV1.GET("/analytics", server.analyticsService.GetAnalyticsHandler)
@@ -535,6 +548,12 @@ func main() {
 		// Heatmap routes (GET only - POST goes through /events endpoint)
 		apiV1.GET("/projects/:project_id/heatmaps", server.analyticsService.GetHeatmapHandler)
 		apiV1.GET("/projects/:project_id/heatmaps/pages", server.getHeatmapPagesHandler)
+
+		// Onboarding routes
+		apiV1.GET("/onboarding/status", server.getOnboardingStatusHandler)
+		apiV1.PUT("/onboarding/status", server.updateOnboardingStatusHandler)
+		apiV1.POST("/onboarding/tasks/:task/complete", server.markTaskCompleteHandler)
+		apiV1.GET("/onboarding/tasks", server.getOnboardingTasksHandler)
 
 		// Project and API Key management
 		apiV1.POST("/projects", server.createProjectHandler)
@@ -598,6 +617,13 @@ func main() {
 		apiV1.GET("/projects/:project_id/features/usage", server.getFeatureUsageHandler)
 		apiV1.GET("/projects/:project_id/onboarding/stats", server.getOnboardingStatsHandler)
 		apiV1.GET("/projects/:project_id/users/:user_id/journey", server.getUserFeatureJourneyHandler)
+	}
+
+	// Test/Debug routes - No authentication (disable in production!)
+	testAPI := router.Group("/api/v1/test")
+	{
+		testAPI.GET("/recordings", server.testListAllRecordingsHandler)
+		testAPI.GET("/recordings/:session_id", server.testGetRecordingBySessionHandler)
 	}
 
 	// Admin routes - require admin authentication
@@ -943,7 +969,21 @@ func (s *Server) updateProjectStripeApiKeyHandler(c *gin.Context) {
 
 	projectID := c.Param("project_id")
 
-	if err := s.db.Model(&Project{}).Where("id = ?", projectID).Update("stripe_api_key", req.ApiKey).Error; err != nil {
+	// SECURITY: Validate project belongs to authenticated account
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Unauthorized Stripe key update attempt - Account: %s, Project: %s", accountID, projectID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+		return
+	}
+
+	if err := s.db.Model(&Project{}).Where("id = ? AND account_id = ?", projectID, accountID.(string)).Update("stripe_api_key", req.ApiKey).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update Stripe API key"})
 		return
 	}
@@ -960,12 +1000,14 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 
 	// Parse request body
 	var recordingData struct {
-		Events    json.RawMessage `json:"events"`
-		Duration  int             `json:"duration"`
-		StartURL  string          `json:"start_url"`
-		AccountID string          `json:"account_id"`
-		ProjectID string          `json:"project_id"`
-		UserID    *string         `json:"user_id"`
+		Events      json.RawMessage `json:"events"`
+		Duration    int             `json:"duration"`
+		StartURL    string          `json:"start_url"`
+		AccountID   string          `json:"account_id"`
+		ProjectID   string          `json:"project_id"`
+		UserID      *string         `json:"user_id"`
+		IsFinal     bool            `json:"is_final"`
+		EventOffset int             `json:"event_offset"`
 	}
 
 	if err := c.ShouldBindJSON(&recordingData); err != nil {
@@ -1002,8 +1044,10 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 	var eventsJSON []byte
 	var err error
 
-	// Try to upload to S3/R2 if configured
-	if s.sessionStorage != nil {
+	// Determine storage strategy
+	useS3Storage := s.sessionStorage != nil
+	if useS3Storage {
+		// Upload to S3/R2 - returns base path for all chunks
 		storagePath, err = s.sessionStorage.UploadRecording(
 			sessionID,
 			recordingData.ProjectID,
@@ -1013,8 +1057,9 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 		if err != nil {
 			log.Printf("Failed to upload recording to S3: %v. Falling back to DB storage.", err)
 			// Fall back to DB storage
+			useS3Storage = false
 			eventsJSON = recordingData.Events
-			storagePath = "" // Empty storage path means data is in RecordingData field
+			storagePath = ""
 		}
 	} else {
 		// No S3 configured, store in DB
@@ -1049,14 +1094,59 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 	err = s.db.Where("session_id = ? AND project_id = ?", sessionID, recordingData.ProjectID).First(&existingRecording).Error
 
 	if err == nil {
-		// Update existing recording
+		// Update existing recording - APPEND events instead of replacing
 		recording.ID = existingRecording.ID
 		recording.CreatedAt = existingRecording.CreatedAt
+
+		// Append new events to existing events
+		if useS3Storage {
+			// S3 storage - chunks are uploaded separately, just update count and keep base path
+			recording.EventCount = existingRecording.EventCount + eventCount
+			// Keep the same storage path (base path for all chunks)
+			recording.StoragePath = existingRecording.StoragePath
+			recording.RecordingData = nil // No data in DB when using S3
+		} else if len(existingRecording.RecordingData) > 0 {
+			// DB storage - append events
+			var existingEvents []interface{}
+			var newEvents []interface{}
+
+			if err := json.Unmarshal(existingRecording.RecordingData, &existingEvents); err == nil {
+				if err := json.Unmarshal(recordingData.Events, &newEvents); err == nil {
+					// Combine events
+					allEvents := append(existingEvents, newEvents...)
+					combinedJSON, err := json.Marshal(allEvents)
+					if err == nil {
+						recording.RecordingData = combinedJSON
+						recording.EventCount = len(allEvents)
+					} else {
+						log.Printf("Failed to marshal combined events: %v", err)
+					}
+				} else {
+					log.Printf("Failed to unmarshal new events: %v", err)
+				}
+			} else {
+				log.Printf("Failed to unmarshal existing events: %v", err)
+			}
+		} else {
+			// First upload to DB storage
+			recording.EventCount = eventCount
+		}
+
+		// Update duration to the maximum (SDK sends cumulative duration)
+		if recordingData.Duration > existingRecording.Duration {
+			recording.Duration = recordingData.Duration
+		} else {
+			recording.Duration = existingRecording.Duration
+		}
+
 		if err := s.db.Save(&recording).Error; err != nil {
 			log.Printf("Failed to update recording: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save recording"})
 			return
 		}
+
+		log.Printf("Appended %d events to existing recording %s (total: %d events, duration: %ds)",
+			eventCount, recording.ID, recording.EventCount, recording.Duration)
 	} else {
 		// Create new recording
 		if err := s.db.Create(&recording).Error; err != nil {
@@ -1064,6 +1154,8 @@ func (s *Server) ingestRecordingHandler(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save recording"})
 			return
 		}
+		log.Printf("Created new recording %s with %d events (duration: %ds)",
+			recording.ID, recording.EventCount, recording.Duration)
 	}
 
 	storageType := "S3/R2"
@@ -1083,6 +1175,19 @@ func (s *Server) listRecordingsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	if projectID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id is required"})
+		return
+	}
+
+	// SECURITY: Validate project belongs to authenticated account
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Unauthorized recordings access - Account: %s, Project: %s", accountID, projectID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
 		return
 	}
 
@@ -1143,6 +1248,19 @@ func (s *Server) listRecordingsHandler(c *gin.Context) {
 func (s *Server) getRecordingHandler(c *gin.Context) {
 	recordingID := c.Param("recordingId")
 	projectID := c.Param("project_id")
+
+	// SECURITY: Validate project belongs to authenticated account
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Unauthorized recording access - Account: %s, Project: %s, Recording: %s", accountID, projectID, recordingID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+		return
+	}
 
 	// Try to get from cache first
 	var recording SessionRecording
@@ -1212,6 +1330,21 @@ func (s *Server) getSessionsHandler(c *gin.Context) {
 		return
 	}
 
+	// Get account ID from context
+	accountID, _ := c.Get("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// SECURITY: Validate project belongs to authenticated account
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Unauthorized sessions access - Account: %s, Project: %s", accountID, projectID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+		return
+	}
+
 	// Optional filters
 	userID := c.Query("user_id")
 	limit := 50
@@ -1237,13 +1370,6 @@ func (s *Server) getSessionsHandler(c *gin.Context) {
 	}
 	if endDate == "" {
 		endDate = time.Now().Format("2006-01-02")
-	}
-
-	// Get account ID from context
-	accountID, _ := c.Get("account_id")
-	if accountID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
 	}
 
 	// Fetch events to construct sessions
@@ -1513,6 +1639,14 @@ func (s *Server) getHeatmapPagesHandler(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: Validate project belongs to authenticated account
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID.(string)).First(&project).Error; err != nil {
+		log.Printf("🚨 SECURITY: Unauthorized heatmap access - Account: %s, Project: %s", accountID, projectID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+		return
+	}
+
 	// Fetch recent events to get page URLs
 	startDate := time.Now().AddDate(0, 0, -7).Format("2006-01-02")
 	endDate := time.Now().Format("2006-01-02")
@@ -1621,6 +1755,50 @@ func (s *Server) signupHandler(c *gin.Context) {
 			"name":  account.Name,
 			"email": account.Email,
 		},
+	})
+}
+
+func (s *Server) getMeHandler(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Get account details
+	var account Account
+	if err := s.db.Where("id = ?", accountID).First(&account).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Account not found"})
+		return
+	}
+
+	// Get user's projects
+	var projects []Project
+	var projectID string
+	if err := s.db.Where("account_id = ?", account.ID).Find(&projects).Error; err == nil && len(projects) > 0 {
+		projectID = projects[0].ID
+	}
+
+	// Check subscription status
+	var subscription AccountSubscription
+	hasActiveSubscription := false
+	subscriptionStatus := "none"
+	if err := s.db.Where("account_id = ?", account.ID).First(&subscription).Error; err == nil {
+		subscriptionStatus = subscription.Status
+		// Consider active, trialing, or developer tier as having subscription
+		if subscription.Status == "active" || subscription.Status == "trialing" || subscription.Tier == "developer" {
+			hasActiveSubscription = true
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":                    account.ID,
+		"name":                  account.Name,
+		"email":                 account.Email,
+		"isAdmin":               account.IsAdmin,
+		"projectId":             projectID,
+		"hasActiveSubscription": hasActiveSubscription,
+		"subscriptionStatus":    subscriptionStatus,
 	})
 }
 
@@ -1754,8 +1932,16 @@ func (s *Server) authMiddleware(c *gin.Context) {
 		c.Set("account_id", project.AccountID)
 		c.Set("api_key_id", cachedKey.ID)
 
-		// If admin and X-Project-ID header is provided, allow access to that project
-		if isAdmin && projectID != "" {
+		// Validate X-Project-ID header if provided
+		if projectID != "" {
+			// Verify the project belongs to this account
+			var targetProject Project
+			if err := s.db.Where("id = ? AND account_id = ?", projectID, project.AccountID).First(&targetProject).Error; err != nil {
+				log.Printf("🚨 SECURITY: Unauthorized project access attempt - Account: %s, Attempted Project: %s, API Key: %s",
+					project.AccountID, projectID, cachedKey.ID)
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+				return
+			}
 			c.Set("project_id", projectID)
 		} else {
 			c.Set("project_id", cachedKey.ProjectID)
@@ -1801,8 +1987,16 @@ func (s *Server) authMiddleware(c *gin.Context) {
 		c.Set("account_id", project.AccountID)
 		c.Set("api_key_id", apiKey.ID)
 
-		// If admin and X-Project-ID header is provided, allow access to that project
-		if isAdmin && projectID != "" {
+		// Validate X-Project-ID header if provided
+		if projectID != "" {
+			// Verify the project belongs to this account
+			var targetProject Project
+			if err := s.db.Where("id = ? AND account_id = ?", projectID, project.AccountID).First(&targetProject).Error; err != nil {
+				log.Printf("🚨 SECURITY: Unauthorized project access attempt - Account: %s, Attempted Project: %s, API Key: %s",
+					project.AccountID, projectID, apiKey.ID)
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+				return
+			}
 			c.Set("project_id", projectID)
 		} else {
 			c.Set("project_id", apiKey.ProjectID)
@@ -1837,10 +2031,16 @@ func (s *Server) authMiddleware(c *gin.Context) {
 			c.Set("is_admin", true)
 		}
 
-		// If admin and X-Project-ID header is provided, allow access to that project
-		if isAdmin && projectID != "" {
-			c.Set("project_id", projectID)
-		} else if projectID != "" {
+		// Validate X-Project-ID header if provided
+		if projectID != "" {
+			// CRITICAL: Verify the project belongs to this account
+			var targetProject Project
+			if err := s.db.Where("id = ? AND account_id = ?", projectID, claims.AccountID).First(&targetProject).Error; err != nil {
+				log.Printf("🚨 SECURITY: Unauthorized project access attempt - Account: %s (JWT), Email: %s, Attempted Project: %s",
+					claims.AccountID, claims.Email, projectID)
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+				return
+			}
 			c.Set("project_id", projectID)
 		}
 		c.Next()
@@ -1856,7 +2056,19 @@ func (s *Server) authMiddleware(c *gin.Context) {
 
 	c.Set("account_id", account.ID)
 	c.Set("email", account.Email)
-	c.Set("project_id", projectID)
+
+	// Validate X-Project-ID header if provided
+	if projectID != "" {
+		// CRITICAL: Verify the project belongs to this account
+		var targetProject Project
+		if err := s.db.Where("id = ? AND account_id = ?", projectID, account.ID).First(&targetProject).Error; err != nil {
+			log.Printf("🚨 SECURITY: Unauthorized project access attempt - Account: %s (Email Token), Email: %s, Attempted Project: %s",
+				account.ID, account.Email, projectID)
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Project not found or access denied"})
+			return
+		}
+		c.Set("project_id", projectID)
+	}
 	c.Next()
 }
 
@@ -2760,5 +2972,81 @@ func (s *Server) adminGetProjectDataHandler(c *gin.Context) {
 		"recent_events":     events[:recentEventsLimit],
 		"start_date":        startDate,
 		"end_date":          endDate,
+	})
+}
+
+// Test/Debug Handlers - Remove or disable in production!
+
+// testListAllRecordingsHandler lists all recordings (no auth) for testing
+func (s *Server) testListAllRecordingsHandler(c *gin.Context) {
+	var recordings []SessionRecording
+
+	limit := 50
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+
+	if err := s.db.Order("created_at DESC").Limit(limit).Find(&recordings).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recordings"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"recordings": recordings,
+		"total":      len(recordings),
+		"message":    "Test endpoint - disable in production",
+	})
+}
+
+// testGetRecordingBySessionHandler gets a specific recording by session ID (no auth) for testing
+func (s *Server) testGetRecordingBySessionHandler(c *gin.Context) {
+	sessionID := c.Param("session_id")
+
+	var recording SessionRecording
+	if err := s.db.Where("session_id = ?", sessionID).First(&recording).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Recording not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recording"})
+		return
+	}
+
+	var events []map[string]interface{}
+	var err error
+
+	// Check if data is in S3 or DB
+	if recording.StoragePath != "" && s.sessionStorage != nil {
+		// Retrieve from S3/R2
+		events, err = s.sessionStorage.DownloadRecording(recording.StoragePath)
+		if err != nil {
+			log.Printf("Failed to download recording from S3: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve recording from storage"})
+			return
+		}
+	} else if len(recording.RecordingData) > 0 {
+		// Retrieve from DB
+		if err := json.Unmarshal(recording.RecordingData, &events); err != nil {
+			log.Printf("Failed to decode recording data from DB: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recording data"})
+			return
+		}
+	} else {
+		events = []map[string]interface{}{}
+	}
+
+	storageType := "Database"
+	if recording.StoragePath != "" {
+		storageType = "S3/R2"
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"recording":    recording,
+		"events":       events,
+		"event_count":  len(events),
+		"storage_type": storageType,
+		"message":      "Test endpoint - disable in production",
 	})
 }

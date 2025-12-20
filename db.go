@@ -34,6 +34,7 @@ func MigrateDB(db *gorm.DB) error {
 		// Mentiq subscription models
 		&AccountSubscription{},
 		&PaymentHistory{},
+		&OnboardingStatus{},
 		// Stripe revenue models (for customer analytics)
 		&StripeCustomer{},
 		&StripeSubscription{},

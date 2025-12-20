@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/google/uuid"
 )
 
 // SessionStorageService handles storing session recordings in S3/R2
@@ -58,11 +58,13 @@ func NewSessionStorageService() (*SessionStorageService, error) {
 }
 
 // UploadRecording uploads recording data to S3/R2
+// Returns the base path (without chunk suffix) for the recording
 func (sss *SessionStorageService) UploadRecording(sessionID, projectID, accountID string, events json.RawMessage) (string, error) {
-	// Generate unique key for this recording
-	recordingID := uuid.New().String()
-	key := fmt.Sprintf("recordings/account_id=%s/project_id=%s/session_id=%s/%s.json",
-		accountID, projectID, sessionID, recordingID)
+	// Use timestamp for chunk ordering
+	timestamp := time.Now().UnixNano()
+	basePath := fmt.Sprintf("recordings/account_id=%s/project_id=%s/session_id=%s",
+		accountID, projectID, sessionID)
+	key := fmt.Sprintf("%s/chunk_%d.json", basePath, timestamp)
 
 	// Upload to S3/R2
 	_, err := sss.s3Client.PutObject(&s3.PutObjectInput{
@@ -76,63 +78,98 @@ func (sss *SessionStorageService) UploadRecording(sessionID, projectID, accountI
 		return "", fmt.Errorf("failed to upload recording: %w", err)
 	}
 
-	log.Printf("Uploaded recording to S3: %s", key)
-	return key, nil
-} // DownloadRecording retrieves recording data from S3/R2
+	log.Printf("Uploaded recording chunk to S3: %s", key)
+	// Return the base path so we can find all chunks later
+	return basePath, nil
+} // DownloadRecording retrieves all recording chunks from S3/R2 and combines them
 func (sss *SessionStorageService) DownloadRecording(storagePath string) ([]map[string]interface{}, error) {
-	// Download from S3/R2
-	result, err := sss.s3Client.GetObject(&s3.GetObjectInput{
+	// List all chunks in this recording path
+	listResult, err := sss.s3Client.ListObjectsV2(&s3.ListObjectsV2Input{
 		Bucket: aws.String(sss.bucketName),
-		Key:    aws.String(storagePath),
+		Prefix: aws.String(storagePath + "/"),
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to download recording: %w", err)
-	}
-	defer result.Body.Close()
-
-	// Parse JSON
-	var events []map[string]interface{}
-	decoder := json.NewDecoder(result.Body)
-	if err := decoder.Decode(&events); err != nil {
-		return nil, fmt.Errorf("failed to parse recording: %w", err)
+		return nil, fmt.Errorf("failed to list recording chunks: %w", err)
 	}
 
-	return events, nil
+	if len(listResult.Contents) == 0 {
+		return []map[string]interface{}{}, nil
+	}
+
+	// Combine all chunks
+	var allEvents []map[string]interface{}
+
+	for _, obj := range listResult.Contents {
+		// Download chunk
+		result, err := sss.s3Client.GetObject(&s3.GetObjectInput{
+			Bucket: aws.String(sss.bucketName),
+			Key:    obj.Key,
+		})
+
+		if err != nil {
+			log.Printf("Warning: Failed to download chunk %s: %v", *obj.Key, err)
+			continue
+		}
+
+		// Parse JSON
+		var chunkEvents []map[string]interface{}
+		decoder := json.NewDecoder(result.Body)
+		if err := decoder.Decode(&chunkEvents); err != nil {
+			log.Printf("Warning: Failed to parse chunk %s: %v", *obj.Key, err)
+			result.Body.Close()
+			continue
+		}
+		result.Body.Close()
+
+		// Append to all events
+		allEvents = append(allEvents, chunkEvents...)
+	}
+
+	return allEvents, nil
 }
 
-// DownloadRecordingData retrieves raw recording data from S3/R2
+// DownloadRecordingData retrieves all recording chunks from S3/R2 and combines them into raw JSON
 func (sss *SessionStorageService) DownloadRecordingData(storagePath string) ([]byte, error) {
-	// Download from S3/R2
-	result, err := sss.s3Client.GetObject(&s3.GetObjectInput{
-		Bucket: aws.String(sss.bucketName),
-		Key:    aws.String(storagePath),
-	})
-
+	// Use DownloadRecording to get all events
+	events, err := sss.DownloadRecording(storagePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download recording data: %w", err)
-	}
-	defer result.Body.Close()
-
-	buf := new(bytes.Buffer)
-	if _, err := buf.ReadFrom(result.Body); err != nil {
-		return nil, fmt.Errorf("failed to read recording data from body: %w", err)
+		return nil, err
 	}
 
-	return buf.Bytes(), nil
+	// Marshal back to JSON
+	data, err := json.Marshal(events)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal combined events: %w", err)
+	}
+
+	return data, nil
 }
 
-// DeleteRecording removes a recording from S3/R2
+// DeleteRecording removes all recording chunks from S3/R2
 func (sss *SessionStorageService) DeleteRecording(storagePath string) error {
-	_, err := sss.s3Client.DeleteObject(&s3.DeleteObjectInput{
+	// List all chunks
+	listResult, err := sss.s3Client.ListObjectsV2(&s3.ListObjectsV2Input{
 		Bucket: aws.String(sss.bucketName),
-		Key:    aws.String(storagePath),
+		Prefix: aws.String(storagePath + "/"),
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to delete recording: %w", err)
+		return fmt.Errorf("failed to list recording chunks for deletion: %w", err)
 	}
 
-	log.Printf("Deleted recording from S3: %s", storagePath)
+	// Delete each chunk
+	for _, obj := range listResult.Contents {
+		_, err := sss.s3Client.DeleteObject(&s3.DeleteObjectInput{
+			Bucket: aws.String(sss.bucketName),
+			Key:    obj.Key,
+		})
+
+		if err != nil {
+			log.Printf("Warning: Failed to delete chunk %s: %v", *obj.Key, err)
+		}
+	}
+
+	log.Printf("Deleted recording chunks from S3: %s", storagePath)
 	return nil
 }
