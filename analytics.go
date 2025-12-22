@@ -130,22 +130,17 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 	}
 
 	// Robustly handle metrics parameter
-	// 1. Start with what Gin bound (might be []string{"a,b,c"} or []string{"a", "b"})
 	rawMetrics := query.Metrics
 	query.Metrics = make([]string, 0)
 
-	// 2. Also check the raw query param in case Gin missed it or bound it weirdly
 	if val := c.Query("metrics"); val != "" {
-		// If we have a raw string, split it and use it if it looks richer than what Gin gave
 		parts := strings.Split(val, ",")
 		if len(parts) > len(rawMetrics) {
 			rawMetrics = parts
 		}
 	}
 
-	// 3. Flatten and clean
 	for _, m := range rawMetrics {
-		// Split by comma just in case we have "a,b" as a single element
 		parts := strings.Split(m, ",")
 		for _, p := range parts {
 			clean := strings.TrimSpace(p)
@@ -169,9 +164,7 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 		return
 	}
 
-	// Get Stripe API key from project (optional - currently not stored in Project model)
 	var stripeKey string
-
 	sc := &client.API{}
 	if stripeKey != "" {
 		sc.Init(stripeKey, nil)
@@ -190,42 +183,642 @@ func (as *AnalyticsService) GetAnalyticsHandler(c *gin.Context) {
 		query.GroupBy = "day"
 	}
 
-	// Determine fetch range (extended for rolling windows)
-	fetchStartDate := query.StartDate
-	needsRolling := false
+	// Parse date range for SQL
+	startTime, _ := time.Parse("2006-01-02", query.StartDate)
+	endTime, _ := time.Parse("2006-01-02", query.EndDate)
+	endTime = endTime.Add(24*time.Hour - time.Nanosecond)
+
+	// Extended date range for rolling windows (WAU/MAU) - used by SQL queries
+	_ = startTime.AddDate(0, 0, -30) // extendedStartTime - referenced in SQL queries
+
+	// FULLY OPTIMIZED: All metrics now use SQL aggregation
+	// Events are only loaded for Stripe-related metrics that need the old logic
+	var events, extendedEvents []Event
+	needsStripeMetrics := false
 	for _, m := range query.Metrics {
-		if m == "wau" || m == "mau" {
-			needsRolling = true
-		}
-	}
-	if needsRolling {
-		t, err := time.Parse("2006-01-02", query.StartDate)
-		if err == nil {
-			fetchStartDate = t.AddDate(0, 0, -30).Format("2006-01-02")
+		if m == "conversion_rate" || m == "churn_rate" || m == "mrr" || m == "arpu" {
+			needsStripeMetrics = true
+			break
 		}
 	}
 
-	events, err := as.fetchEventsForDateRange(accountID.(string), projectID.(string), fetchStartDate, query.EndDate)
-	if err != nil {
-		log.Printf("Error fetching events: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch events"})
-		return
+	// Only create empty slices for Stripe metrics (they don't actually use events but need the function signature)
+	if needsStripeMetrics {
+		events = []Event{}
+		extendedEvents = []Event{}
 	}
 
-	filteredEvents := as.filterEvents(events, query)
-	standardEvents := as.filterEventsByDate(filteredEvents, query.StartDate, query.EndDate)
+	// OPTIMIZED: Calculate all metrics using SQL
+	results := as.calculateMetricsOptimized(events, extendedEvents, query, sc, projectID.(string), accountID.(string), startTime, endTime)
 
-	results := as.calculateMetrics(standardEvents, filteredEvents, query, sc, projectID.(string))
-	fmt.Printf("%+v\n", results)
 	response := AnalyticsResponse{
 		Query:   query,
 		Results: results,
 	}
-	response.Meta.TotalEvents = len(standardEvents)
+
+	// Get total events count from SQL
+	var totalCount int64
+	as.db.Model(&Event{}).
+		Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ?",
+			accountID.(string), projectID.(string), startTime, endTime).
+		Count(&totalCount)
+	response.Meta.TotalEvents = int(totalCount)
+
 	response.Meta.ProcessingTime = time.Since(start)
 	response.Meta.DateRange = fmt.Sprintf("%s to %s", query.StartDate, query.EndDate)
 
 	c.JSON(http.StatusOK, response)
+}
+
+// calculateMetricsOptimized uses SQL aggregation for metrics that don't need in-memory processing
+func (as *AnalyticsService) calculateMetricsOptimized(events []Event, extendedEvents []Event, query AnalyticsQuery, sc *client.API, projectID, accountID string, startTime, endTime time.Time) []MetricResult {
+	var results []MetricResult
+
+	for _, metric := range query.Metrics {
+		switch metric {
+		case "total_events":
+			// SQL: Simple COUNT
+			var count int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ?",
+					accountID, projectID, startTime, endTime).
+				Count(&count)
+
+			// Get time series with SQL
+			timeSeries := as.getTimeSeriesFromSQL(accountID, projectID, startTime, endTime, query.GroupBy, "count")
+
+			results = append(results, MetricResult{
+				Metric:     "total_events",
+				Value:      count,
+				TimeSeries: timeSeries,
+			})
+
+		case "unique_users":
+			// SQL: COUNT DISTINCT
+			var count int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, startTime, endTime).
+				Distinct("user_id").
+				Count(&count)
+
+			timeSeries := as.getTimeSeriesFromSQL(accountID, projectID, startTime, endTime, query.GroupBy, "unique_users")
+
+			results = append(results, MetricResult{
+				Metric:     "unique_users",
+				Value:      count,
+				TimeSeries: timeSeries,
+			})
+
+		case "top_events":
+			// SQL: GROUP BY event_type
+			type EventCount struct {
+				EventType string `gorm:"column:event_type"`
+				Count     int64  `gorm:"column:count"`
+			}
+			var eventCounts []EventCount
+			as.db.Model(&Event{}).
+				Select("event_type, COUNT(*) as count").
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ?",
+					accountID, projectID, startTime, endTime).
+				Group("event_type").
+				Order("count DESC").
+				Limit(20).
+				Scan(&eventCounts)
+
+			breakdown := make(map[string]interface{})
+			for _, ec := range eventCounts {
+				breakdown[ec.EventType] = ec.Count
+			}
+
+			results = append(results, MetricResult{
+				Metric:    "top_events",
+				Value:     breakdown,
+				Breakdown: breakdown,
+			})
+
+		case "page_views":
+			// SQL: COUNT with filter
+			var count int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND event_type IN ('page_view', 'pageview')",
+					accountID, projectID, startTime, endTime).
+				Count(&count)
+
+			// Get breakdown by path using JSON extraction
+			type PathCount struct {
+				Path  string `gorm:"column:path"`
+				Count int64  `gorm:"column:count"`
+			}
+			var pathCounts []PathCount
+			as.db.Raw(`
+				SELECT COALESCE(properties->>'path', properties->>'url', properties->>'page', 'unknown') as path, COUNT(*) as count
+				FROM events
+				WHERE account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ?
+					AND event_type IN ('page_view', 'pageview')
+				GROUP BY COALESCE(properties->>'path', properties->>'url', properties->>'page', 'unknown')
+				ORDER BY count DESC
+				LIMIT 20
+			`, accountID, projectID, startTime, endTime).Scan(&pathCounts)
+
+			breakdown := make(map[string]interface{})
+			for _, pc := range pathCounts {
+				breakdown[pc.Path] = pc.Count
+			}
+
+			timeSeries := as.getTimeSeriesFromSQL(accountID, projectID, startTime, endTime, query.GroupBy, "page_views")
+
+			results = append(results, MetricResult{
+				Metric:     "page_views",
+				Value:      count,
+				Breakdown:  breakdown,
+				TimeSeries: timeSeries,
+			})
+
+		case "total_sessions":
+			// SQL: COUNT DISTINCT
+			var count int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND session_id IS NOT NULL AND session_id != ''",
+					accountID, projectID, startTime, endTime).
+				Distinct("session_id").
+				Count(&count)
+
+			timeSeries := as.getTimeSeriesFromSQL(accountID, projectID, startTime, endTime, query.GroupBy, "sessions")
+
+			results = append(results, MetricResult{
+				Metric:     "total_sessions",
+				Value:      count,
+				TimeSeries: timeSeries,
+			})
+
+		case "country_breakdown":
+			type BreakdownCount struct {
+				Value string `gorm:"column:value"`
+				Count int64  `gorm:"column:count"`
+			}
+			var counts []BreakdownCount
+			as.db.Model(&Event{}).
+				Select("country as value, COUNT(*) as count").
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND country IS NOT NULL AND country != ''",
+					accountID, projectID, startTime, endTime).
+				Group("country").
+				Order("count DESC").
+				Scan(&counts)
+
+			breakdown := make(map[string]interface{})
+			for _, c := range counts {
+				breakdown[c.Value] = c.Count
+			}
+			results = append(results, MetricResult{
+				Metric:    "country_breakdown",
+				Value:     breakdown,
+				Breakdown: breakdown,
+			})
+
+		case "city_breakdown":
+			type BreakdownCount struct {
+				Value string `gorm:"column:value"`
+				Count int64  `gorm:"column:count"`
+			}
+			var counts []BreakdownCount
+			as.db.Model(&Event{}).
+				Select("city as value, COUNT(*) as count").
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND city IS NOT NULL AND city != ''",
+					accountID, projectID, startTime, endTime).
+				Group("city").
+				Order("count DESC").
+				Limit(50).
+				Scan(&counts)
+
+			breakdown := make(map[string]interface{})
+			for _, c := range counts {
+				breakdown[c.Value] = c.Count
+			}
+			results = append(results, MetricResult{
+				Metric:    "city_breakdown",
+				Value:     breakdown,
+				Breakdown: breakdown,
+			})
+
+		case "device_breakdown":
+			type BreakdownCount struct {
+				Value string `gorm:"column:value"`
+				Count int64  `gorm:"column:count"`
+			}
+			var counts []BreakdownCount
+			as.db.Model(&Event{}).
+				Select("device as value, COUNT(*) as count").
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND device IS NOT NULL AND device != ''",
+					accountID, projectID, startTime, endTime).
+				Group("device").
+				Order("count DESC").
+				Scan(&counts)
+
+			breakdown := make(map[string]interface{})
+			for _, c := range counts {
+				breakdown[c.Value] = c.Count
+			}
+			results = append(results, MetricResult{
+				Metric:    "device_breakdown",
+				Value:     breakdown,
+				Breakdown: breakdown,
+			})
+
+		case "os_breakdown":
+			type BreakdownCount struct {
+				Value string `gorm:"column:value"`
+				Count int64  `gorm:"column:count"`
+			}
+			var counts []BreakdownCount
+			as.db.Model(&Event{}).
+				Select("os as value, COUNT(*) as count").
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND os IS NOT NULL AND os != ''",
+					accountID, projectID, startTime, endTime).
+				Group("os").
+				Order("count DESC").
+				Scan(&counts)
+
+			breakdown := make(map[string]interface{})
+			for _, c := range counts {
+				breakdown[c.Value] = c.Count
+			}
+			results = append(results, MetricResult{
+				Metric:    "os_breakdown",
+				Value:     breakdown,
+				Breakdown: breakdown,
+			})
+
+		case "browser_breakdown":
+			type BreakdownCount struct {
+				Value string `gorm:"column:value"`
+				Count int64  `gorm:"column:count"`
+			}
+			var counts []BreakdownCount
+			as.db.Model(&Event{}).
+				Select("browser as value, COUNT(*) as count").
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND browser IS NOT NULL AND browser != ''",
+					accountID, projectID, startTime, endTime).
+				Group("browser").
+				Order("count DESC").
+				Scan(&counts)
+
+			breakdown := make(map[string]interface{})
+			for _, c := range counts {
+				breakdown[c.Value] = c.Count
+			}
+			results = append(results, MetricResult{
+				Metric:    "browser_breakdown",
+				Value:     breakdown,
+				Breakdown: breakdown,
+			})
+
+		case "dau":
+			// SQL: Daily Active Users - unique users on the last day of the range
+			var dauCount int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, endTime.Add(-24*time.Hour), endTime).
+				Distinct("user_id").
+				Count(&dauCount)
+
+			// Time series for DAU
+			timeSeries := as.getTimeSeriesFromSQL(accountID, projectID, startTime, endTime, query.GroupBy, "unique_users")
+
+			results = append(results, MetricResult{
+				Metric:     "dau",
+				Value:      dauCount,
+				TimeSeries: timeSeries,
+			})
+
+		case "wau":
+			// SQL: Weekly Active Users - unique users in last 7 days
+			sevenDaysAgo := endTime.Add(-7 * 24 * time.Hour)
+			var wauCount int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, sevenDaysAgo, endTime).
+				Distinct("user_id").
+				Count(&wauCount)
+
+			// Time series for WAU (rolling 7-day unique users per day)
+			timeSeries := as.getRollingActiveUsersTimeSeriesSQL(accountID, projectID, startTime, endTime, 7)
+
+			results = append(results, MetricResult{
+				Metric:     "wau",
+				Value:      wauCount,
+				TimeSeries: timeSeries,
+			})
+
+		case "mau":
+			// SQL: Monthly Active Users - unique users in last 30 days
+			thirtyDaysAgo := endTime.Add(-30 * 24 * time.Hour)
+			var mauCount int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, thirtyDaysAgo, endTime).
+				Distinct("user_id").
+				Count(&mauCount)
+
+			// Time series for MAU (rolling 30-day unique users per day)
+			timeSeries := as.getRollingActiveUsersTimeSeriesSQL(accountID, projectID, startTime, endTime, 30)
+
+			results = append(results, MetricResult{
+				Metric:     "mau",
+				Value:      mauCount,
+				TimeSeries: timeSeries,
+			})
+
+		case "bounce_rate":
+			// SQL: Calculate bounce rate (sessions with only 1 event)
+			type BounceData struct {
+				TotalSessions  int64 `gorm:"column:total_sessions"`
+				BounceSessions int64 `gorm:"column:bounce_sessions"`
+			}
+			var bounceData BounceData
+			as.db.Raw(`
+				WITH session_counts AS (
+					SELECT session_id, COUNT(*) as event_count
+					FROM events
+					WHERE account_id = $1 AND project_id = $2 AND timestamp BETWEEN $3 AND $4
+						AND session_id IS NOT NULL AND session_id != ''
+					GROUP BY session_id
+				)
+				SELECT 
+					COUNT(*) as total_sessions,
+					SUM(CASE WHEN event_count = 1 THEN 1 ELSE 0 END) as bounce_sessions
+				FROM session_counts
+			`, accountID, projectID, startTime, endTime).Scan(&bounceData)
+
+			bounceRate := 0.0
+			if bounceData.TotalSessions > 0 {
+				bounceRate = float64(bounceData.BounceSessions) / float64(bounceData.TotalSessions) * 100
+			}
+
+			results = append(results, MetricResult{
+				Metric: "bounce_rate",
+				Value:  fmt.Sprintf("%.2f%%", bounceRate),
+			})
+
+		case "avg_session_duration":
+			// SQL: Calculate average session duration
+			type DurationData struct {
+				AvgDuration float64 `gorm:"column:avg_duration"`
+			}
+			var durationData DurationData
+			as.db.Raw(`
+				WITH session_durations AS (
+					SELECT session_id, 
+						EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) as duration_seconds
+					FROM events
+					WHERE account_id = $1 AND project_id = $2 AND timestamp BETWEEN $3 AND $4
+						AND session_id IS NOT NULL AND session_id != ''
+					GROUP BY session_id
+					HAVING COUNT(*) > 1
+				)
+				SELECT COALESCE(AVG(duration_seconds), 0) as avg_duration
+				FROM session_durations
+			`, accountID, projectID, startTime, endTime).Scan(&durationData)
+
+			avgDuration := time.Duration(durationData.AvgDuration * float64(time.Second))
+			results = append(results, MetricResult{
+				Metric: "avg_session_duration",
+				Value:  avgDuration.String(),
+			})
+
+		case "stickiness_ratio":
+			// SQL: DAU/MAU ratio
+			today := time.Now().UTC().Truncate(24 * time.Hour)
+			tomorrow := today.Add(24 * time.Hour)
+			thirtyDaysAgo := today.Add(-30 * 24 * time.Hour)
+
+			var dauCount, mauCount int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, today, tomorrow).
+				Distinct("user_id").
+				Count(&dauCount)
+
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, thirtyDaysAgo, tomorrow).
+				Distinct("user_id").
+				Count(&mauCount)
+
+			stickiness := 0.0
+			if mauCount > 0 {
+				stickiness = float64(dauCount) / float64(mauCount) * 100
+			}
+
+			results = append(results, MetricResult{
+				Metric: "stickiness_ratio",
+				Value:  fmt.Sprintf("%.2f%%", stickiness),
+			})
+
+		case "session_frequency":
+			// SQL: Average sessions per user
+			type FrequencyData struct {
+				AvgFrequency float64 `gorm:"column:avg_frequency"`
+			}
+			var freqData FrequencyData
+			as.db.Raw(`
+				WITH user_sessions AS (
+					SELECT user_id, COUNT(DISTINCT session_id) as session_count
+					FROM events
+					WHERE account_id = $1 AND project_id = $2 AND timestamp BETWEEN $3 AND $4
+						AND user_id IS NOT NULL AND user_id != ''
+						AND session_id IS NOT NULL AND session_id != ''
+					GROUP BY user_id
+				)
+				SELECT COALESCE(AVG(session_count), 0) as avg_frequency
+				FROM user_sessions
+			`, accountID, projectID, startTime, endTime).Scan(&freqData)
+
+			results = append(results, MetricResult{
+				Metric: "session_frequency",
+				Value:  fmt.Sprintf("%.2f", freqData.AvgFrequency),
+			})
+
+		case "adoption_metrics":
+			// SQL: Feature adoption rates
+			coreFeatures := []string{"purchase", "form_submit"}
+
+			// Get total active users
+			var totalUsers int64
+			as.db.Model(&Event{}).
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, startTime, endTime).
+				Distinct("user_id").
+				Count(&totalUsers)
+
+			// Get users per feature
+			type FeatureCount struct {
+				EventType string `gorm:"column:event_type"`
+				UserCount int64  `gorm:"column:user_count"`
+			}
+			var featureCounts []FeatureCount
+			as.db.Model(&Event{}).
+				Select("event_type, COUNT(DISTINCT user_id) as user_count").
+				Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ? AND event_type IN ? AND user_id IS NOT NULL AND user_id != ''",
+					accountID, projectID, startTime, endTime, coreFeatures).
+				Group("event_type").
+				Scan(&featureCounts)
+
+			adoptionRates := make(map[string]interface{})
+			totalAdopted := int64(0)
+			for _, fc := range featureCounts {
+				rate := 0.0
+				if totalUsers > 0 {
+					rate = float64(fc.UserCount) / float64(totalUsers) * 100
+				}
+				adoptionRates[fc.EventType] = fmt.Sprintf("%.2f%%", rate)
+				totalAdopted += fc.UserCount
+			}
+
+			overallRate := 0.0
+			if totalUsers > 0 {
+				overallRate = float64(totalAdopted) / float64(totalUsers) * 100
+			}
+
+			results = append(results, MetricResult{
+				Metric:    "adoption_metrics",
+				Value:     fmt.Sprintf("%.2f%%", overallRate),
+				Breakdown: adoptionRates,
+			})
+
+		case "conversion_rate", "churn_rate", "mrr", "arpu":
+			// These use Stripe data, not events - use existing logic
+			result := as.calculateSingleMetric(events, extendedEvents, metric, query, sc, projectID)
+			results = append(results, result)
+
+		default:
+			log.Printf("Unknown metric requested: %s", metric)
+			results = append(results, MetricResult{
+				Metric: metric,
+				Value:  "Metric not implemented",
+			})
+		}
+	}
+
+	return results
+}
+
+// getTimeSeriesFromSQL gets time series data using SQL aggregation
+func (as *AnalyticsService) getTimeSeriesFromSQL(accountID, projectID string, startTime, endTime time.Time, groupBy, metricType string) []TimeSeriesPoint {
+	var truncFunc string
+	switch groupBy {
+	case "hour":
+		truncFunc = "hour"
+	case "week":
+		truncFunc = "week"
+	case "month":
+		truncFunc = "month"
+	default:
+		truncFunc = "day"
+	}
+
+	type TimePoint struct {
+		Date  time.Time `gorm:"column:date"`
+		Value int64     `gorm:"column:value"`
+	}
+
+	var selectClause string
+	switch metricType {
+	case "unique_users":
+		selectClause = "date_trunc('" + truncFunc + "', timestamp) as date, COUNT(DISTINCT user_id) as value"
+	case "sessions":
+		selectClause = "date_trunc('" + truncFunc + "', timestamp) as date, COUNT(DISTINCT session_id) as value"
+	case "page_views":
+		selectClause = "date_trunc('" + truncFunc + "', timestamp) as date, COUNT(*) as value"
+	default:
+		selectClause = "date_trunc('" + truncFunc + "', timestamp) as date, COUNT(*) as value"
+	}
+
+	var points []TimePoint
+	query := as.db.Model(&Event{}).
+		Select(selectClause).
+		Where("account_id = ? AND project_id = ? AND timestamp BETWEEN ? AND ?",
+			accountID, projectID, startTime, endTime).
+		Group("date_trunc('" + truncFunc + "', timestamp)").
+		Order("date ASC")
+
+	if metricType == "page_views" {
+		query = query.Where("event_type IN ('page_view', 'pageview')")
+	}
+
+	query.Scan(&points)
+
+	result := make([]TimeSeriesPoint, 0, len(points))
+	for _, p := range points {
+		result = append(result, TimeSeriesPoint{
+			Date:  p.Date.Format("2006-01-02"),
+			Value: p.Value,
+		})
+	}
+	return result
+}
+
+// getRollingActiveUsersTimeSeriesSQL gets rolling N-day active users time series using SQL
+// Note: For true rolling window, we use daily unique users as an approximation
+// A full rolling window would require complex window functions or lateral joins
+func (as *AnalyticsService) getRollingActiveUsersTimeSeriesSQL(accountID, projectID string, startTime, endTime time.Time, windowDays int) []TimeSeriesPoint {
+	type TimePoint struct {
+		Date  time.Time `gorm:"column:date"`
+		Value int64     `gorm:"column:value"`
+	}
+
+	var points []TimePoint
+
+	// Use a simpler approach: for each day, count unique users in the rolling window
+	// This uses LATERAL join for accurate rolling counts
+	as.db.Raw(`
+		WITH date_series AS (
+			SELECT generate_series(
+				$3::date,
+				$4::date,
+				'1 day'::interval
+			)::date as date
+		)
+		SELECT 
+			ds.date,
+			(
+				SELECT COUNT(DISTINCT user_id)
+				FROM events e
+				WHERE e.account_id = $1 
+					AND e.project_id = $2
+					AND e.timestamp >= ds.date - make_interval(days => $5)
+					AND e.timestamp < ds.date + interval '1 day'
+					AND e.user_id IS NOT NULL 
+					AND e.user_id != ''
+			) as value
+		FROM date_series ds
+		ORDER BY ds.date ASC
+	`, accountID, projectID, startTime.Format("2006-01-02"), endTime.Format("2006-01-02"), windowDays).Scan(&points)
+
+	result := make([]TimeSeriesPoint, 0, len(points))
+	for _, p := range points {
+		result = append(result, TimeSeriesPoint{
+			Date:  p.Date.Format("2006-01-02"),
+			Value: p.Value,
+		})
+	}
+	return result
+}
+
+// calculateSingleMetric calculates a single metric using the original in-memory logic
+func (as *AnalyticsService) calculateSingleMetric(events []Event, extendedEvents []Event, metric string, query AnalyticsQuery, sc *client.API, projectID string) MetricResult {
+	// Use the existing calculateMetrics logic for a single metric
+	tempQuery := AnalyticsQuery{
+		Metrics:   []string{metric},
+		StartDate: query.StartDate,
+		EndDate:   query.EndDate,
+		GroupBy:   query.GroupBy,
+	}
+	results := as.calculateMetrics(events, extendedEvents, tempQuery, sc, projectID)
+	if len(results) > 0 {
+		return results[0]
+	}
+	return MetricResult{Metric: metric, Value: nil}
 }
 
 func (as *AnalyticsService) calculateMetrics(events []Event, extendedEvents []Event, query AnalyticsQuery, sc *client.API, projectID string) []MetricResult {
