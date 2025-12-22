@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +62,14 @@ type CacheEntry struct {
 	ExpiresAt time.Time
 }
 
+// CachedResponse represents a cached HTTP response
+type CachedResponse struct {
+	StatusCode int
+	Body       []byte
+	Headers    map[string]string
+	ExpiresAt  time.Time
+}
+
 type AnalyticsService struct {
 	db           *gorm.DB
 	stripeClient *client.API
@@ -105,6 +112,10 @@ type Server struct {
 	apiKeyCache      map[string]*CacheEntry // Key: apiKey token
 	recordingCache   map[string]*CacheEntry // Key: recordingID
 	entityCacheMutex sync.RWMutex
+
+	// Response cache for analytics endpoints (aggressive caching)
+	responseCache      map[string]*CachedResponse
+	responseCacheMutex sync.RWMutex
 }
 
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
@@ -128,6 +139,7 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		accountCache:             make(map[string]*CacheEntry),
 		apiKeyCache:              make(map[string]*CacheEntry),
 		recordingCache:           make(map[string]*CacheEntry),
+		responseCache:            make(map[string]*CachedResponse),
 	}
 
 	// Start entity cache cleanup (every 15 minutes)
@@ -438,6 +450,172 @@ func (s *Server) setCachedRecording(recording *SessionRecording) {
 	s.setCachedEntity(recording.ID, recording, 15*time.Minute, s.recordingCache)
 }
 
+// ========================================
+// Response Caching Middleware (Aggressive)
+// ========================================
+
+// responseRecorder wraps gin.ResponseWriter to capture response body
+type responseRecorder struct {
+	gin.ResponseWriter
+	body       []byte
+	statusCode int
+}
+
+func (r *responseRecorder) Write(data []byte) (int, error) {
+	r.body = append(r.body, data...)
+	return r.ResponseWriter.Write(data)
+}
+
+func (r *responseRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
+	r.ResponseWriter.WriteHeader(statusCode)
+}
+
+// generateResponseCacheKey creates a unique key for caching responses
+func (s *Server) generateResponseCacheKey(c *gin.Context) string {
+	// Include path, query params, account ID, and project ID for uniqueness
+	accountID, _ := c.Get("account_id")
+	projectID := c.Param("project_id")
+	queryString := c.Request.URL.RawQuery
+
+	key := fmt.Sprintf("resp:%s:%s:%v:%s", c.Request.URL.Path, projectID, accountID, queryString)
+	return key
+}
+
+// getCachedResponse retrieves a cached response if valid
+func (s *Server) getCachedResponse(cacheKey string) (*CachedResponse, bool) {
+	s.responseCacheMutex.RLock()
+	defer s.responseCacheMutex.RUnlock()
+
+	cached, exists := s.responseCache[cacheKey]
+	if !exists {
+		return nil, false
+	}
+
+	if time.Now().After(cached.ExpiresAt) {
+		return nil, false
+	}
+
+	return cached, true
+}
+
+// setCachedResponse stores a response in the cache
+func (s *Server) setCachedResponse(cacheKey string, statusCode int, body []byte, headers map[string]string, ttl time.Duration) {
+	s.responseCacheMutex.Lock()
+	defer s.responseCacheMutex.Unlock()
+
+	s.responseCache[cacheKey] = &CachedResponse{
+		StatusCode: statusCode,
+		Body:       body,
+		Headers:    headers,
+		ExpiresAt:  time.Now().Add(ttl),
+	}
+}
+
+// cleanExpiredResponseCache removes expired response cache entries
+func (s *Server) cleanExpiredResponseCache() {
+	s.responseCacheMutex.Lock()
+	defer s.responseCacheMutex.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+
+	for key, entry := range s.responseCache {
+		if now.After(entry.ExpiresAt) {
+			delete(s.responseCache, key)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("Response cache cleanup: removed %d expired entries", cleaned)
+	}
+}
+
+// startResponseCacheCleanup periodically cleans up expired response cache entries
+func (s *Server) startResponseCacheCleanup() {
+	cleanupTicker := time.NewTicker(10 * time.Minute)
+	defer cleanupTicker.Stop()
+
+	for range cleanupTicker.C {
+		s.cleanExpiredResponseCache()
+	}
+}
+
+// cacheResponseMiddleware creates a middleware that caches GET responses with specified TTL
+// This is an "excessive" caching strategy for analytics endpoints
+func (s *Server) cacheResponseMiddleware(ttl time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Only cache GET requests
+		if c.Request.Method != http.MethodGet {
+			c.Next()
+			return
+		}
+
+		// Generate cache key
+		cacheKey := s.generateResponseCacheKey(c)
+
+		// Check if we have a cached response
+		if cached, found := s.getCachedResponse(cacheKey); found {
+			// Add cache hit header for debugging
+			c.Header("X-Cache", "HIT")
+			c.Header("X-Cache-Expires", cached.ExpiresAt.Format(time.RFC3339))
+
+			// Set any cached headers
+			for key, value := range cached.Headers {
+				c.Header(key, value)
+			}
+
+			c.Data(cached.StatusCode, "application/json; charset=utf-8", cached.Body)
+			c.Abort()
+			return
+		}
+
+		// Cache miss - record the response
+		recorder := &responseRecorder{
+			ResponseWriter: c.Writer,
+			body:           []byte{},
+			statusCode:     http.StatusOK,
+		}
+		c.Writer = recorder
+
+		// Add cache miss header
+		c.Header("X-Cache", "MISS")
+
+		// Process the request
+		c.Next()
+
+		// Only cache successful responses (2xx)
+		if recorder.statusCode >= 200 && recorder.statusCode < 300 {
+			headers := make(map[string]string)
+			headers["Content-Type"] = "application/json; charset=utf-8"
+
+			s.setCachedResponse(cacheKey, recorder.statusCode, recorder.body, headers, ttl)
+		}
+	}
+}
+
+// Cache TTL constants for different analytics types (AGGRESSIVE/EXCESSIVE caching)
+const (
+	CacheTTLStripeMetrics      = 30 * time.Minute // Stripe data doesn't change frequently
+	CacheTTLStripeAnalytics    = 45 * time.Minute // Revenue analytics - stable data
+	CacheTTLLocationAnalytics  = 1 * time.Hour    // Geographic data is very stable
+	CacheTTLDeviceAnalytics    = 1 * time.Hour    // Device/browser stats are stable
+	CacheTTLCohortAnalytics    = 45 * time.Minute // Cohort/retention data
+	CacheTTLFeatureAdoption    = 30 * time.Minute // Feature usage analytics
+	CacheTTLPaidUserMetrics    = 30 * time.Minute // Subscription user metrics
+	CacheTTLChurnMetrics       = 30 * time.Minute // Churn analytics
+	CacheTTLSubscriptionHealth = 30 * time.Minute // Subscription health overview
+	CacheTTLFunnelAnalytics    = 25 * time.Minute // Conversion funnels
+	CacheTTLSessionAnalytics   = 20 * time.Minute // Session-based analytics
+	CacheTTLExperimentResults  = 15 * time.Minute // A/B test results (more dynamic)
+	CacheTTLHeatmapData        = 45 * time.Minute // Heatmap aggregations
+	CacheTTLRecordingsList     = 15 * time.Minute // Recording lists
+	CacheTTLSessionsList       = 15 * time.Minute // Sessions list
+	CacheTTLFeatureUsage       = 30 * time.Minute // Feature usage stats
+	CacheTTLOnboardingStats    = 30 * time.Minute // Onboarding statistics
+)
+
 func main() {
 
 	// Load environment variables from .env.local file
@@ -485,6 +663,9 @@ func main() {
 
 	// Initialize webhook secret
 	InitWebhookSecret()
+
+	// Start response cache cleanup (every 10 minutes)
+	go server.startResponseCacheCleanup()
 
 	// Setup Gin router
 	router := gin.Default()
@@ -538,17 +719,6 @@ func main() {
 		apiV1.GET("/analytics/retention", server.analyticsService.GetRetentionCohortsHandler)
 		apiV1.GET("/analytics/churn-by-channel", server.analyticsService.GetChurnByChannelHandler)
 
-		// Session Recording routes
-		apiV1.POST("/sessions/:session_id/recordings", server.ingestRecordingHandler)
-		apiV1.GET("/projects/:project_id/recordings", server.listRecordingsHandler)
-		apiV1.GET("/projects/:project_id/recordings/:recordingId", server.getRecordingHandler)
-		apiV1.GET("/projects/:project_id/sessions", server.getSessionsHandler)
-		apiV1.GET("/projects/:project_id/sessions/:sessionId", server.getSessionHandler)
-
-		// Heatmap routes (GET only - POST goes through /events endpoint)
-		apiV1.GET("/projects/:project_id/heatmaps", server.analyticsService.GetHeatmapHandler)
-		apiV1.GET("/projects/:project_id/heatmaps/pages", server.getHeatmapPagesHandler)
-
 		// Onboarding routes
 		apiV1.GET("/onboarding/status", server.getOnboardingStatusHandler)
 		apiV1.PUT("/onboarding/status", server.updateOnboardingStatusHandler)
@@ -567,49 +737,74 @@ func main() {
 		apiV1.DELETE("/projects/:project_id/apikeys/:key_id", server.deleteApiKeyHandler)
 		apiV1.PUT("/projects/:project_id/stripe-key", server.updateProjectStripeApiKeyHandler)
 
-		// Stripe Revenue Analytics routes
+		// ========================================
+		// Stripe Revenue Analytics routes (CACHED)
+		// ========================================
 		apiV1.POST("/projects/:project_id/stripe/sync", server.stripeService.SyncStripeDataHandler)
-		apiV1.GET("/projects/:project_id/stripe/metrics", server.stripeService.GetRevenueMetricsHandler)
-		apiV1.GET("/projects/:project_id/stripe/analytics", server.stripeService.GetRevenueAnalyticsHandler)
-		apiV1.GET("/projects/:project_id/stripe/customers", server.stripeService.GetCustomerAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/stripe/metrics", server.cacheResponseMiddleware(CacheTTLStripeMetrics), server.stripeService.GetRevenueMetricsHandler)
+		apiV1.GET("/projects/:project_id/stripe/analytics", server.cacheResponseMiddleware(CacheTTLStripeAnalytics), server.stripeService.GetRevenueAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/stripe/customers", server.cacheResponseMiddleware(CacheTTLStripeAnalytics), server.stripeService.GetCustomerAnalyticsHandler)
 
-		// Enhanced Analytics routes
-		apiV1.GET("/projects/:project_id/analytics/location", server.enhancedAnalyticsService.LocationAnalyticsHandler)
-		apiV1.GET("/projects/:project_id/analytics/devices", server.enhancedAnalyticsService.DeviceAnalyticsHandler)
-		apiV1.GET("/projects/:project_id/analytics/cohorts", server.enhancedAnalyticsService.RetentionCohortHandler)
-		apiV1.GET("/projects/:project_id/analytics/features", server.enhancedAnalyticsService.FeatureAdoptionHandler)
+		// ========================================
+		// Session Recording routes (CACHED)
+		// ========================================
+		apiV1.POST("/sessions/:session_id/recordings", server.ingestRecordingHandler)
+		apiV1.GET("/projects/:project_id/recordings", server.cacheResponseMiddleware(CacheTTLRecordingsList), server.listRecordingsHandler)
+		apiV1.GET("/projects/:project_id/recordings/:recordingId", server.getRecordingHandler) // Individual recordings not cached (large data)
+		apiV1.GET("/projects/:project_id/sessions", server.cacheResponseMiddleware(CacheTTLSessionsList), server.getSessionsHandler)
+		apiV1.GET("/projects/:project_id/sessions/:sessionId", server.getSessionHandler) // Individual sessions not cached
 
-		// Subscription Analytics routes (for paid user tracking and churn)
-		apiV1.GET("/projects/:project_id/analytics/paid-users", server.analyticsService.GetPaidUsersMetricsHandler)
-		apiV1.GET("/projects/:project_id/analytics/churn-metrics", server.analyticsService.GetChurnMetricsHandler)
-		apiV1.GET("/projects/:project_id/analytics/subscription-health", server.analyticsService.GetSubscriptionHealthHandler)
-		apiV1.GET("/projects/:project_id/analytics/churn", server.enhancedAnalyticsService.ChurnRiskHandler)
-		apiV1.GET("/projects/:project_id/analytics/funnels", server.enhancedAnalyticsService.ConversionFunnelHandler)
-		apiV1.GET("/projects/:project_id/analytics/sessions", server.enhancedAnalyticsService.SessionAnalyticsHandler)
+		// ========================================
+		// Heatmap routes (CACHED)
+		// ========================================
+		apiV1.GET("/projects/:project_id/heatmaps", server.cacheResponseMiddleware(CacheTTLHeatmapData), server.analyticsService.GetHeatmapHandler)
+		apiV1.GET("/projects/:project_id/heatmaps/pages", server.cacheResponseMiddleware(CacheTTLHeatmapData), server.getHeatmapPagesHandler)
 
-		// A/B Testing routes
+		// ========================================
+		// Enhanced Analytics routes (CACHED - 45min to 1hr)
+		// ========================================
+		apiV1.GET("/projects/:project_id/analytics/location", server.cacheResponseMiddleware(CacheTTLLocationAnalytics), server.enhancedAnalyticsService.LocationAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/analytics/devices", server.cacheResponseMiddleware(CacheTTLDeviceAnalytics), server.enhancedAnalyticsService.DeviceAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/analytics/cohorts", server.cacheResponseMiddleware(CacheTTLCohortAnalytics), server.enhancedAnalyticsService.RetentionCohortHandler)
+		apiV1.GET("/projects/:project_id/analytics/features", server.cacheResponseMiddleware(CacheTTLFeatureAdoption), server.enhancedAnalyticsService.FeatureAdoptionHandler)
+
+		// ========================================
+		// Subscription Analytics routes (CACHED - 30min)
+		// ========================================
+		apiV1.GET("/projects/:project_id/analytics/paid-users", server.cacheResponseMiddleware(CacheTTLPaidUserMetrics), server.analyticsService.GetPaidUsersMetricsHandler)
+		apiV1.GET("/projects/:project_id/analytics/churn-metrics", server.cacheResponseMiddleware(CacheTTLChurnMetrics), server.analyticsService.GetChurnMetricsHandler)
+		apiV1.GET("/projects/:project_id/analytics/subscription-health", server.cacheResponseMiddleware(CacheTTLSubscriptionHealth), server.analyticsService.GetSubscriptionHealthHandler)
+		apiV1.GET("/projects/:project_id/analytics/churn", server.cacheResponseMiddleware(CacheTTLChurnMetrics), server.enhancedAnalyticsService.ChurnRiskHandler)
+		apiV1.GET("/projects/:project_id/analytics/funnels", server.cacheResponseMiddleware(CacheTTLFunnelAnalytics), server.enhancedAnalyticsService.ConversionFunnelHandler)
+		apiV1.GET("/projects/:project_id/analytics/sessions", server.cacheResponseMiddleware(CacheTTLSessionAnalytics), server.enhancedAnalyticsService.SessionAnalyticsHandler)
+
+		// ========================================
+		// A/B Testing routes (CACHED for results only)
+		// ========================================
 		apiV1.POST("/projects/:project_id/experiments", server.CreateExperiment)
 		apiV1.GET("/projects/:project_id/experiments", server.GetExperiments)
 		apiV1.GET("/projects/:project_id/experiments/:experimentId", server.GetExperiment)
 		apiV1.PATCH("/projects/:project_id/experiments/:experimentId", server.UpdateExperiment)
 		apiV1.DELETE("/projects/:project_id/experiments/:experimentId", server.DeleteExperiment)
-		apiV1.GET("/projects/:project_id/experiments/:experimentId/results", server.GetExperimentResults)
+		apiV1.GET("/projects/:project_id/experiments/:experimentId/results", server.cacheResponseMiddleware(CacheTTLExperimentResults), server.GetExperimentResults)
 
-		// Global experiment routes (for SDK)
+		// Global experiment routes (for SDK) - NO CACHING (real-time assignment needed)
 		apiV1.POST("/experiments/:experimentKey/assignment", server.GetAssignment)
 		apiV1.POST("/experiments/track", server.TrackConversion)
 		apiV1.PUT("/experiments/:id/status", server.UpdateExperimentStatus)
 
-		// Mentiq Subscription Management routes
+		// Mentiq Subscription Management routes - NO CACHING (mutation heavy)
 		apiV1.POST("/subscriptions", server.createOrUpdateSubscriptionHandler)
 		apiV1.GET("/subscriptions/:account_id", server.getSubscriptionHandler)
 		apiV1.POST("/payments", server.createPaymentHandler)
 		apiV1.GET("/payments/:account_id", server.listPaymentsHandler)
 
-		// Feature Tracking & Onboarding routes
-		apiV1.GET("/projects/:project_id/features/usage", server.getFeatureUsageHandler)
-		apiV1.GET("/projects/:project_id/onboarding/stats", server.getOnboardingStatsHandler)
-		apiV1.GET("/projects/:project_id/users/:user_id/journey", server.getUserFeatureJourneyHandler)
+		// ========================================
+		// Feature Tracking & Onboarding routes (CACHED)
+		// ========================================
+		apiV1.GET("/projects/:project_id/features/usage", server.cacheResponseMiddleware(CacheTTLFeatureUsage), server.getFeatureUsageHandler)
+		apiV1.GET("/projects/:project_id/onboarding/stats", server.cacheResponseMiddleware(CacheTTLOnboardingStats), server.getOnboardingStatsHandler)
+		apiV1.GET("/projects/:project_id/users/:user_id/journey", server.getUserFeatureJourneyHandler) // User-specific, not cached
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)
@@ -1316,6 +1511,7 @@ func (s *Server) getRecordingHandler(c *gin.Context) {
 }
 
 // getSessionsHandler returns a list of sessions for a project
+// OPTIMIZED: Uses SQL aggregation instead of loading all events into memory
 func (s *Server) getSessionsHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	if projectID == "" {
@@ -1355,7 +1551,7 @@ func (s *Server) getSessionsHandler(c *gin.Context) {
 		}
 	}
 
-	// For now, get sessions from events - in a real implementation you might have a separate sessions table
+	// Date range
 	startDate := c.Query("start_date")
 	endDate := c.Query("end_date")
 	if startDate == "" {
@@ -1365,130 +1561,118 @@ func (s *Server) getSessionsHandler(c *gin.Context) {
 		endDate = time.Now().Format("2006-01-02")
 	}
 
-	// Fetch events to construct sessions
-	events, err := s.analyticsService.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
-	if err != nil {
-		log.Printf("Failed to fetch events for sessions: %v", err)
+	// Parse dates for SQL query
+	startTime, _ := time.Parse("2006-01-02", startDate)
+	endTime, _ := time.Parse("2006-01-02", endDate)
+	endTime = endTime.Add(24*time.Hour - time.Nanosecond)
+
+	// OPTIMIZED: Use SQL aggregation to get session data directly
+	type SessionAggregation struct {
+		SessionID  string    `gorm:"column:session_id"`
+		UserID     string    `gorm:"column:user_id"`
+		StartTime  time.Time `gorm:"column:start_time"`
+		EndTime    time.Time `gorm:"column:end_time"`
+		EventCount int64     `gorm:"column:event_count"`
+		PageViews  int64     `gorm:"column:page_views"`
+		Device     string    `gorm:"column:device"`
+		Browser    string    `gorm:"column:browser"`
+		Country    string    `gorm:"column:country"`
+	}
+
+	// Build the query
+	query := s.db.Table("events").
+		Select(`
+			session_id,
+			MAX(user_id) as user_id,
+			MIN(timestamp) as start_time,
+			MAX(timestamp) as end_time,
+			COUNT(*) as event_count,
+			SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) as page_views,
+			MAX(device) as device,
+			MAX(browser) as browser,
+			MAX(country) as country
+		`).
+		Where("project_id = ? AND account_id = ? AND timestamp BETWEEN ? AND ? AND session_id IS NOT NULL AND session_id != ''",
+			projectID, accountID.(string), startTime, endTime).
+		Group("session_id").
+		Order("start_time DESC")
+
+	// Apply user filter if provided
+	if userID != "" {
+		query = query.Having("MAX(user_id) = ?", userID)
+	}
+
+	// Get total count first
+	var totalCount int64
+	countQuery := s.db.Table("events").
+		Select("COUNT(DISTINCT session_id)").
+		Where("project_id = ? AND account_id = ? AND timestamp BETWEEN ? AND ? AND session_id IS NOT NULL AND session_id != ''",
+			projectID, accountID.(string), startTime, endTime)
+	if userID != "" {
+		countQuery = countQuery.Where("user_id = ?", userID)
+	}
+	countQuery.Scan(&totalCount)
+
+	// Apply pagination
+	var sessionAggs []SessionAggregation
+	if err := query.Offset(offset).Limit(limit).Scan(&sessionAggs).Error; err != nil {
+		log.Printf("Failed to fetch sessions: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve sessions"})
 		return
 	}
 
-	// Group events by session_id to create session summaries
-	sessionMap := make(map[string]map[string]interface{})
-	for _, event := range events {
-		sessionID := event.SessionID
-		if sessionID == "" {
-			continue
-		}
-
-		if userID != "" && event.UserID != userID {
-			continue
-		}
-
-		session, exists := sessionMap[sessionID]
-		if !exists {
-			session = map[string]interface{}{
-				"id":         sessionID,
-				"user_id":    event.UserID,
-				"start_time": event.Timestamp,
-				"end_time":   event.Timestamp,
-				"events":     0,
-				"page_views": 0,
-				"device":     "Unknown",
-				"browser":    "Unknown",
-				"location":   "Unknown",
-			}
-			sessionMap[sessionID] = session
-		}
-
-		// Update session data
-		session["events"] = session["events"].(int) + 1
-		if event.EventType == "page_view" {
-			session["page_views"] = session["page_views"].(int) + 1
-		}
-
-		// Update end time if this event is later
-		if event.Timestamp.After(session["end_time"].(time.Time)) {
-			session["end_time"] = event.Timestamp
-		}
-
-		// Update start time if this event is earlier
-		if event.Timestamp.Before(session["start_time"].(time.Time)) {
-			session["start_time"] = event.Timestamp
-		}
-
-		// Extract device info from event if available
-		if event.Device != "" {
-			session["device"] = event.Device
-		}
-		if event.Browser != "" {
-			session["browser"] = event.Browser
-		}
-		if event.Country != "" {
-			session["location"] = event.Country
-		}
-	}
-
-	// Fetch recording durations for all sessions
-	sessionIDs := make([]string, 0, len(sessionMap))
-	for sessionID := range sessionMap {
-		sessionIDs = append(sessionIDs, sessionID)
+	// Fetch recording durations for these sessions
+	sessionIDs := make([]string, 0, len(sessionAggs))
+	for _, sess := range sessionAggs {
+		sessionIDs = append(sessionIDs, sess.SessionID)
 	}
 
 	var recordings []SessionRecording
+	recordingDurations := make(map[string]int)
 	if len(sessionIDs) > 0 {
 		s.db.Where("session_id IN ? AND project_id = ?", sessionIDs, projectID).Find(&recordings)
+		for _, rec := range recordings {
+			recordingDurations[rec.SessionID] = rec.Duration
+		}
 	}
 
-	// Create a map of session_id -> recording duration
-	recordingDurations := make(map[string]int)
-	for _, rec := range recordings {
-		recordingDurations[rec.SessionID] = rec.Duration
-	}
-
-	// Convert to slice and set durations
-	sessions := make([]map[string]interface{}, 0, len(sessionMap))
-	for sessionID, session := range sessionMap {
-		startTime := session["start_time"].(time.Time)
-		endTime := session["end_time"].(time.Time)
-
-		// Use recording duration if available, otherwise calculate from events
-		if duration, exists := recordingDurations[sessionID]; exists && duration > 0 {
-			session["duration"] = duration
-		} else {
-			session["duration"] = int(endTime.Sub(startTime).Seconds())
+	// Build response
+	sessions := make([]map[string]interface{}, 0, len(sessionAggs))
+	for _, sess := range sessionAggs {
+		duration := int(sess.EndTime.Sub(sess.StartTime).Seconds())
+		if recDuration, exists := recordingDurations[sess.SessionID]; exists && recDuration > 0 {
+			duration = recDuration
 		}
 
-		sessions = append(sessions, session)
-	}
+		location := sess.Country
+		if location == "" {
+			location = "Unknown"
+		}
 
-	// Sort by start time descending
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i]["start_time"].(time.Time).After(sessions[j]["start_time"].(time.Time))
-	})
-
-	// Apply pagination
-	total := len(sessions)
-	start := offset
-	end := offset + limit
-	if start > total {
-		start = total
+		sessions = append(sessions, map[string]interface{}{
+			"id":         sess.SessionID,
+			"user_id":    sess.UserID,
+			"start_time": sess.StartTime,
+			"end_time":   sess.EndTime,
+			"events":     sess.EventCount,
+			"page_views": sess.PageViews,
+			"device":     sess.Device,
+			"browser":    sess.Browser,
+			"location":   location,
+			"duration":   duration,
+		})
 	}
-	if end > total {
-		end = total
-	}
-
-	paginatedSessions := sessions[start:end]
 
 	c.JSON(http.StatusOK, gin.H{
-		"sessions": paginatedSessions,
-		"total":    total,
+		"sessions": sessions,
+		"total":    totalCount,
 		"limit":    limit,
 		"offset":   offset,
 	})
 }
 
 // getSessionHandler returns detailed information about a specific session
+// OPTIMIZED: Removed redundant event fetch - we use direct WHERE session_id query instead
 func (s *Server) getSessionHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	sessionID := c.Param("sessionId")
@@ -1503,25 +1687,6 @@ func (s *Server) getSessionHandler(c *gin.Context) {
 	if accountID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
-	}
-
-	// Fetch events for this session
-	startDate := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
-	endDate := time.Now().Format("2006-01-02")
-
-	events, err := s.analyticsService.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
-	if err != nil {
-		log.Printf("Failed to fetch events for session: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve session"})
-		return
-	}
-
-	// Filter events for this session
-	sessionEvents := make([]Event, 0)
-	for _, event := range events {
-		if event.SessionID == sessionID {
-			sessionEvents = append(sessionEvents, event)
-		}
 	}
 
 	// Fetch recording for this session
@@ -1618,6 +1783,7 @@ func (s *Server) getSessionHandler(c *gin.Context) {
 }
 
 // getHeatmapPagesHandler returns a list of pages with heatmap data
+// OPTIMIZED: Uses SQL JSON extraction and aggregation instead of loading all events
 func (s *Server) getHeatmapPagesHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	if projectID == "" {
@@ -1640,69 +1806,57 @@ func (s *Server) getHeatmapPagesHandler(c *gin.Context) {
 		return
 	}
 
-	// Fetch recent events to get page URLs
-	startDate := time.Now().AddDate(0, 0, -7).Format("2006-01-02")
-	endDate := time.Now().Format("2006-01-02")
+	// Calculate date range
+	startDate := time.Now().AddDate(0, 0, -7)
+	endDate := time.Now().Add(24*time.Hour - time.Nanosecond)
 
-	events, err := s.analyticsService.fetchEventsForDateRange(accountID.(string), projectID, startDate, endDate)
+	// OPTIMIZED: Use SQL aggregation with JSON extraction instead of loading all events
+	type PageStats struct {
+		URL         string    `gorm:"column:url"`
+		Title       string    `gorm:"column:title"`
+		Visits      int64     `gorm:"column:visits"`
+		LastUpdated time.Time `gorm:"column:last_updated"`
+	}
+
+	var pageStats []PageStats
+	err := s.db.Raw(`
+		SELECT 
+			properties->>'url' as url,
+			MAX(COALESCE(NULLIF(properties->>'title', ''), properties->>'url')) as title,
+			COUNT(*) as visits,
+			MAX(timestamp) as last_updated
+		FROM events
+		WHERE account_id = ? 
+			AND project_id = ?
+			AND timestamp BETWEEN ? AND ?
+			AND properties->>'url' IS NOT NULL
+			AND properties->>'url' != ''
+		GROUP BY properties->>'url'
+		ORDER BY visits DESC
+		LIMIT 100
+	`, accountID.(string), projectID, startDate, endDate).Scan(&pageStats).Error
+
 	if err != nil {
-		log.Printf("Failed to fetch events for heatmap pages: %v", err)
+		log.Printf("Failed to fetch heatmap pages: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve pages"})
 		return
 	}
 
-	// Extract unique page URLs and count visits
-	pageMap := make(map[string]map[string]interface{})
-	for _, event := range events {
-		if event.Properties == nil {
-			continue
+	// Build response
+	pages := make([]map[string]interface{}, 0, len(pageStats))
+	for _, page := range pageStats {
+		title := page.Title
+		if title == "" {
+			title = page.URL
 		}
-
-		var url string
-		if urlProp, exists := event.Properties["url"]; exists {
-			if urlStr, ok := urlProp.(string); ok {
-				url = urlStr
-			}
-		}
-
-		if url == "" {
-			continue
-		}
-
-		page, exists := pageMap[url]
-		if !exists {
-			page = map[string]interface{}{
-				"id":           uuid.New().String(),
-				"url":          url,
-				"title":        url, // Default to URL, could extract from page_view events
-				"visits":       0,
-				"last_updated": event.Timestamp,
-			}
-			pageMap[url] = page
-		}
-
-		page["visits"] = page["visits"].(int) + 1
-		if event.Timestamp.After(page["last_updated"].(time.Time)) {
-			page["last_updated"] = event.Timestamp
-		}
-
-		// Try to get page title from properties
-		if title, exists := event.Properties["title"]; exists {
-			if titleStr, ok := title.(string); ok && titleStr != "" {
-				page["title"] = titleStr
-			}
-		}
+		pages = append(pages, map[string]interface{}{
+			"id":           uuid.New().String(),
+			"url":          page.URL,
+			"title":        title,
+			"visits":       page.Visits,
+			"last_updated": page.LastUpdated,
+		})
 	}
-
-	// Convert to slice and sort by visits descending
-	pages := make([]map[string]interface{}, 0, len(pageMap))
-	for _, page := range pageMap {
-		pages = append(pages, page)
-	}
-
-	sort.Slice(pages, func(i, j int) bool {
-		return pages[i]["visits"].(int) > pages[j]["visits"].(int)
-	})
 
 	c.JSON(http.StatusOK, pages)
 }
