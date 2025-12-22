@@ -11,7 +11,7 @@ import (
 
 // addProjectMemberHandler adds a user to a project
 func (s *Server) addProjectMemberHandler(c *gin.Context) {
-	projectID := c.Param("id")
+	projectID := c.Param("project_id")
 	accountID, _ := c.Get("account_id")
 
 	var req struct {
@@ -89,7 +89,7 @@ func (s *Server) addProjectMemberHandler(c *gin.Context) {
 
 // listProjectMembersHandler lists all members of a project
 func (s *Server) listProjectMembersHandler(c *gin.Context) {
-	projectID := c.Param("id")
+	projectID := c.Param("project_id")
 	accountID, _ := c.Get("account_id")
 
 	// Verify project exists and belongs to user's account
@@ -115,7 +115,7 @@ func (s *Server) listProjectMembersHandler(c *gin.Context) {
 
 // updateProjectMemberHandler updates a member's role in a project
 func (s *Server) updateProjectMemberHandler(c *gin.Context) {
-	projectID := c.Param("id")
+	projectID := c.Param("project_id")
 	memberID := c.Param("member_id")
 	accountID, _ := c.Get("account_id")
 
@@ -172,7 +172,7 @@ func (s *Server) updateProjectMemberHandler(c *gin.Context) {
 
 // removeProjectMemberHandler removes a user from a project
 func (s *Server) removeProjectMemberHandler(c *gin.Context) {
-	projectID := c.Param("id")
+	projectID := c.Param("project_id")
 	memberID := c.Param("member_id")
 	accountID, _ := c.Get("account_id")
 

@@ -204,8 +204,15 @@ func (s *Server) getOnboardingTasksHandler(c *gin.Context) {
 	var status OnboardingStatus
 	err := s.db.Where("account_id = ?", accountID).First(&status).Error
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Onboarding status not found"})
-		return
+		// If not found, create a new onboarding status (same as getOnboardingStatusHandler)
+		status = OnboardingStatus{
+			ID:        uuid.New().String(),
+			AccountID: accountID,
+		}
+		if err := s.db.Create(&status).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create onboarding status"})
+			return
+		}
 	}
 
 	type Task struct {
@@ -224,7 +231,7 @@ func (s *Server) getOnboardingTasksHandler(c *gin.Context) {
 			Description: "Install the SDK and track your first user event",
 			Completed:   status.FirstEventTracked,
 			CompletedAt: status.FirstEventTrackedAt,
-			Route:       "/dashboard/onboarding/setup",
+			Route:       "/dashboard/onboarding",
 		},
 		{
 			ID:          "stripe_connected",
@@ -232,7 +239,7 @@ func (s *Server) getOnboardingTasksHandler(c *gin.Context) {
 			Description: "Add your Stripe API key to track revenue and churn",
 			Completed:   status.StripeConnected,
 			CompletedAt: status.StripeConnectedAt,
-			Route:       "/dashboard/settings?tab=integrations",
+			Route:       "/dashboard/pricing",
 		},
 		{
 			ID:          "team_invited",
@@ -240,7 +247,7 @@ func (s *Server) getOnboardingTasksHandler(c *gin.Context) {
 			Description: "Collaborate with your team on analytics and insights",
 			Completed:   status.TeamMembersInvited,
 			CompletedAt: status.TeamMembersInvitedAt,
-			Route:       "/dashboard/settings?tab=team",
+			Route:       "/dashboard/team",
 		},
 	}
 

@@ -98,6 +98,8 @@ type Server struct {
 	stripeService            *StripeService
 	enhancedAnalyticsService *EnhancedAnalyticsService
 	sessionStorage           *SessionStorageService
+	emailService             *EmailService
+	llmService               *LLMService
 
 	// Entity caches with TTL
 	projectCache     map[string]*CacheEntry // Key: projectID
@@ -110,6 +112,7 @@ type Server struct {
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 	stripeService := NewStripeService(db)
 	enhancedAnalyticsService := NewEnhancedAnalyticsService(db)
+	emailService := NewEmailService()
 
 	// Initialize session storage (optional - falls back to DB if not configured)
 	sessionStorage, err := NewSessionStorageService()
@@ -124,6 +127,7 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		stripeService:            stripeService,
 		enhancedAnalyticsService: enhancedAnalyticsService,
 		sessionStorage:           sessionStorage,
+		emailService:             emailService,
 		projectCache:             make(map[string]*CacheEntry),
 		accountCache:             make(map[string]*CacheEntry),
 		apiKeyCache:              make(map[string]*CacheEntry),
@@ -196,6 +200,7 @@ type JWTClaims struct {
 	AccountID string `json:"account_id"`
 	Email     string `json:"email"`
 	IsAdmin   bool   `json:"is_admin"`
+	Role      string `json:"role,omitempty"`    // "owner", "admin", "member", "viewer"
 	ProjectID string `json:"project_id,omitempty"`
 	APIKeyID  string `json:"api_key_id,omitempty"`
 	Type      string `json:"type"` // "access" or "refresh"
@@ -204,7 +209,7 @@ type JWTClaims struct {
 }
 
 // GenerateJWT generates a JWT token for an account with HMAC-SHA256 signing
-func GenerateJWT(accountID, email, tokenType string, isAdmin bool, expiresInHours int) (string, error) {
+func GenerateJWT(accountID, email, tokenType string, isAdmin bool, role string, expiresInHours int) (string, error) {
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		return "", fmt.Errorf("JWT_SECRET must be configured")
@@ -217,6 +222,7 @@ func GenerateJWT(accountID, email, tokenType string, isAdmin bool, expiresInHour
 		AccountID: accountID,
 		Email:     email,
 		IsAdmin:   isAdmin,
+		Role:      role,
 		Type:      tokenType,
 		Exp:       expiryTime,
 		Iat:       now,
@@ -501,6 +507,7 @@ func main() {
 	router.POST("/signup", server.signupHandler)
 	router.POST("/login", server.loginHandler)
 	router.POST("/refresh", server.refreshTokenHandler)
+	router.POST("/api/v1/invitations/accept", server.acceptInvitationHandler)
 	router.GET("/health", healthCheckHandler)
 
 	// Webhook routes (no authentication - secured by signature validation)
@@ -568,10 +575,10 @@ func main() {
 		apiV1.PUT("/projects/:project_id/stripe-key", server.updateProjectStripeApiKeyHandler)
 
 		// Project Member management
-		apiV1.POST("/projects/:id/members", server.addProjectMemberHandler)
-		apiV1.GET("/projects/:id/members", server.listProjectMembersHandler)
-		apiV1.PUT("/projects/:id/members/:member_id", server.updateProjectMemberHandler)
-		apiV1.DELETE("/projects/:id/members/:member_id", server.removeProjectMemberHandler)
+		apiV1.POST("/projects/:project_id/members", server.addProjectMemberHandler)
+		apiV1.GET("/projects/:project_id/members", server.listProjectMembersHandler)
+		apiV1.PUT("/projects/:project_id/members/:member_id", server.updateProjectMemberHandler)
+		apiV1.DELETE("/projects/:project_id/members/:member_id", server.removeProjectMemberHandler)
 		apiV1.GET("/users/:user_id/projects", server.getUserProjectsHandler)
 
 		// Stripe Revenue Analytics routes
@@ -607,6 +614,40 @@ func main() {
 		apiV1.POST("/experiments/track", server.TrackConversion)
 		apiV1.PUT("/experiments/:id/status", server.UpdateExperimentStatus)
 
+		// Playbook routes
+		apiV1.POST("/projects/:project_id/playbooks", server.createPlaybookHandler)
+		apiV1.GET("/projects/:project_id/playbooks", server.getPlaybooksHandler)
+		apiV1.GET("/projects/:project_id/playbooks/summary", server.getPlaybooksSummaryHandler)
+		apiV1.GET("/projects/:project_id/playbooks/:playbook_id", server.getPlaybookHandler)
+		apiV1.PUT("/projects/:project_id/playbooks/:playbook_id", server.updatePlaybookHandler)
+		apiV1.DELETE("/projects/:project_id/playbooks/:playbook_id", server.deletePlaybookHandler)
+		apiV1.PATCH("/projects/:project_id/playbooks/:playbook_id/status", server.updatePlaybookStatusHandler)
+
+		// Playbook Steps routes
+		apiV1.POST("/projects/:project_id/playbooks/:playbook_id/steps", server.addStepHandler)
+		apiV1.PUT("/projects/:project_id/playbooks/:playbook_id/steps/:step_id", server.updateStepHandler)
+		apiV1.DELETE("/projects/:project_id/playbooks/:playbook_id/steps/:step_id", server.deleteStepHandler)
+
+		// Playbook Triggers routes
+		apiV1.POST("/projects/:project_id/playbooks/:playbook_id/triggers", server.createTriggerHandler)
+		apiV1.GET("/projects/:project_id/playbooks/:playbook_id/triggers", server.getTriggersHandler)
+		apiV1.PUT("/projects/:project_id/playbooks/:playbook_id/triggers/:trigger_id", server.updateTriggerHandler)
+		apiV1.DELETE("/projects/:project_id/playbooks/:playbook_id/triggers/:trigger_id", server.deleteTriggerHandler)
+		apiV1.PATCH("/projects/:project_id/playbooks/:playbook_id/triggers/:trigger_id/toggle", server.toggleTriggerHandler)
+
+		// Playbook Enrollments routes
+		apiV1.POST("/projects/:project_id/playbooks/:playbook_id/enroll", server.enrollUsersHandler)
+		apiV1.GET("/projects/:project_id/playbooks/:playbook_id/enrollments", server.getEnrollmentsHandler)
+		apiV1.POST("/projects/:project_id/playbooks/:playbook_id/enrollments/:enrollment_id/exit", server.exitEnrollmentHandler)
+
+		// Playbook Analytics routes
+		apiV1.GET("/projects/:project_id/playbooks/:playbook_id/analytics", server.getPlaybookAnalyticsHandler)
+
+		// Playbook LLM Generation routes
+		apiV1.POST("/projects/:project_id/playbooks/generate", server.generatePlaybookHandler)
+		apiV1.GET("/projects/:project_id/playbooks/generate/:generation_id", server.getGenerationStatusHandler)
+		apiV1.POST("/projects/:project_id/playbooks/generate/:generation_id/apply", server.applyGeneratedPlaybookHandler)
+
 		// Mentiq Subscription Management routes
 		apiV1.POST("/subscriptions", server.createOrUpdateSubscriptionHandler)
 		apiV1.GET("/subscriptions/:account_id", server.getSubscriptionHandler)
@@ -617,6 +658,17 @@ func main() {
 		apiV1.GET("/projects/:project_id/features/usage", server.getFeatureUsageHandler)
 		apiV1.GET("/projects/:project_id/onboarding/stats", server.getOnboardingStatsHandler)
 		apiV1.GET("/projects/:project_id/users/:user_id/journey", server.getUserFeatureJourneyHandler)
+
+		// Team Invitation routes
+		apiV1.POST("/invitations", server.createInvitationHandler)
+		apiV1.GET("/invitations", server.listInvitationsHandler)
+		apiV1.DELETE("/invitations/:id", server.cancelInvitationHandler)
+		apiV1.POST("/invitations/:id/resend", server.resendInvitationHandler)
+
+		// Team Member management routes
+		apiV1.GET("/team/members", server.listAccountMembersHandler)
+		apiV1.PUT("/team/members/:id", server.updateAccountMemberHandler)
+		apiV1.DELETE("/team/members/:id", server.removeAccountMemberHandler)
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)
@@ -973,6 +1025,15 @@ func (s *Server) updateProjectStripeApiKeyHandler(c *gin.Context) {
 	accountID, _ := c.Get("account_id")
 	if accountID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	email := c.GetString("email")
+
+	// Check user role - require member or above
+	userRole, err := s.getUserRole(accountID.(string), email)
+	if err != nil || (userRole != "owner" && userRole != "admin" && userRole != "member") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only members and above can update Stripe API key"})
 		return
 	}
 
@@ -1809,27 +1870,55 @@ func (s *Server) loginHandler(c *gin.Context) {
 		return
 	}
 
-	// Find account by email
-	var account Account
-	if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-		return
+	// Normalize email
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
+	// Try to find team member user first
+	var user User
+	var accountID string
+	var userName string
+	var userEmail string
+	var isAdmin bool
+	var userRole string
+	var hashedPassword string
+
+	if err := s.db.Where("email = ? AND is_active = ?", req.Email, true).First(&user).Error; err == nil {
+		// Found a team member user
+		accountID = user.AccountID
+		userName = user.FullName
+		userEmail = user.Email
+		isAdmin = false // Team members are not admins by default
+		userRole = user.Role
+		hashedPassword = user.Password
+	} else {
+		// Try to find account owner
+		var account Account
+		if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+			return
+		}
+		accountID = account.ID
+		userName = account.Name
+		userEmail = account.Email
+		isAdmin = account.IsAdmin
+		userRole = "owner" // Account owners always have owner role
+		hashedPassword = account.Password
 	}
 
 	// Verify password
-	if err := bcrypt.CompareHashAndPassword([]byte(account.Password), []byte(req.Password)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(req.Password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
 	// Generate access token (1 hour expiration) and refresh token (7 days expiration)
-	accessToken, err := GenerateJWT(account.ID, account.Email, "access", account.IsAdmin, 1)
+	accessToken, err := GenerateJWT(accountID, userEmail, "access", isAdmin, userRole, 1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
 		return
 	}
 
-	refreshToken, err := GenerateJWT(account.ID, account.Email, "refresh", account.IsAdmin, 24*7)
+	refreshToken, err := GenerateJWT(accountID, userEmail, "refresh", isAdmin, userRole, 24*7)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
 		return
@@ -1839,7 +1928,7 @@ func (s *Server) loginHandler(c *gin.Context) {
 	refreshTokenRecord := RefreshToken{
 		ID:        uuid.New().String(),
 		Token:     refreshToken,
-		AccountID: account.ID,
+		AccountID: accountID,
 		ExpiresAt: time.Now().Add(24 * 7 * time.Hour),
 		IsRevoked: false,
 	}
@@ -1852,7 +1941,7 @@ func (s *Server) loginHandler(c *gin.Context) {
 	// Get user's projects to return the first project ID
 	var projects []Project
 	var projectID string
-	if err := s.db.Where("account_id = ?", account.ID).Find(&projects).Error; err == nil && len(projects) > 0 {
+	if err := s.db.Where("account_id = ?", accountID).Find(&projects).Error; err == nil && len(projects) > 0 {
 		projectID = projects[0].ID
 	}
 
@@ -1860,7 +1949,7 @@ func (s *Server) loginHandler(c *gin.Context) {
 	var subscription AccountSubscription
 	hasActiveSubscription := false
 	subscriptionStatus := "none"
-	if err := s.db.Where("account_id = ?", account.ID).First(&subscription).Error; err == nil {
+	if err := s.db.Where("account_id = ?", accountID).First(&subscription).Error; err == nil {
 		subscriptionStatus = subscription.Status
 		// Consider active, trialing, or developer tier as having subscription
 		if subscription.Status == "active" || subscription.Status == "trialing" || subscription.Tier == "developer" {
@@ -1874,10 +1963,11 @@ func (s *Server) loginHandler(c *gin.Context) {
 		"expiresIn":    3600, // 1 hour in seconds
 		"projectId":    projectID,
 		"user": gin.H{
-			"id":                    account.ID,
-			"name":                  account.Name,
-			"email":                 account.Email,
-			"isAdmin":               account.IsAdmin,
+			"id":                    accountID,
+			"name":                  userName,
+			"email":                 userEmail,
+			"isAdmin":               isAdmin,
+			"role":                  userRole,
 			"hasActiveSubscription": hasActiveSubscription,
 			"subscriptionStatus":    subscriptionStatus,
 		},
@@ -2031,6 +2121,12 @@ func (s *Server) authMiddleware(c *gin.Context) {
 			c.Set("is_admin", true)
 		}
 
+		// Look up user_id for team member operations
+		var user User
+		if err := s.db.Where("account_id = ? AND email = ?", claims.AccountID, claims.Email).First(&user).Error; err == nil {
+			c.Set("user_id", user.ID)
+		}
+
 		// Validate X-Project-ID header if provided
 		if projectID != "" {
 			// CRITICAL: Verify the project belongs to this account
@@ -2056,6 +2152,12 @@ func (s *Server) authMiddleware(c *gin.Context) {
 
 	c.Set("account_id", account.ID)
 	c.Set("email", account.Email)
+
+	// Look up user_id for team member operations (backward compatibility path)
+	var user User
+	if err := s.db.Where("account_id = ? AND email = ?", account.ID, account.Email).First(&user).Error; err == nil {
+		c.Set("user_id", user.ID)
+	}
 
 	// Validate X-Project-ID header if provided
 	if projectID != "" {
@@ -2135,6 +2237,14 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 	}
 
 	accountID, _ := c.Get("account_id")
+	email := c.GetString("email")
+
+	// Check user role - require member or above
+	userRole, err := s.getUserRole(accountID.(string), email)
+	if err != nil || (userRole != "owner" && userRole != "admin" && userRole != "member") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only members and above can create projects"})
+		return
+	}
 
 	// Check existing project count for non-enterprise users
 	var existingProjects []Project
@@ -2188,6 +2298,14 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 func (s *Server) updateProjectHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	accountID, _ := c.Get("account_id")
+	email := c.GetString("email")
+
+	// Check user role - require member or above
+	userRole, err := s.getUserRole(accountID.(string), email)
+	if err != nil || (userRole != "owner" && userRole != "admin" && userRole != "member") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only members and above can update projects"})
+		return
+	}
 
 	var req UpdateProjectRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2229,6 +2347,14 @@ func (s *Server) updateProjectHandler(c *gin.Context) {
 func (s *Server) deleteProjectHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	accountID, _ := c.Get("account_id")
+	email := c.GetString("email")
+
+	// Check user role - only owners can delete projects
+	userRole, err := s.getUserRole(accountID.(string), email)
+	if err != nil || userRole != "owner" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only account owners can delete projects"})
+		return
+	}
 
 	// Verify project exists and belongs to user
 	var project Project
@@ -2289,15 +2415,21 @@ func (s *Server) refreshTokenHandler(c *gin.Context) {
 		return
 	}
 
+	// Get role from claims, default to owner if not present (for backward compatibility)
+	role := claims.Role
+	if role == "" {
+		role = "owner"
+	}
+
 	// Generate new access token
-	newAccessToken, err := GenerateJWT(claims.AccountID, claims.Email, "access", claims.IsAdmin, 1)
+	newAccessToken, err := GenerateJWT(claims.AccountID, claims.Email, "access", claims.IsAdmin, role, 1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
 		return
 	}
 
 	// Optionally generate new refresh token (refresh token rotation)
-	newRefreshToken, err := GenerateJWT(claims.AccountID, claims.Email, "refresh", claims.IsAdmin, 24*7)
+	newRefreshToken, err := GenerateJWT(claims.AccountID, claims.Email, "refresh", claims.IsAdmin, role, 24*7)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
 		return
@@ -2338,6 +2470,14 @@ func (s *Server) createApiKeyHandler(c *gin.Context) {
 	}
 
 	accountID, _ := c.Get("account_id")
+	email := c.GetString("email")
+
+	// Check user role - require member or above
+	userRole, err := s.getUserRole(accountID.(string), email)
+	if err != nil || (userRole != "owner" && userRole != "admin" && userRole != "member") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only members and above can create API keys"})
+		return
+	}
 
 	// Verify project exists and belongs to user
 	var project Project
@@ -2413,6 +2553,14 @@ func (s *Server) updateApiKeyHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	keyID := c.Param("key_id")
 	accountID, _ := c.Get("account_id")
+	email := c.GetString("email")
+
+	// Check user role - require member or above
+	userRole, err := s.getUserRole(accountID.(string), email)
+	if err != nil || (userRole != "owner" && userRole != "admin" && userRole != "member") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only members and above can update API keys"})
+		return
+	}
 
 	// Verify project exists and belongs to user
 	var project Project
@@ -2481,6 +2629,14 @@ func (s *Server) deleteApiKeyHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	keyID := c.Param("key_id")
 	accountID, _ := c.Get("account_id")
+	email := c.GetString("email")
+
+	// Check user role - require member or above
+	userRole, err := s.getUserRole(accountID.(string), email)
+	if err != nil || (userRole != "owner" && userRole != "admin" && userRole != "member") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only members and above can delete API keys"})
+		return
+	}
 
 	// Verify project exists and belongs to user
 	var project Project

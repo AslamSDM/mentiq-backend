@@ -42,6 +42,29 @@ type User struct {
 	ProjectMemberships []ProjectMember `gorm:"foreignKey:UserID" json:"project_memberships,omitempty"`
 }
 
+// UserInvitation represents a pending team member invitation
+type UserInvitation struct {
+	ID          string     `gorm:"primaryKey" json:"id"`
+	Email       string     `gorm:"index;not null" json:"email"`
+	Token       string     `gorm:"uniqueIndex;not null" json:"token"`
+	Role        string     `json:"role" gorm:"default:'member'"` // owner, admin, member, viewer
+	Status      string     `json:"status" gorm:"default:'pending'"` // pending, accepted, expired, canceled
+	AccountID   string     `gorm:"index;not null" json:"account_id"`
+	InvitedByID string     `gorm:"index;not null" json:"invited_by_id"` // User ID who sent invite
+	ExpiresAt   time.Time  `gorm:"not null;index" json:"expires_at"`
+	AcceptedAt  *time.Time `json:"accepted_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+
+	// Relations
+	Account   Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+	InvitedBy User    `gorm:"foreignKey:InvitedByID;references:ID" json:"invited_by,omitempty"`
+}
+
+func (UserInvitation) TableName() string {
+	return "user_invitations"
+}
+
 // ProjectMember represents a user's membership and permissions in a specific project
 type ProjectMember struct {
 	ID        string    `gorm:"primaryKey" json:"id"`
@@ -64,7 +87,7 @@ func (ProjectMember) TableName() string {
 type Project struct {
 	ID           string    `gorm:"primaryKey" json:"id"`
 	Name         string    `json:"name"`
-	Description  string    `json:"description"`
+	Description  string    `json:"description" gorm:"default:''"`
 	StripeAPIKey string    `json:"-" gorm:"column:stripe_api_key"` // Don't expose in JSON for security
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
@@ -639,4 +662,184 @@ type OnboardingStatus struct {
 
 	// Relations
 	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+}
+
+// =====================
+// PLAYBOOKS
+// =====================
+
+// Playbook represents a reusable automation workflow template
+type Playbook struct {
+	ID              string     `gorm:"primaryKey" json:"id"`
+	ProjectID       string     `gorm:"index;not null" json:"project_id"`
+	Name            string     `gorm:"not null" json:"name"`
+	Description     string     `json:"description"`
+	Type            string     `gorm:"index;not null" json:"type"`              // "churn_prevention", "growth_expansion", "onboarding", "engagement"
+	Status          string     `gorm:"index;default:'draft'" json:"status"`     // "draft", "active", "paused", "archived"
+	Source          string     `gorm:"default:'manual'" json:"source"`          // "manual", "llm_generated"
+	LLMPromptUsed   string     `json:"llm_prompt_used,omitempty"`               // Prompt used if LLM-generated
+	LLMModelVersion string     `json:"llm_model_version,omitempty"`             // Model version if LLM-generated
+	CreatedBy       string     `json:"created_by"`                              // User or Account ID who created
+	ActivatedAt     *time.Time `json:"activated_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+
+	// Relations
+	Project     Project              `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+	Steps       []PlaybookStep       `gorm:"foreignKey:PlaybookID" json:"steps,omitempty"`
+	Triggers    []PlaybookTrigger    `gorm:"foreignKey:PlaybookID" json:"triggers,omitempty"`
+	Enrollments []PlaybookEnrollment `gorm:"foreignKey:PlaybookID" json:"enrollments,omitempty"`
+}
+
+func (Playbook) TableName() string {
+	return "playbook"
+}
+
+// PlaybookStep represents a single action/step in a playbook workflow
+type PlaybookStep struct {
+	ID           string                 `gorm:"primaryKey" json:"id"`
+	PlaybookID   string                 `gorm:"index;not null" json:"playbook_id"`
+	StepOrder    int                    `gorm:"not null" json:"step_order"`
+	Name         string                 `gorm:"not null" json:"name"`
+	Description  string                 `json:"description"`
+	ActionType   string                 `gorm:"not null" json:"action_type"` // "email", "in_app_message", "webhook", "wait", "condition", "feature_flag"
+	ActionConfig map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"action_config"`
+	DelayMinutes int                    `json:"delay_minutes"`                                              // Wait time before this step executes
+	Conditions   map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"conditions,omitempty"`     // Exit/skip conditions
+	IsRequired   bool                   `gorm:"default:true" json:"is_required"`
+	CreatedAt    time.Time              `json:"created_at"`
+	UpdatedAt    time.Time              `json:"updated_at"`
+
+	// Relations
+	Playbook Playbook `gorm:"foreignKey:PlaybookID;references:ID" json:"playbook,omitempty"`
+}
+
+func (PlaybookStep) TableName() string {
+	return "playbook_step"
+}
+
+// PlaybookTrigger defines when a playbook should automatically activate for users
+type PlaybookTrigger struct {
+	ID              string                 `gorm:"primaryKey" json:"id"`
+	PlaybookID      string                 `gorm:"index;not null" json:"playbook_id"`
+	Name            string                 `json:"name"`
+	TriggerType     string                 `gorm:"not null" json:"trigger_type"` // "event", "metric_threshold", "segment", "schedule"
+	Conditions      map[string]interface{} `gorm:"type:jsonb;serializer:json;not null" json:"conditions"`
+	IsEnabled       bool                   `gorm:"default:true" json:"is_enabled"`
+	Priority        int                    `gorm:"default:0" json:"priority"`     // Higher = runs first
+	CooldownMinutes int                    `json:"cooldown_minutes"`              // Prevent re-triggering
+	MaxEnrollments  int                    `json:"max_enrollments"`               // 0 = unlimited
+	CreatedAt       time.Time              `json:"created_at"`
+	UpdatedAt       time.Time              `json:"updated_at"`
+
+	// Relations
+	Playbook Playbook `gorm:"foreignKey:PlaybookID;references:ID" json:"playbook,omitempty"`
+}
+
+func (PlaybookTrigger) TableName() string {
+	return "playbook_trigger"
+}
+
+// PlaybookEnrollment tracks a user's progress through a playbook
+type PlaybookEnrollment struct {
+	ID               string                  `gorm:"primaryKey" json:"id"`
+	PlaybookID       string                  `gorm:"index;not null" json:"playbook_id"`
+	ProjectID        string                  `gorm:"index;not null" json:"project_id"`
+	UserID           string                  `gorm:"index;not null" json:"user_id"`
+	TriggerID        *string                 `json:"trigger_id,omitempty"`                                      // Which trigger enrolled the user (null if manual)
+	Status           string                  `gorm:"index;default:'active'" json:"status"`                      // "active", "completed", "exited", "paused"
+	CurrentStepOrder int                     `gorm:"default:1" json:"current_step_order"`
+	EnrolledAt       time.Time               `json:"enrolled_at"`
+	CompletedAt      *time.Time              `json:"completed_at,omitempty"`
+	ExitedAt         *time.Time              `json:"exited_at,omitempty"`
+	ExitReason       string                  `json:"exit_reason,omitempty"`                                     // "completed", "manual_exit", "condition_met", "goal_achieved"
+	MetricsAtStart   map[string]interface{}  `gorm:"type:jsonb;serializer:json" json:"metrics_at_start"`        // Health score, etc at enrollment
+	MetricsAtEnd     map[string]interface{}  `gorm:"type:jsonb;serializer:json" json:"metrics_at_end,omitempty"`
+	CreatedAt        time.Time               `json:"created_at"`
+	UpdatedAt        time.Time               `json:"updated_at"`
+
+	// Relations
+	Playbook       Playbook                `gorm:"foreignKey:PlaybookID;references:ID" json:"playbook,omitempty"`
+	StepExecutions []PlaybookStepExecution `gorm:"foreignKey:EnrollmentID" json:"step_executions,omitempty"`
+}
+
+func (PlaybookEnrollment) TableName() string {
+	return "playbook_enrollment"
+}
+
+// PlaybookStepExecution tracks individual step execution for an enrollment
+type PlaybookStepExecution struct {
+	ID              string                 `gorm:"primaryKey" json:"id"`
+	EnrollmentID    string                 `gorm:"index;not null" json:"enrollment_id"`
+	StepID          string                 `gorm:"index;not null" json:"step_id"`
+	Status          string                 `gorm:"default:'pending'" json:"status"` // "pending", "scheduled", "executing", "completed", "failed", "skipped"
+	ScheduledAt     *time.Time             `json:"scheduled_at,omitempty"`
+	StartedAt       *time.Time             `json:"started_at,omitempty"`
+	CompletedAt     *time.Time             `json:"completed_at,omitempty"`
+	FailedAt        *time.Time             `json:"failed_at,omitempty"`
+	FailureReason   string                 `json:"failure_reason,omitempty"`
+	RetryCount      int                    `gorm:"default:0" json:"retry_count"`
+	ExecutionResult map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"execution_result,omitempty"`
+	CreatedAt       time.Time              `json:"created_at"`
+	UpdatedAt       time.Time              `json:"updated_at"`
+
+	// Relations
+	Enrollment PlaybookEnrollment `gorm:"foreignKey:EnrollmentID;references:ID" json:"enrollment,omitempty"`
+	Step       PlaybookStep       `gorm:"foreignKey:StepID;references:ID" json:"step,omitempty"`
+}
+
+func (PlaybookStepExecution) TableName() string {
+	return "playbook_step_execution"
+}
+
+// PlaybookAnalytics stores aggregated metrics for playbook performance
+type PlaybookAnalytics struct {
+	ID                     uint      `gorm:"primaryKey" json:"id"`
+	PlaybookID             string    `gorm:"index;not null" json:"playbook_id"`
+	Date                   time.Time `gorm:"index" json:"date"`
+	TotalEnrollments       int       `json:"total_enrollments"`
+	ActiveEnrollments      int       `json:"active_enrollments"`
+	CompletedEnrollments   int       `json:"completed_enrollments"`
+	ExitedEnrollments      int       `json:"exited_enrollments"`
+	CompletionRate         float64   `json:"completion_rate"`
+	AvgTimeToComplete      int       `json:"avg_time_to_complete"`      // In minutes
+	ChurnPrevented         int       `json:"churn_prevented"`           // Users who improved from at-risk
+	RevenueImpact          int64     `json:"revenue_impact"`            // In cents
+	HealthScoreImprovement float64   `json:"health_score_improvement"`  // Average improvement
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+
+	// Relations
+	Playbook Playbook `gorm:"foreignKey:PlaybookID;references:ID" json:"playbook,omitempty"`
+}
+
+func (PlaybookAnalytics) TableName() string {
+	return "playbook_analytics"
+}
+
+// LLMPlaybookGeneration tracks LLM generation requests for playbooks
+type LLMPlaybookGeneration struct {
+	ID             string                 `gorm:"primaryKey" json:"id"`
+	ProjectID      string                 `gorm:"index;not null" json:"project_id"`
+	PlaybookType   string                 `json:"playbook_type"`                                      // "churn_prevention", "growth_expansion"
+	InputContext   map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"input_context"`
+	PromptUsed     string                 `json:"prompt_used"`
+	LLMResponse    string                 `json:"llm_response"`
+	ParsedPlaybook map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"parsed_playbook"`
+	Status         string                 `json:"status"`                                             // "pending", "generating", "completed", "failed", "applied"
+	ErrorMessage   string                 `json:"error_message,omitempty"`
+	PlaybookID     *string                `json:"playbook_id,omitempty"`                              // Set when converted to actual playbook
+	ModelUsed      string                 `json:"model_used"`                                         // e.g., "claude-3-5-sonnet"
+	TokensUsed     int                    `json:"tokens_used"`
+	CostCents      int                    `json:"cost_cents"`
+	CreatedAt      time.Time              `json:"created_at"`
+	CompletedAt    *time.Time             `json:"completed_at,omitempty"`
+
+	// Relations
+	Project  Project   `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+	Playbook *Playbook `gorm:"foreignKey:PlaybookID;references:ID" json:"playbook,omitempty"`
+}
+
+func (LLMPlaybookGeneration) TableName() string {
+	return "llm_playbook_generation"
 }
