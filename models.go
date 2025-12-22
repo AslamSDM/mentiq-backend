@@ -7,12 +7,26 @@ import (
 // Account represents an organization/company account (main billing entity)
 type Account struct {
 	ID        string    `gorm:"primaryKey" json:"id"`
-	Name      string    `json:"name"` // Company/Organization name
+	Name      string    `json:"name"`                     // Company/Organization name
 	Email     string    `gorm:"uniqueIndex" json:"email"` // Primary contact email
-	Password  string    `json:"-"` // Keep for backward compatibility during migration
+	Password  string    `json:"-"`                        // Keep for backward compatibility during migration
 	IsAdmin   bool      `gorm:"default:false" json:"is_admin"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Email verification
+	EmailVerified       bool       `gorm:"default:false" json:"email_verified"`
+	VerificationToken   string     `json:"-"` // Not exposed in JSON
+	VerificationSentAt  *time.Time `json:"verification_sent_at,omitempty"`
+	VerificationExpires *time.Time `json:"-"` // Token expiry time
+
+	// Password reset
+	ResetPasswordToken   string     `json:"-"` // Not exposed in JSON
+	ResetPasswordSentAt  *time.Time `json:"-"`
+	ResetPasswordExpires *time.Time `json:"-"` // Token expiry time (1 hour)
+
+	// Google OAuth
+	GoogleID string `gorm:"index" json:"-"` // Google user ID for OAuth
 
 	// Stripe customer info for Mentiq subscriptions
 	StripeCustomerID string `json:"stripe_customer_id" gorm:"index"`
@@ -47,7 +61,7 @@ type UserInvitation struct {
 	ID          string     `gorm:"primaryKey" json:"id"`
 	Email       string     `gorm:"index;not null" json:"email"`
 	Token       string     `gorm:"uniqueIndex;not null" json:"token"`
-	Role        string     `json:"role" gorm:"default:'member'"` // owner, admin, member, viewer
+	Role        string     `json:"role" gorm:"default:'member'"`    // owner, admin, member, viewer
 	Status      string     `json:"status" gorm:"default:'pending'"` // pending, accepted, expired, canceled
 	AccountID   string     `gorm:"index;not null" json:"account_id"`
 	InvitedByID string     `gorm:"index;not null" json:"invited_by_id"` // User ID who sent invite
@@ -674,12 +688,12 @@ type Playbook struct {
 	ProjectID       string     `gorm:"index;not null" json:"project_id"`
 	Name            string     `gorm:"not null" json:"name"`
 	Description     string     `json:"description"`
-	Type            string     `gorm:"index;not null" json:"type"`              // "churn_prevention", "growth_expansion", "onboarding", "engagement"
-	Status          string     `gorm:"index;default:'draft'" json:"status"`     // "draft", "active", "paused", "archived"
-	Source          string     `gorm:"default:'manual'" json:"source"`          // "manual", "llm_generated"
-	LLMPromptUsed   string     `json:"llm_prompt_used,omitempty"`               // Prompt used if LLM-generated
-	LLMModelVersion string     `json:"llm_model_version,omitempty"`             // Model version if LLM-generated
-	CreatedBy       string     `json:"created_by"`                              // User or Account ID who created
+	Type            string     `gorm:"index;not null" json:"type"`          // "churn_prevention", "growth_expansion", "onboarding", "engagement"
+	Status          string     `gorm:"index;default:'draft'" json:"status"` // "draft", "active", "paused", "archived"
+	Source          string     `gorm:"default:'manual'" json:"source"`      // "manual", "llm_generated"
+	LLMPromptUsed   string     `json:"llm_prompt_used,omitempty"`           // Prompt used if LLM-generated
+	LLMModelVersion string     `json:"llm_model_version,omitempty"`         // Model version if LLM-generated
+	CreatedBy       string     `json:"created_by"`                          // User or Account ID who created
 	ActivatedAt     *time.Time `json:"activated_at,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
@@ -704,8 +718,8 @@ type PlaybookStep struct {
 	Description  string                 `json:"description"`
 	ActionType   string                 `gorm:"not null" json:"action_type"` // "email", "in_app_message", "webhook", "wait", "condition", "feature_flag"
 	ActionConfig map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"action_config"`
-	DelayMinutes int                    `json:"delay_minutes"`                                              // Wait time before this step executes
-	Conditions   map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"conditions,omitempty"`     // Exit/skip conditions
+	DelayMinutes int                    `json:"delay_minutes"`                                          // Wait time before this step executes
+	Conditions   map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"conditions,omitempty"` // Exit/skip conditions
 	IsRequired   bool                   `gorm:"default:true" json:"is_required"`
 	CreatedAt    time.Time              `json:"created_at"`
 	UpdatedAt    time.Time              `json:"updated_at"`
@@ -726,9 +740,9 @@ type PlaybookTrigger struct {
 	TriggerType     string                 `gorm:"not null" json:"trigger_type"` // "event", "metric_threshold", "segment", "schedule"
 	Conditions      map[string]interface{} `gorm:"type:jsonb;serializer:json;not null" json:"conditions"`
 	IsEnabled       bool                   `gorm:"default:true" json:"is_enabled"`
-	Priority        int                    `gorm:"default:0" json:"priority"`     // Higher = runs first
-	CooldownMinutes int                    `json:"cooldown_minutes"`              // Prevent re-triggering
-	MaxEnrollments  int                    `json:"max_enrollments"`               // 0 = unlimited
+	Priority        int                    `gorm:"default:0" json:"priority"` // Higher = runs first
+	CooldownMinutes int                    `json:"cooldown_minutes"`          // Prevent re-triggering
+	MaxEnrollments  int                    `json:"max_enrollments"`           // 0 = unlimited
 	CreatedAt       time.Time              `json:"created_at"`
 	UpdatedAt       time.Time              `json:"updated_at"`
 
@@ -742,21 +756,21 @@ func (PlaybookTrigger) TableName() string {
 
 // PlaybookEnrollment tracks a user's progress through a playbook
 type PlaybookEnrollment struct {
-	ID               string                  `gorm:"primaryKey" json:"id"`
-	PlaybookID       string                  `gorm:"index;not null" json:"playbook_id"`
-	ProjectID        string                  `gorm:"index;not null" json:"project_id"`
-	UserID           string                  `gorm:"index;not null" json:"user_id"`
-	TriggerID        *string                 `json:"trigger_id,omitempty"`                                      // Which trigger enrolled the user (null if manual)
-	Status           string                  `gorm:"index;default:'active'" json:"status"`                      // "active", "completed", "exited", "paused"
-	CurrentStepOrder int                     `gorm:"default:1" json:"current_step_order"`
-	EnrolledAt       time.Time               `json:"enrolled_at"`
-	CompletedAt      *time.Time              `json:"completed_at,omitempty"`
-	ExitedAt         *time.Time              `json:"exited_at,omitempty"`
-	ExitReason       string                  `json:"exit_reason,omitempty"`                                     // "completed", "manual_exit", "condition_met", "goal_achieved"
-	MetricsAtStart   map[string]interface{}  `gorm:"type:jsonb;serializer:json" json:"metrics_at_start"`        // Health score, etc at enrollment
-	MetricsAtEnd     map[string]interface{}  `gorm:"type:jsonb;serializer:json" json:"metrics_at_end,omitempty"`
-	CreatedAt        time.Time               `json:"created_at"`
-	UpdatedAt        time.Time               `json:"updated_at"`
+	ID               string                 `gorm:"primaryKey" json:"id"`
+	PlaybookID       string                 `gorm:"index;not null" json:"playbook_id"`
+	ProjectID        string                 `gorm:"index;not null" json:"project_id"`
+	UserID           string                 `gorm:"index;not null" json:"user_id"`
+	TriggerID        *string                `json:"trigger_id,omitempty"`                 // Which trigger enrolled the user (null if manual)
+	Status           string                 `gorm:"index;default:'active'" json:"status"` // "active", "completed", "exited", "paused"
+	CurrentStepOrder int                    `gorm:"default:1" json:"current_step_order"`
+	EnrolledAt       time.Time              `json:"enrolled_at"`
+	CompletedAt      *time.Time             `json:"completed_at,omitempty"`
+	ExitedAt         *time.Time             `json:"exited_at,omitempty"`
+	ExitReason       string                 `json:"exit_reason,omitempty"`                              // "completed", "manual_exit", "condition_met", "goal_achieved"
+	MetricsAtStart   map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"metrics_at_start"` // Health score, etc at enrollment
+	MetricsAtEnd     map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"metrics_at_end,omitempty"`
+	CreatedAt        time.Time              `json:"created_at"`
+	UpdatedAt        time.Time              `json:"updated_at"`
 
 	// Relations
 	Playbook       Playbook                `gorm:"foreignKey:PlaybookID;references:ID" json:"playbook,omitempty"`
@@ -802,10 +816,10 @@ type PlaybookAnalytics struct {
 	CompletedEnrollments   int       `json:"completed_enrollments"`
 	ExitedEnrollments      int       `json:"exited_enrollments"`
 	CompletionRate         float64   `json:"completion_rate"`
-	AvgTimeToComplete      int       `json:"avg_time_to_complete"`      // In minutes
-	ChurnPrevented         int       `json:"churn_prevented"`           // Users who improved from at-risk
-	RevenueImpact          int64     `json:"revenue_impact"`            // In cents
-	HealthScoreImprovement float64   `json:"health_score_improvement"`  // Average improvement
+	AvgTimeToComplete      int       `json:"avg_time_to_complete"`     // In minutes
+	ChurnPrevented         int       `json:"churn_prevented"`          // Users who improved from at-risk
+	RevenueImpact          int64     `json:"revenue_impact"`           // In cents
+	HealthScoreImprovement float64   `json:"health_score_improvement"` // Average improvement
 	CreatedAt              time.Time `json:"created_at"`
 	UpdatedAt              time.Time `json:"updated_at"`
 
@@ -821,15 +835,15 @@ func (PlaybookAnalytics) TableName() string {
 type LLMPlaybookGeneration struct {
 	ID             string                 `gorm:"primaryKey" json:"id"`
 	ProjectID      string                 `gorm:"index;not null" json:"project_id"`
-	PlaybookType   string                 `json:"playbook_type"`                                      // "churn_prevention", "growth_expansion"
+	PlaybookType   string                 `json:"playbook_type"` // "churn_prevention", "growth_expansion"
 	InputContext   map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"input_context"`
 	PromptUsed     string                 `json:"prompt_used"`
 	LLMResponse    string                 `json:"llm_response"`
 	ParsedPlaybook map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"parsed_playbook"`
-	Status         string                 `json:"status"`                                             // "pending", "generating", "completed", "failed", "applied"
+	Status         string                 `json:"status"` // "pending", "generating", "completed", "failed", "applied"
 	ErrorMessage   string                 `json:"error_message,omitempty"`
-	PlaybookID     *string                `json:"playbook_id,omitempty"`                              // Set when converted to actual playbook
-	ModelUsed      string                 `json:"model_used"`                                         // e.g., "claude-3-5-sonnet"
+	PlaybookID     *string                `json:"playbook_id,omitempty"` // Set when converted to actual playbook
+	ModelUsed      string                 `json:"model_used"`            // e.g., "claude-3-5-sonnet"
 	TokensUsed     int                    `json:"tokens_used"`
 	CostCents      int                    `json:"cost_cents"`
 	CreatedAt      time.Time              `json:"created_at"`

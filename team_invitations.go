@@ -369,13 +369,13 @@ func (s *Server) acceptInvitationHandler(c *gin.Context) {
 	})
 
 	// Generate access and refresh tokens
-	accessToken, err := GenerateJWT(user.AccountID, user.Email, "access", false, 1)
+	accessToken, err := GenerateJWT(user.AccountID, user.Email, "access", false, user.Role, 1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
 		return
 	}
 
-	refreshToken, err := GenerateJWT(user.AccountID, user.Email, "refresh", false, 24*7)
+	refreshToken, err := GenerateJWT(user.AccountID, user.Email, "refresh", false, user.Role, 24*7)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
 		return

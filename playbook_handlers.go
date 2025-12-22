@@ -482,6 +482,61 @@ func (s *Server) deleteStepHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Step deleted successfully"})
 }
 
+// ReorderStepsRequest represents the request to reorder steps
+type ReorderStepsRequest struct {
+	StepIDs []string `json:"step_ids" binding:"required"`
+}
+
+// reorderStepsHandler reorders the steps in a playbook
+func (s *Server) reorderStepsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	playbookID := c.Param("playbook_id")
+	accountID := c.GetString("account_id")
+
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Verify access
+	var project Project
+	if err := s.db.Where("id = ? AND account_id = ?", projectID, accountID).First(&project).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+
+	var playbook Playbook
+	if err := s.db.Where("id = ? AND project_id = ?", playbookID, projectID).First(&playbook).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Playbook not found"})
+		return
+	}
+
+	var req ReorderStepsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Update step orders in a transaction
+	tx := s.db.Begin()
+	for i, stepID := range req.StepIDs {
+		if err := tx.Model(&PlaybookStep{}).
+			Where("id = ? AND playbook_id = ?", stepID, playbookID).
+			Update("step_order", i+1).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reorder steps"})
+			return
+		}
+	}
+	tx.Commit()
+
+	// Return updated steps
+	var steps []PlaybookStep
+	s.db.Where("playbook_id = ?", playbookID).Order("step_order").Find(&steps)
+
+	c.JSON(http.StatusOK, steps)
+}
+
 // ==================
 // Trigger Handlers
 // ==================

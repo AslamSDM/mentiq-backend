@@ -160,6 +160,25 @@ func CreateIndices(db *gorm.DB) error {
 		{&ChurnAnalytics{}, "idx_churn_analytics_date", "date"},
 		{&ChurnAnalytics{}, "idx_churn_analytics_user_id", "user_id"},
 		{&ChurnAnalytics{}, "idx_churn_analytics_risk_score", "churn_risk_score"},
+		// Playbook indices
+		{&Playbook{}, "idx_playbook_project_id", "project_id"},
+		{&Playbook{}, "idx_playbook_status", "status"},
+		{&Playbook{}, "idx_playbook_type", "type"},
+		{&PlaybookStep{}, "idx_playbook_step_playbook_id", "playbook_id"},
+		{&PlaybookStep{}, "idx_playbook_step_order", "step_order"},
+		{&PlaybookTrigger{}, "idx_playbook_trigger_playbook_id", "playbook_id"},
+		{&PlaybookTrigger{}, "idx_playbook_trigger_enabled", "is_enabled"},
+		{&PlaybookEnrollment{}, "idx_playbook_enrollment_playbook_id", "playbook_id"},
+		{&PlaybookEnrollment{}, "idx_playbook_enrollment_project_id", "project_id"},
+		{&PlaybookEnrollment{}, "idx_playbook_enrollment_user_id", "user_id"},
+		{&PlaybookEnrollment{}, "idx_playbook_enrollment_status", "status"},
+		{&PlaybookStepExecution{}, "idx_playbook_step_execution_enrollment_id", "enrollment_id"},
+		{&PlaybookStepExecution{}, "idx_playbook_step_execution_step_id", "step_id"},
+		{&PlaybookStepExecution{}, "idx_playbook_step_execution_status", "status"},
+		{&PlaybookAnalytics{}, "idx_playbook_analytics_playbook_id", "playbook_id"},
+		{&PlaybookAnalytics{}, "idx_playbook_analytics_date", "date"},
+		{&LLMPlaybookGeneration{}, "idx_llm_playbook_generation_project_id", "project_id"},
+		{&LLMPlaybookGeneration{}, "idx_llm_playbook_generation_status", "status"},
 	}
 
 	for _, idx := range indices {

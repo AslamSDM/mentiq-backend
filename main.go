@@ -100,6 +100,8 @@ type Server struct {
 	sessionStorage           *SessionStorageService
 	emailService             *EmailService
 	llmService               *LLMService
+	playbookExecutor         *PlaybookExecutor
+	triggerEvaluator         *TriggerEvaluator
 
 	// Entity caches with TTL
 	projectCache     map[string]*CacheEntry // Key: projectID
@@ -121,6 +123,10 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		sessionStorage = nil
 	}
 
+	// Initialize playbook executor and trigger evaluator
+	playbookExecutor := NewPlaybookExecutor(db, emailService)
+	triggerEvaluator := NewTriggerEvaluator(db)
+
 	server := &Server{
 		db:                       db,
 		analyticsService:         analyticsService,
@@ -128,11 +134,17 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		enhancedAnalyticsService: enhancedAnalyticsService,
 		sessionStorage:           sessionStorage,
 		emailService:             emailService,
+		playbookExecutor:         playbookExecutor,
+		triggerEvaluator:         triggerEvaluator,
 		projectCache:             make(map[string]*CacheEntry),
 		accountCache:             make(map[string]*CacheEntry),
 		apiKeyCache:              make(map[string]*CacheEntry),
 		recordingCache:           make(map[string]*CacheEntry),
 	}
+
+	// Start background workers
+	playbookExecutor.Start()
+	triggerEvaluator.Start()
 
 	// Start entity cache cleanup (every 15 minutes)
 	go server.startEntityCacheCleanup()
@@ -160,6 +172,25 @@ func (s *Server) Disconnect() error {
 		return err
 	}
 	return sqlDB.Close()
+}
+
+// getUserRole returns the role of a user within an account
+// It first checks the User table, then falls back to Account table for legacy account owners
+func (s *Server) getUserRole(accountID, email string) (string, error) {
+	// First, try to find the user in the User table
+	var user User
+	if err := s.db.Where("account_id = ? AND email = ?", accountID, email).First(&user).Error; err == nil {
+		return user.Role, nil
+	}
+
+	// If not found in User table, check if this is an account owner
+	var account Account
+	if err := s.db.Where("id = ? AND email = ?", accountID, email).First(&account).Error; err == nil {
+		// Account owner always has "owner" role
+		return "owner", nil
+	}
+
+	return "", fmt.Errorf("user not found in account")
 }
 
 type SignupRequest struct {
@@ -200,7 +231,7 @@ type JWTClaims struct {
 	AccountID string `json:"account_id"`
 	Email     string `json:"email"`
 	IsAdmin   bool   `json:"is_admin"`
-	Role      string `json:"role,omitempty"`    // "owner", "admin", "member", "viewer"
+	Role      string `json:"role,omitempty"` // "owner", "admin", "member", "viewer"
 	ProjectID string `json:"project_id,omitempty"`
 	APIKeyID  string `json:"api_key_id,omitempty"`
 	Type      string `json:"type"` // "access" or "refresh"
@@ -508,6 +539,11 @@ func main() {
 	router.POST("/login", server.loginHandler)
 	router.POST("/refresh", server.refreshTokenHandler)
 	router.POST("/api/v1/invitations/accept", server.acceptInvitationHandler)
+	router.GET("/verify-email", server.verifyEmailHandler)
+	router.POST("/resend-verification", server.resendVerificationHandler)
+	router.POST("/api/auth/google", server.googleAuthHandler)
+	router.POST("/forgot-password", server.forgotPasswordHandler)
+	router.POST("/reset-password", server.resetPasswordHandler)
 	router.GET("/health", healthCheckHandler)
 
 	// Webhook routes (no authentication - secured by signature validation)
@@ -627,6 +663,7 @@ func main() {
 		apiV1.POST("/projects/:project_id/playbooks/:playbook_id/steps", server.addStepHandler)
 		apiV1.PUT("/projects/:project_id/playbooks/:playbook_id/steps/:step_id", server.updateStepHandler)
 		apiV1.DELETE("/projects/:project_id/playbooks/:playbook_id/steps/:step_id", server.deleteStepHandler)
+		apiV1.PUT("/projects/:project_id/playbooks/:playbook_id/steps/reorder", server.reorderStepsHandler)
 
 		// Playbook Triggers routes
 		apiV1.POST("/projects/:project_id/playbooks/:playbook_id/triggers", server.createTriggerHandler)
@@ -1782,6 +1819,9 @@ func (s *Server) signupHandler(c *gin.Context) {
 		return
 	}
 
+	// Normalize email
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
 	// Check if account already exists
 	var existingAccount Account
 	if err := s.db.Where("email = ?", req.Email).First(&existingAccount).Error; err == nil {
@@ -1796,12 +1836,21 @@ func (s *Server) signupHandler(c *gin.Context) {
 		return
 	}
 
-	// Create account
+	// Generate verification token
+	verificationToken := uuid.New().String()
+	now := time.Now()
+	expiresAt := now.Add(24 * time.Hour) // Token valid for 24 hours
+
+	// Create account with unverified email
 	account := Account{
-		ID:       uuid.New().String(),
-		Name:     req.Name,
-		Email:    req.Email,
-		Password: string(hashedPassword),
+		ID:                  uuid.New().String(),
+		Name:                req.Name,
+		Email:               req.Email,
+		Password:            string(hashedPassword),
+		EmailVerified:       false,
+		VerificationToken:   verificationToken,
+		VerificationSentAt:  &now,
+		VerificationExpires: &expiresAt,
 	}
 
 	if err := s.db.Create(&account).Error; err != nil {
@@ -1809,14 +1858,356 @@ func (s *Server) signupHandler(c *gin.Context) {
 		return
 	}
 
+	// Send verification email (non-blocking)
+	go func() {
+		if err := s.emailService.SendVerificationEmail(account.Email, account.Name, verificationToken); err != nil {
+			log.Printf("Failed to send verification email to %s: %v", account.Email, err)
+		}
+	}()
+
 	c.JSON(http.StatusCreated, gin.H{
-		"message": "Account created successfully",
+		"message":              "Account created successfully. Please check your email to verify your account.",
+		"requiresVerification": true,
 		"account": gin.H{
-			"id":    account.ID,
-			"name":  account.Name,
-			"email": account.Email,
+			"id":            account.ID,
+			"name":          account.Name,
+			"email":         account.Email,
+			"emailVerified": account.EmailVerified,
 		},
 	})
+}
+
+// verifyEmailHandler handles email verification
+func (s *Server) verifyEmailHandler(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Verification token is required"})
+		return
+	}
+
+	// Find account with this verification token
+	var account Account
+	if err := s.db.Where("verification_token = ?", token).First(&account).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired verification token"})
+		return
+	}
+
+	// Check if token is expired
+	if account.VerificationExpires != nil && time.Now().After(*account.VerificationExpires) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Verification token has expired. Please request a new one."})
+		return
+	}
+
+	// Check if already verified
+	if account.EmailVerified {
+		c.JSON(http.StatusOK, gin.H{
+			"message":  "Email already verified",
+			"verified": true,
+		})
+		return
+	}
+
+	// Mark email as verified and clear verification token
+	if err := s.db.Model(&account).Updates(map[string]interface{}{
+		"email_verified":     true,
+		"verification_token": "",
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify email"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Email verified successfully",
+		"verified": true,
+	})
+}
+
+// resendVerificationHandler resends the verification email
+func (s *Server) resendVerificationHandler(c *gin.Context) {
+	var req struct {
+		Email string `json:"email" binding:"required,email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Normalize email
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
+	// Find account
+	var account Account
+	if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
+		// Don't reveal if email exists or not for security
+		c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a verification link has been sent."})
+		return
+	}
+
+	// Check if already verified
+	if account.EmailVerified {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Email is already verified"})
+		return
+	}
+
+	// Generate new verification token
+	newToken := uuid.New().String()
+	now := time.Now()
+	expiresAt := now.Add(24 * time.Hour)
+
+	// Update account with new token
+	if err := s.db.Model(&account).Updates(map[string]interface{}{
+		"verification_token":   newToken,
+		"verification_sent_at": now,
+		"verification_expires": expiresAt,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate new verification token"})
+		return
+	}
+
+	// Send verification email (non-blocking)
+	go func() {
+		if err := s.emailService.SendVerificationEmail(account.Email, account.Name, newToken); err != nil {
+			log.Printf("Failed to resend verification email to %s: %v", account.Email, err)
+		}
+	}()
+
+	c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a verification link has been sent."})
+}
+
+// GoogleAuthRequest represents the request for Google OAuth
+type GoogleAuthRequest struct {
+	IDToken string `json:"idToken" binding:"required"`
+}
+
+// googleAuthHandler handles Google OAuth authentication
+func (s *Server) googleAuthHandler(c *gin.Context) {
+	var req GoogleAuthRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify Google ID token
+	// We'll use Google's tokeninfo endpoint for simplicity
+	resp, err := http.Get("https://oauth2.googleapis.com/tokeninfo?id_token=" + req.IDToken)
+	if err != nil {
+		log.Printf("Failed to verify Google ID token: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to verify Google token"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Google token"})
+		return
+	}
+
+	var tokenInfo struct {
+		Email         string `json:"email"`
+		EmailVerified string `json:"email_verified"`
+		Name          string `json:"name"`
+		Picture       string `json:"picture"`
+		Sub           string `json:"sub"` // Google user ID
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&tokenInfo); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse Google token info"})
+		return
+	}
+
+	if tokenInfo.Email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No email in Google token"})
+		return
+	}
+
+	// Normalize email
+	tokenInfo.Email = strings.ToLower(strings.TrimSpace(tokenInfo.Email))
+
+	// Try to find existing account
+	var account Account
+	var isNewAccount bool
+
+	if err := s.db.Where("email = ?", tokenInfo.Email).First(&account).Error; err != nil {
+		// Create new account
+		account = Account{
+			ID:            uuid.New().String(),
+			Name:          tokenInfo.Name,
+			Email:         tokenInfo.Email,
+			GoogleID:      tokenInfo.Sub,
+			EmailVerified: true, // Google-authenticated emails are pre-verified
+			Password:      "",   // No password for OAuth accounts
+		}
+
+		if err := s.db.Create(&account).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create account"})
+			return
+		}
+		isNewAccount = true
+	} else {
+		// Update existing account with Google ID if not set
+		if account.GoogleID == "" {
+			s.db.Model(&account).Update("google_id", tokenInfo.Sub)
+		}
+		// Mark email as verified if logging in via Google
+		if !account.EmailVerified {
+			s.db.Model(&account).Update("email_verified", true)
+		}
+	}
+
+	// Generate access token
+	accessToken, err := GenerateJWT(account.ID, account.Email, "access", account.IsAdmin, "owner", 1)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
+		return
+	}
+
+	refreshToken, err := GenerateJWT(account.ID, account.Email, "refresh", account.IsAdmin, "owner", 24*7)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
+		return
+	}
+
+	// Store refresh token
+	refreshTokenRecord := RefreshToken{
+		ID:        uuid.New().String(),
+		Token:     refreshToken,
+		AccountID: account.ID,
+		ExpiresAt: time.Now().Add(24 * 7 * time.Hour),
+		IsRevoked: false,
+	}
+	s.db.Create(&refreshTokenRecord)
+
+	// Get user's projects
+	var projects []Project
+	var projectID string
+	if err := s.db.Where("account_id = ?", account.ID).Find(&projects).Error; err == nil && len(projects) > 0 {
+		projectID = projects[0].ID
+	}
+
+	// Check subscription status
+	var subscription AccountSubscription
+	hasActiveSubscription := false
+	subscriptionStatus := "none"
+	if err := s.db.Where("account_id = ?", account.ID).First(&subscription).Error; err == nil {
+		subscriptionStatus = subscription.Status
+		if subscription.Status == "active" || subscription.Status == "trialing" || subscription.Tier == "developer" {
+			hasActiveSubscription = true
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"accessToken":  accessToken,
+		"refreshToken": refreshToken,
+		"expiresIn":    3600, // 1 hour
+		"projectId":    projectID,
+		"isNewAccount": isNewAccount,
+		"user": gin.H{
+			"id":                    account.ID,
+			"name":                  account.Name,
+			"email":                 account.Email,
+			"isAdmin":               account.IsAdmin,
+			"hasActiveSubscription": hasActiveSubscription,
+			"subscriptionStatus":    subscriptionStatus,
+			"emailVerified":         true,
+			"role":                  "owner",
+		},
+	})
+}
+
+// forgotPasswordHandler handles password reset requests
+func (s *Server) forgotPasswordHandler(c *gin.Context) {
+	var req struct {
+		Email string `json:"email" binding:"required,email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Normalize email
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
+	// Find account (don't reveal if email exists for security)
+	var account Account
+	if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
+		// Don't reveal if email exists
+		c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a password reset link has been sent."})
+		return
+	}
+
+	// Check if this is a Google-only account (no password)
+	if account.Password == "" && account.GoogleID != "" {
+		c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a password reset link has been sent."})
+		return
+	}
+
+	// Generate reset token
+	resetToken := uuid.New().String()
+	now := time.Now()
+	expiresAt := now.Add(1 * time.Hour) // 1 hour expiry
+
+	// Update account with reset token
+	if err := s.db.Model(&account).Updates(map[string]interface{}{
+		"reset_password_token":   resetToken,
+		"reset_password_sent_at": now,
+		"reset_password_expires": expiresAt,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate reset token"})
+		return
+	}
+
+	// Send password reset email (non-blocking)
+	go func() {
+		if err := s.emailService.SendPasswordResetEmail(account.Email, account.Name, resetToken); err != nil {
+			log.Printf("Failed to send password reset email to %s: %v", account.Email, err)
+		}
+	}()
+
+	c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a password reset link has been sent."})
+}
+
+// resetPasswordHandler handles password reset with token
+func (s *Server) resetPasswordHandler(c *gin.Context) {
+	var req struct {
+		Token       string `json:"token" binding:"required"`
+		NewPassword string `json:"newPassword" binding:"required,min=8"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Find account with this reset token
+	var account Account
+	if err := s.db.Where("reset_password_token = ?", req.Token).First(&account).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired reset token"})
+		return
+	}
+
+	// Check if token is expired
+	if account.ResetPasswordExpires != nil && time.Now().After(*account.ResetPasswordExpires) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Reset token has expired. Please request a new one."})
+		return
+	}
+
+	// Hash new password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		return
+	}
+
+	// Update password and clear reset token
+	if err := s.db.Model(&account).Updates(map[string]interface{}{
+		"password":               string(hashedPassword),
+		"reset_password_token":   "",
+		"reset_password_expires": nil,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update password"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully. You can now sign in with your new password."})
 }
 
 func (s *Server) getMeHandler(c *gin.Context) {
@@ -1881,17 +2272,36 @@ func (s *Server) loginHandler(c *gin.Context) {
 	var isAdmin bool
 	var userRole string
 	var hashedPassword string
+	var isAccountOwner bool
 
 	if err := s.db.Where("email = ? AND is_active = ?", req.Email, true).First(&user).Error; err == nil {
-		// Found a team member user
+		// Found a user record
 		accountID = user.AccountID
 		userName = user.FullName
 		userEmail = user.Email
-		isAdmin = false // Team members are not admins by default
 		userRole = user.Role
 		hashedPassword = user.Password
+
+		// Check if this user is also an account owner (owner role or password is empty)
+		// Account owners might have User records but passwords are stored in Account table
+		if user.Role == "owner" || hashedPassword == "" {
+			var account Account
+			if err := s.db.Where("id = ? AND email = ?", user.AccountID, req.Email).First(&account).Error; err == nil {
+				// Use account's password for verification
+				hashedPassword = account.Password
+				isAdmin = account.IsAdmin
+				isAccountOwner = true
+				if userName == "" {
+					userName = account.Name
+				}
+			}
+		}
+
+		if !isAccountOwner {
+			isAdmin = false // Team members are not admins by default
+		}
 	} else {
-		// Try to find account owner
+		// Try to find account owner directly
 		var account Account
 		if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
@@ -1909,6 +2319,21 @@ func (s *Server) loginHandler(c *gin.Context) {
 	if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(req.Password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
+	}
+
+	// Check email verification (for account owners)
+	// Account owners need to have verified email; team members are verified through invitation
+	var account Account
+	if err := s.db.Where("id = ?", accountID).First(&account).Error; err == nil {
+		if !account.EmailVerified && account.GoogleID == "" {
+			// Only require verification for credential-based logins, not Google OAuth
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":                "Please verify your email address before signing in",
+				"requiresVerification": true,
+				"email":                userEmail,
+			})
+			return
+		}
 	}
 
 	// Generate access token (1 hour expiration) and refresh token (7 days expiration)
@@ -2101,7 +2526,7 @@ func (s *Server) authMiddleware(c *gin.Context) {
 		// Valid JWT token
 		c.Set("account_id", claims.AccountID)
 		c.Set("email", claims.Email)
-		
+
 		// Set role from claims, default to owner if not present
 		role := claims.Role
 		if role == "" {
