@@ -23,6 +23,7 @@ func MigrateDB(db *gorm.DB) error {
 	err := db.AutoMigrate(
 		&Account{},
 		&User{},
+		&UserInvitation{},
 		&ProjectMember{},
 		&Project{},
 		&APIKey{},
@@ -51,6 +52,14 @@ func MigrateDB(db *gorm.DB) error {
 		&ChurnAnalytics{},
 		// Events table for TimescaleDB
 		&Event{},
+		// Playbooks models
+		&Playbook{},
+		&PlaybookStep{},
+		&PlaybookTrigger{},
+		&PlaybookEnrollment{},
+		&PlaybookStepExecution{},
+		&PlaybookAnalytics{},
+		&LLMPlaybookGeneration{},
 	)
 
 	if err != nil {

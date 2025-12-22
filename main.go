@@ -2101,6 +2101,13 @@ func (s *Server) authMiddleware(c *gin.Context) {
 		// Valid JWT token
 		c.Set("account_id", claims.AccountID)
 		c.Set("email", claims.Email)
+		
+		// Set role from claims, default to owner if not present
+		role := claims.Role
+		if role == "" {
+			role = "owner"
+		}
+		c.Set("role", role)
 
 		// Verify admin status (check cache first, then database)
 		isAdmin := false
