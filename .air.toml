@@ -1,0 +1,81 @@
+# Air - Hot Reload for Go applications
+
+root = "."
+testdata_dir = "testdata"
+tmp_dir = "tmp"
+
+[build]
+  # Full binary name.
+  bin = "./tmp/main"
+  # Command to build the application.
+  cmd = "go build -o ./tmp/main ."
+  # Binary to run after build.
+  full_bin = "./tmp/main"
+  # Delay between file change detection and rebuild (milliseconds).
+  delay = 500
+  # File extensions to watch.
+  include_ext = ["go", "tpl", "tmpl", "html"]
+  # Directories to ignore.
+  exclude_dir = ["assets", "tmp", "vendor", "testdata", "node_modules", ".git", "utils", "scripts", "migrations"]
+  # Regex patterns to exclude.
+  exclude_regex = ["_test\\.go", ".*_test\\.go"]
+  # Files to exclude.
+  exclude_file = []
+  # Unchanged files to watch for rebuild.
+  include_file = []
+  # Watch subdirectories.
+  include_dir = []
+  # Stop running previous binary when a new build starts.
+  kill_delay = "2s"
+  # Enable debug logs.
+  log = "build-errors.log"
+  # Enable poll watcher (useful for Docker/VM).
+  poll = false
+  # Poll interval (milliseconds).
+  poll_interval = 0
+  # Send interrupt signal to stop the process (false for kill).
+  send_interrupt = true
+  # Specify the stop signal (default: SIGINT).
+  stop_signal = "SIGTERM"
+  # Post-build commands.
+  post_cmd = []
+  # Pre-build commands.
+  pre_cmd = []
+  # Rerun command on file change.
+  rerun = false
+  # Rerun delay.
+  rerun_delay = 500
+  # Arguments to pass to the binary.
+  args_bin = []
+
+[color]
+  # Colorize output in terminal (light or dark).
+  app = ""
+  build = "yellow"
+  main = "magenta"
+  runner = "green"
+  watcher = "cyan"
+
+[log]
+  # Show log time.
+  time = true
+  # Don't print logs.
+  silent = false
+  # Log prefix (full file path or just name).
+  prefix = false
+
+[misc]
+  # Clean tmp directory on exit.
+  clean_on_exit = true
+
+[screen]
+  # Keep scroll position.
+  clear_on_rebuild = false
+  # Keep old build output.
+  keep_scroll = true
+
+# Proxy settings (optional, for browser sync).
+# [proxy]
+#   enabled = true
+#   proxy_port = 8090
+#   app_port = 8080

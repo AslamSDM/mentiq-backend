@@ -102,6 +102,7 @@ type Server struct {
 	llmService               *LLMService
 	playbookExecutor         *PlaybookExecutor
 	triggerEvaluator         *TriggerEvaluator
+	autoUpgradeService       *AutoUpgradeService
 
 	// Entity caches with TTL
 	projectCache     map[string]*CacheEntry // Key: projectID
@@ -109,6 +110,9 @@ type Server struct {
 	apiKeyCache      map[string]*CacheEntry // Key: apiKey token
 	recordingCache   map[string]*CacheEntry // Key: recordingID
 	entityCacheMutex sync.RWMutex
+
+	// Graceful shutdown
+	stopChan chan struct{}
 }
 
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
@@ -136,10 +140,12 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		emailService:             emailService,
 		playbookExecutor:         playbookExecutor,
 		triggerEvaluator:         triggerEvaluator,
+		autoUpgradeService:       NewAutoUpgradeService(db),
 		projectCache:             make(map[string]*CacheEntry),
 		accountCache:             make(map[string]*CacheEntry),
 		apiKeyCache:              make(map[string]*CacheEntry),
 		recordingCache:           make(map[string]*CacheEntry),
+		stopChan:                 make(chan struct{}),
 	}
 
 	// Start background workers
@@ -172,6 +178,32 @@ func (s *Server) Disconnect() error {
 		return err
 	}
 	return sqlDB.Close()
+}
+
+// Shutdown gracefully stops all background workers
+func (s *Server) Shutdown() {
+	log.Println("Shutting down server background workers...")
+
+	// Stop background workers
+	if s.playbookExecutor != nil {
+		log.Println("Stopping playbook executor...")
+		s.playbookExecutor.Stop()
+	}
+
+	if s.triggerEvaluator != nil {
+		log.Println("Stopping trigger evaluator...")
+		s.triggerEvaluator.Stop()
+	}
+
+	// Signal entity cache cleanup to stop
+	select {
+	case <-s.stopChan:
+		// Already closed
+	default:
+		close(s.stopChan)
+	}
+
+	log.Println("All server background workers stopped")
 }
 
 // getUserRole returns the role of a user within an account
@@ -376,8 +408,14 @@ func (s *Server) startEntityCacheCleanup() {
 	cleanupTicker := time.NewTicker(15 * time.Minute)
 	defer cleanupTicker.Stop()
 
-	for range cleanupTicker.C {
-		s.cleanExpiredEntityCache()
+	for {
+		select {
+		case <-cleanupTicker.C:
+			s.cleanExpiredEntityCache()
+		case <-s.stopChan:
+			log.Println("Entity cache cleanup worker stopped")
+			return
+		}
 	}
 }
 
@@ -691,6 +729,10 @@ func main() {
 		apiV1.POST("/payments", server.createPaymentHandler)
 		apiV1.GET("/payments/:account_id", server.listPaymentsHandler)
 
+		// Auto-upgrade routes
+		apiV1.POST("/subscriptions/check-upgrades", server.autoUpgradeService.CheckUpgradesHandler)
+		apiV1.POST("/subscriptions/:account_id/check-upgrade", server.autoUpgradeService.CheckSingleAccountUpgradeHandler)
+
 		// Feature Tracking & Onboarding routes
 		apiV1.GET("/projects/:project_id/features/usage", server.getFeatureUsageHandler)
 		apiV1.GET("/projects/:project_id/onboarding/stats", server.getOnboardingStatsHandler)
@@ -751,19 +793,26 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Shutting down server...")
+	log.Println("Received shutdown signal, initiating graceful shutdown...")
 
-	// Gracefully stop the analytics service (flush cache)
-	analyticsService.Stop()
-
-	// Create a deadline to wait for
+	// Create a deadline for graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Stop accepting new connections and wait for active requests to complete
+	log.Println("Stopping HTTP server...")
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown:", err)
+		log.Printf("HTTP server shutdown error: %v", err)
 	}
 
-	log.Println("Server exited")
+	// Gracefully stop all server background workers
+	server.Shutdown()
+
+	// Gracefully stop the analytics service (flush cache)
+	log.Println("Stopping analytics service...")
+	analyticsService.Stop()
+
+	log.Println("Graceful shutdown completed")
 }
 
 // These methods are no longer needed with TimescaleDB direct writes
@@ -2321,19 +2370,20 @@ func (s *Server) loginHandler(c *gin.Context) {
 		return
 	}
 
-	// Check email verification (for account owners)
-	// Account owners need to have verified email; team members are verified through invitation
+	// Check email verification status
+	// - Account owners need to verify their email explicitly
+	// - Team members (invited users) are considered verified since they accepted an invitation sent to their email
+	// - Google OAuth users are always considered verified
 	var account Account
+	emailVerified := true // Default to true
 	if err := s.db.Where("id = ?", accountID).First(&account).Error; err == nil {
-		if !account.EmailVerified && account.GoogleID == "" {
-			// Only require verification for credential-based logins, not Google OAuth
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":                "Please verify your email address before signing in",
-				"requiresVerification": true,
-				"email":                userEmail,
-			})
-			return
+		// Only require verification for account owners using credential-based login
+		// Team members (non-owner roles) have implicitly verified their email by accepting an invitation
+		if userRole == "owner" && account.GoogleID == "" {
+			emailVerified = account.EmailVerified
 		}
+		// Team members (admin, member, viewer roles) are always considered verified
+		// since they clicked on an email invitation link to join
 	}
 
 	// Generate access token (1 hour expiration) and refresh token (7 days expiration)
@@ -2395,6 +2445,7 @@ func (s *Server) loginHandler(c *gin.Context) {
 			"role":                  userRole,
 			"hasActiveSubscription": hasActiveSubscription,
 			"subscriptionStatus":    subscriptionStatus,
+			"emailVerified":         emailVerified,
 		},
 	})
 }

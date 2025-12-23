@@ -1,6 +1,6 @@
 # Analytics Platform Makefile
 
-.PHONY: build run test clean docker-build docker-run install deps
+.PHONY: build run test clean docker-build docker-run install deps dev install-air
 
 # Go parameters
 GOCMD=go
@@ -81,12 +81,29 @@ setup:
 	$(GOCMD) mod tidy
 	@echo "Setup complete!"
 
+# Install Air for hot reloading
+install-air:
+	@echo "Installing Air for hot reloading..."
+	go install github.com/air-verse/air@latest
+	@echo "Air installed! Make sure $(GOPATH)/bin is in your PATH"
+
+# Run with hot reloading (development mode)
+dev:
+	@if command -v air >/dev/null 2>&1; then \
+		air; \
+	else \
+		echo "Air is not installed. Run 'make install-air' first."; \
+		exit 1; \
+	fi
+
 # Show help
 help:
 	@echo "Available commands:"
 	@echo "  build       - Build the application"
 	@echo "  run         - Build and run the application"
 	@echo "  run-env     - Run with environment variables from .env file"
+	@echo "  dev         - Run with hot reloading (requires Air)"
+	@echo "  install-air - Install Air for hot reloading"
 	@echo "  test        - Run Go tests"
 	@echo "  test-api    - Test API endpoints with curl"
 	@echo "  clean       - Clean build artifacts"
@@ -100,3 +117,4 @@ help:
 
 # Default target
 all: deps build
+
