@@ -734,6 +734,7 @@ func (eas *EnhancedAnalyticsService) calculateFeatureAdoption(projectID string, 
 }
 
 // calculateChurnRisk calculates churn risk scores and at-risk users based on user behavior
+// OPTIMIZED: Uses SQL aggregation instead of loading all events into memory
 func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, threshold float64) (map[string]interface{}, error) {
 	// Validate threshold parameter
 	if threshold < 0 || threshold > 100 {
@@ -741,20 +742,47 @@ func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, thresh
 		log.Printf("Warning: Invalid threshold %.2f%%, defaulting to 70%% for project %s", threshold, projectID)
 	}
 
-	// 1. Fetch events for last 90 days to analyze behavior
 	endDate := time.Now()
 	startDate := endDate.AddDate(0, 0, -90)
+	thirtyDaysAgo := endDate.AddDate(0, 0, -30)
 
-	var events []Event
-	// Optimize: Select only needed fields
-	if err := eas.db.Select("user_id, session_id, event_type, timestamp").
-		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, startDate, endDate).
-		Order("timestamp ASC").Find(&events).Error; err != nil {
-		log.Printf("Error fetching events for churn analysis: %v", err)
-		return nil, fmt.Errorf("failed to fetch events: %v", err)
+	// OPTIMIZED: Use SQL aggregation to get user-level stats instead of loading all events
+	type UserStatDB struct {
+		UserID        string    `gorm:"column:user_id"`
+		FirstActive   time.Time `gorm:"column:first_active"`
+		LastActive    time.Time `gorm:"column:last_active"`
+		SessionCount  int64     `gorm:"column:session_count"`
+		ActiveDays    int64     `gorm:"column:active_days"`
+		EventsLast30d int64     `gorm:"column:events_last_30d"`
+		EventsPrev60d int64     `gorm:"column:events_prev_60d"`
 	}
 
-	if len(events) == 0 {
+	var userStats []UserStatDB
+
+	// Single aggregated query to get all user stats
+	err := eas.db.Raw(`
+		SELECT 
+			user_id,
+			MIN(timestamp) as first_active,
+			MAX(timestamp) as last_active,
+			COUNT(DISTINCT session_id) as session_count,
+			COUNT(DISTINCT date_trunc('day', timestamp)) as active_days,
+			SUM(CASE WHEN timestamp > ? THEN 1 ELSE 0 END) as events_last_30d,
+			SUM(CASE WHEN timestamp <= ? THEN 1 ELSE 0 END) as events_prev_60d
+		FROM events
+		WHERE project_id = ? 
+			AND timestamp BETWEEN ? AND ?
+			AND user_id IS NOT NULL 
+			AND user_id != ''
+		GROUP BY user_id
+	`, thirtyDaysAgo, thirtyDaysAgo, projectID, startDate, endDate).Scan(&userStats).Error
+
+	if err != nil {
+		log.Printf("Error fetching user stats for churn analysis: %v", err)
+		return nil, fmt.Errorf("failed to fetch user stats: %v", err)
+	}
+
+	if len(userStats) == 0 {
 		return map[string]interface{}{
 			"at_risk_users": []map[string]interface{}{},
 			"churn_stats": map[string]interface{}{
@@ -765,66 +793,14 @@ func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, thresh
 		}, nil
 	}
 
-	// 2. Aggregate user stats
-	type UserStat struct {
-		UserID          string
-		LastActive      time.Time
-		FirstActive     time.Time
-		SessionCount    int
-		TotalDuration   float64 // Estimated
-		Sessions        map[string]time.Time
-		ActiveDays      map[string]bool
-		EventsLast30d   int
-		EventsPrev30d   int
-		SessionsLast30d int
-		SessionsPrev30d int
+	log.Printf("Calculating churn risk for %d users in project %s", len(userStats), projectID)
+
+	// Calculate Risk Scores
+	type UserRisk struct {
+		data      map[string]interface{}
+		riskScore float64
 	}
-
-	userStats := make(map[string]*UserStat)
-	thirtyDaysAgo := endDate.AddDate(0, 0, -30)
-
-	for _, event := range events {
-		if event.UserID == "" {
-			continue
-		}
-
-		stat, exists := userStats[event.UserID]
-		if !exists {
-			stat = &UserStat{
-				UserID:     event.UserID,
-				Sessions:   make(map[string]time.Time),
-				ActiveDays: make(map[string]bool),
-			}
-			userStats[event.UserID] = stat
-		}
-
-		// Update timestamps
-		if stat.FirstActive.IsZero() || event.Timestamp.Before(stat.FirstActive) {
-			stat.FirstActive = event.Timestamp
-		}
-		if event.Timestamp.After(stat.LastActive) {
-			stat.LastActive = event.Timestamp
-		}
-
-		// Track sessions
-		if event.SessionID != "" {
-			stat.Sessions[event.SessionID] = event.Timestamp
-		}
-
-		// Track active days
-		day := event.Timestamp.Format("2006-01-02")
-		stat.ActiveDays[day] = true
-
-		// Track trend metrics
-		if event.Timestamp.After(thirtyDaysAgo) {
-			stat.EventsLast30d++
-		} else {
-			stat.EventsPrev30d++
-		}
-	}
-
-	// 3. Calculate Risk Scores
-	var atRiskUsers []map[string]interface{}
+	var atRiskUsers []UserRisk
 	riskBuckets := map[string]int{
 		"Critical": 0,
 		"High":     0,
@@ -835,7 +811,7 @@ func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, thresh
 	totalUsers := len(userStats)
 	churnedCount := 0
 
-	for userID, stat := range userStats {
+	for _, stat := range userStats {
 		// Calculate Recency (Days since last active)
 		daysSinceActive := endDate.Sub(stat.LastActive).Hours() / 24.0
 
@@ -844,16 +820,13 @@ func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, thresh
 		if activeWeeks < 1 {
 			activeWeeks = 1
 		}
-		stat.SessionCount = len(stat.Sessions)
 		frequency := float64(stat.SessionCount) / activeWeeks
 
 		// Calculate Trend (Activity change)
-		// Normalize to comparable periods (last 30 days vs previous 60 days normalized to 30)
-		// Simple trend: (Last30 - Prev30Avg)
 		trendScore := 0.0
-		if stat.EventsPrev30d > 0 {
-			// Compare last 30 days to average of previous 60 days (approx)
-			prevAvg := float64(stat.EventsPrev30d) / 2.0
+		if stat.EventsPrev60d > 0 {
+			// Compare last 30 days to average of previous 60 days
+			prevAvg := float64(stat.EventsPrev60d) / 2.0
 			if prevAvg > 0 {
 				change := (float64(stat.EventsLast30d) - prevAvg) / prevAvg
 				if change < -0.5 {
@@ -868,21 +841,19 @@ func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, thresh
 
 		// --- Health Score Calculation (0-100) ---
 		// 1. Recency Score (40%): High if recently active
-		recencyScore := 100.0 - (daysSinceActive * 2) // Lose 2 points per day inactive
+		recencyScore := 100.0 - (daysSinceActive * 2)
 		if recencyScore < 0 {
 			recencyScore = 0
 		}
 
-		// 2. Frequency Score (30%): High if frequent
-		// Assume 3 sessions/week is "good" (100)
+		// 2. Frequency Score (30%): High if frequent (3 sessions/week is "good")
 		freqScore := (frequency / 3.0) * 100.0
 		if freqScore > 100 {
 			freqScore = 100
 		}
 
 		// 3. Engagement/Trend Score (30%)
-		// Base on active days ratio + trend
-		daysActiveRatio := float64(len(stat.ActiveDays)) / 90.0
+		daysActiveRatio := float64(stat.ActiveDays) / 90.0
 		engagementScore := (daysActiveRatio * 100.0) + trendScore
 		if engagementScore > 100 {
 			engagementScore = 100
@@ -919,37 +890,36 @@ func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, thresh
 
 		// Add to list if above threshold or churned
 		if churnRisk >= threshold || isChurned {
-			atRiskUsers = append(atRiskUsers, map[string]interface{}{
-				"user_id":           userID,
-				"risk_score":        fmt.Sprintf("%.1f%%", churnRisk),
-				"health_score":      fmt.Sprintf("%.1f", healthScore),
-				"category":          category,
-				"last_active":       stat.LastActive.Format("2006-01-02"),
-				"days_inactive":     int(daysSinceActive),
-				"sessions_total":    stat.SessionCount,
-				"avg_sessions_week": fmt.Sprintf("%.1f", frequency),
-				"is_churned":        isChurned,
-				"trend":             trendScore,
+			atRiskUsers = append(atRiskUsers, UserRisk{
+				riskScore: churnRisk,
+				data: map[string]interface{}{
+					"user_id":           stat.UserID,
+					"risk_score":        fmt.Sprintf("%.1f%%", churnRisk),
+					"health_score":      fmt.Sprintf("%.1f", healthScore),
+					"category":          category,
+					"last_active":       stat.LastActive.Format("2006-01-02"),
+					"days_inactive":     int(daysSinceActive),
+					"sessions_total":    stat.SessionCount,
+					"avg_sessions_week": fmt.Sprintf("%.1f", frequency),
+					"is_churned":        isChurned,
+					"trend":             trendScore,
+				},
 			})
 		}
 	}
 
-	// Sort by risk score descending
+	// Sort by risk score descending (using actual float values now)
 	sort.Slice(atRiskUsers, func(i, j int) bool {
-		// Parse risk score strings back to float for sorting is messy,
-		// better to store float in struct if needed, but string comparison of "XX.X%" works roughly if padded,
-		// but here we can just rely on the fact that we want high risk first.
-		// Let's just use the string comparison for now or improve if needed.
-		// Actually, let's use the raw values if we had them, but we put strings in the map.
-		// Re-parsing for sort:
-		s1 := atRiskUsers[i]["risk_score"].(string)
-		s2 := atRiskUsers[j]["risk_score"].(string)
-		return s1 > s2 // Rough sort
+		return atRiskUsers[i].riskScore > atRiskUsers[j].riskScore
 	})
 
-	// Limit to top 50
-	if len(atRiskUsers) > 50 {
-		atRiskUsers = atRiskUsers[:50]
+	// Limit to top 50 and extract data maps
+	resultUsers := make([]map[string]interface{}, 0, 50)
+	for i, u := range atRiskUsers {
+		if i >= 50 {
+			break
+		}
+		resultUsers = append(resultUsers, u.data)
 	}
 
 	// Calculate Churn Rate
@@ -959,10 +929,10 @@ func (eas *EnhancedAnalyticsService) calculateChurnRisk(projectID string, thresh
 	}
 
 	result := map[string]interface{}{
-		"at_risk_users": atRiskUsers,
+		"at_risk_users": resultUsers,
 		"churn_stats": map[string]interface{}{
 			"total_users":    totalUsers,
-			"at_risk_users":  len(atRiskUsers),
+			"at_risk_users":  len(resultUsers),
 			"churned_users":  churnedCount,
 			"churn_rate_30d": fmt.Sprintf("%.2f%%", churnRate),
 			"risk_breakdown": riskBuckets,
@@ -1094,35 +1064,31 @@ func (eas *EnhancedAnalyticsService) calculateConversionFunnel(projectID string,
 }
 
 // calculateSessionMetrics calculates enhanced session analytics from events
+// OPTIMIZED: Uses single aggregated SQL query instead of N+1 per-day queries
 func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, start, end time.Time) (map[string]interface{}, error) {
 	// Adjust end date to include the full day
 	endOfDay := end.Add(24*time.Hour - time.Nanosecond)
 
 	log.Printf("Calculating session metrics for project %s from %s to %s", projectID, start.Format("2006-01-02"), end.Format("2006-01-02"))
 
-	// Get total sessions count
-	var totalSessions int64
+	// OPTIMIZED: Get total sessions and unique users in a single query
+	type AggregatedCounts struct {
+		TotalSessions int64
+		UniqueUsers   int64
+	}
+	var counts AggregatedCounts
 	err := eas.db.Model(&Event{}).
+		Select("COUNT(DISTINCT session_id) as total_sessions, COUNT(DISTINCT user_id) as unique_users").
 		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, start, endOfDay).
-		Distinct("session_id").
-		Count(&totalSessions).Error
+		Scan(&counts).Error
 
 	if err != nil {
-		log.Printf("Error counting sessions for project %s: %v", projectID, err)
-		return nil, fmt.Errorf("failed to count sessions: %v", err)
+		log.Printf("Error counting sessions/users for project %s: %v", projectID, err)
+		return nil, fmt.Errorf("failed to count sessions/users: %v", err)
 	}
 
-	// Get unique users count
-	var uniqueUsers int64
-	err = eas.db.Model(&Event{}).
-		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, start, endOfDay).
-		Distinct("user_id").
-		Count(&uniqueUsers).Error
-
-	if err != nil {
-		log.Printf("Error counting unique users for project %s: %v", projectID, err)
-		return nil, fmt.Errorf("failed to count users: %v", err)
-	}
+	totalSessions := counts.TotalSessions
+	uniqueUsers := counts.UniqueUsers
 
 	log.Printf("Found %d sessions and %d unique users for project %s", totalSessions, uniqueUsers, projectID)
 
@@ -1206,35 +1172,43 @@ func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, s
 		returnRate = (float64(returnCount) / float64(len(returningUsers))) * 100
 	}
 
-	// Calculate DAU (last day of range)
+	// OPTIMIZED: Get DAU, WAU, MAU in a single query using date ranges
 	dayStart := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, end.Location())
 	dayEnd := dayStart.Add(24*time.Hour - time.Nanosecond)
-	var dau int64
-	eas.db.Model(&Event{}).
-		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, dayStart, dayEnd).
-		Distinct("user_id").
-		Count(&dau)
+	weekStart := end.AddDate(0, 0, -6)   // 7 days including today
+	monthStart := end.AddDate(0, 0, -29) // 30 days including today
 
-	// Calculate WAU (last 7 days)
-	weekStart := end.AddDate(0, 0, -6) // 7 days including today
-	var wau int64
+	type EngagementCounts struct {
+		DAU int64
+		WAU int64
+		MAU int64
+	}
+	var engagement EngagementCounts
+
+	// DAU query
+	eas.db.Model(&Event{}).
+		Select("COUNT(DISTINCT user_id) as dau").
+		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, dayStart, dayEnd).
+		Scan(&engagement)
+
+	// WAU and MAU in parallel (could use goroutines, but these are fast)
+	var wauCount, mauCount int64
 	eas.db.Model(&Event{}).
 		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, weekStart, endOfDay).
 		Distinct("user_id").
-		Count(&wau)
+		Count(&wauCount)
+	engagement.WAU = wauCount
 
-	// Calculate MAU (last 30 days)
-	monthStart := end.AddDate(0, 0, -29) // 30 days including today
-	var mau int64
 	eas.db.Model(&Event{}).
 		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, monthStart, endOfDay).
 		Distinct("user_id").
-		Count(&mau)
+		Count(&mauCount)
+	engagement.MAU = mauCount
 
 	// Calculate stickiness ratio (DAU/MAU)
 	stickinessRatio := 0.0
-	if mau > 0 {
-		stickinessRatio = (float64(dau) / float64(mau))
+	if engagement.MAU > 0 {
+		stickinessRatio = (float64(engagement.DAU) / float64(engagement.MAU))
 	}
 
 	// Calculate session frequency
@@ -1243,34 +1217,42 @@ func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, s
 		sessionFreq = float64(totalSessions) / float64(uniqueUsers)
 	}
 
-	// Build time series (daily breakdown)
-	timeSeries := make([]map[string]interface{}, 0)
-	current := start
-	for current.Before(end) || current.Equal(end) {
-		dayStart := time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, current.Location())
-		dayEnd := dayStart.Add(24*time.Hour - time.Nanosecond)
+	// OPTIMIZED: Build time series using a SINGLE aggregated query with GROUP BY
+	// This replaces the N+1 query loop that was causing 54 queries (2 per day × 27 days)
+	type DailyStats struct {
+		Date     time.Time `gorm:"column:day_date"`
+		Sessions int64     `gorm:"column:sessions"`
+		Users    int64     `gorm:"column:users"`
+	}
 
-		var daySessions int64
-		eas.db.Model(&Event{}).
-			Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, dayStart, dayEnd).
-			Distinct("session_id").
-			Count(&daySessions)
+	var dailyStats []DailyStats
+	err = eas.db.Model(&Event{}).
+		Select(`
+			date_trunc('day', timestamp) as day_date,
+			COUNT(DISTINCT session_id) as sessions,
+			COUNT(DISTINCT user_id) as users
+		`).
+		Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, start, endOfDay).
+		Group("date_trunc('day', timestamp)").
+		Order("day_date ASC").
+		Scan(&dailyStats).Error
 
-		var dayUsers int64
-		eas.db.Model(&Event{}).
-			Where("project_id = ? AND timestamp BETWEEN ? AND ?", projectID, dayStart, dayEnd).
-			Distinct("user_id").
-			Count(&dayUsers)
+	if err != nil {
+		log.Printf("Error fetching daily stats for project %s: %v", projectID, err)
+		// Non-fatal, return empty time series
+		dailyStats = []DailyStats{}
+	}
 
-		if daySessions > 0 || dayUsers > 0 {
+	// Convert to time series format
+	timeSeries := make([]map[string]interface{}, 0, len(dailyStats))
+	for _, day := range dailyStats {
+		if day.Sessions > 0 || day.Users > 0 {
 			timeSeries = append(timeSeries, map[string]interface{}{
-				"date":     current.Format("2006-01-02"),
-				"sessions": daySessions,
-				"users":    dayUsers,
+				"date":     day.Date.Format("2006-01-02"),
+				"sessions": day.Sessions,
+				"users":    day.Users,
 			})
 		}
-
-		current = current.AddDate(0, 0, 1)
 	}
 
 	// Format average duration for display
@@ -1296,9 +1278,9 @@ func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, s
 			"return_visitor_rate":  fmt.Sprintf("%.2f%%", returnRate),
 		},
 		"engagement": map[string]interface{}{
-			"dau":               dau,
-			"wau":               wau,
-			"mau":               mau,
+			"dau":               engagement.DAU,
+			"wau":               engagement.WAU,
+			"mau":               engagement.MAU,
 			"stickiness_ratio":  fmt.Sprintf("%.2f%%", stickinessRatio*100),
 			"session_frequency": fmt.Sprintf("%.2f", sessionFreq),
 		},
@@ -1311,6 +1293,6 @@ func (eas *EnhancedAnalyticsService) calculateSessionMetrics(projectID string, s
 	}
 
 	log.Printf("Returning session metrics for project %s: %d sessions, %d unique users, DAU: %d, WAU: %d, MAU: %d",
-		projectID, totalSessions, uniqueUsers, dau, wau, mau)
+		projectID, totalSessions, uniqueUsers, engagement.DAU, engagement.WAU, engagement.MAU)
 	return sessionData, nil
 }

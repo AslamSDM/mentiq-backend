@@ -61,6 +61,7 @@ type UserFeatureJourney struct {
 }
 
 // getFeatureUsageHandler returns feature usage statistics
+// OPTIMIZED: Uses SQL aggregation instead of loading all events into memory
 func (s *Server) getFeatureUsageHandler(c *gin.Context) {
 	projectID := c.Param("project_id")
 	if projectID == "" {
@@ -84,21 +85,10 @@ func (s *Server) getFeatureUsageHandler(c *gin.Context) {
 	end, _ := time.Parse("2006-01-02", endDate)
 	end = end.Add(24 * time.Hour) // Include the end date
 
-	// Build query for feature usage events
-	query := s.db.Model(&Event{}).
-		Where("account_id = ? AND project_id = ?", accountID.(string), projectID).
-		Where("timestamp >= ? AND timestamp < ?", start, end).
-		Where("event_type = ?", "feature_usage")
-
-	if featureName != "" {
-		query = query.Where("properties->>'feature_name' = ?", featureName)
-	}
-
-	var events []Event
-	if err := query.Find(&events).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch feature usage data"})
-		return
-	}
+	now := time.Now()
+	oneDayAgo := now.Add(-24 * time.Hour)
+	oneWeekAgo := now.Add(-7 * 24 * time.Hour)
+	oneMonthAgo := now.Add(-30 * 24 * time.Hour)
 
 	// Get total unique users in the period
 	var totalUsers int64
@@ -108,104 +98,95 @@ func (s *Server) getFeatureUsageHandler(c *gin.Context) {
 		Distinct("user_id").
 		Count(&totalUsers)
 
-	// Aggregate feature usage statistics
-	featureStats := make(map[string]*FeatureUsageStats)
-	userFeatureUsage := make(map[string]map[string]int)      // user_id -> feature -> count
-	featureUsers := make(map[string]map[string]bool)         // feature -> set of user_ids
-	featureFirstUse := make(map[string]map[string]time.Time) // feature -> user_id -> first_use_time
-	featureSecondUse := make(map[string]map[string]bool)     // feature -> user_id -> used_again
-
-	now := time.Now()
-	oneDayAgo := now.Add(-24 * time.Hour)
-	oneWeekAgo := now.Add(-7 * 24 * time.Hour)
-	oneMonthAgo := now.Add(-30 * 24 * time.Hour)
-
-	for _, event := range events {
-		feature, ok := event.Properties["feature_name"].(string)
-		if !ok || feature == "" {
-			continue
-		}
-
-		// Initialize feature stats
-		if _, exists := featureStats[feature]; !exists {
-			featureStats[feature] = &FeatureUsageStats{
-				FeatureName: feature,
-				FirstUsed:   event.Timestamp,
-				LastUsed:    event.Timestamp,
-			}
-			featureUsers[feature] = make(map[string]bool)
-			featureFirstUse[feature] = make(map[string]time.Time)
-			featureSecondUse[feature] = make(map[string]bool)
-		}
-
-		stats := featureStats[feature]
-		stats.TotalUsages++
-
-		// Track unique users
-		if event.UserID != "" {
-			featureUsers[feature][event.UserID] = true
-
-			// Track user feature usage count
-			if userFeatureUsage[event.UserID] == nil {
-				userFeatureUsage[event.UserID] = make(map[string]int)
-			}
-			userFeatureUsage[event.UserID][feature]++
-
-			// Track first use for retention calculation
-			if firstUse, exists := featureFirstUse[feature][event.UserID]; !exists {
-				featureFirstUse[feature][event.UserID] = event.Timestamp
-			} else if event.Timestamp.After(firstUse) {
-				featureSecondUse[feature][event.UserID] = true
-			}
-
-			// Count active users by time period
-			if event.Timestamp.After(oneDayAgo) {
-				stats.DailyActiveUsers++
-			}
-			if event.Timestamp.After(oneWeekAgo) {
-				stats.WeeklyActiveUsers++
-			}
-			if event.Timestamp.After(oneMonthAgo) {
-				stats.MonthlyActiveUsers++
-			}
-		}
-
-		// Update first and last used
-		if event.Timestamp.Before(stats.FirstUsed) {
-			stats.FirstUsed = event.Timestamp
-		}
-		if event.Timestamp.After(stats.LastUsed) {
-			stats.LastUsed = event.Timestamp
-		}
+	// OPTIMIZED: Use SQL aggregation to get feature stats directly
+	type FeatureAggregation struct {
+		FeatureName string    `gorm:"column:feature_name"`
+		UniqueUsers int64     `gorm:"column:unique_users"`
+		TotalUsages int64     `gorm:"column:total_usages"`
+		FirstUsed   time.Time `gorm:"column:first_used"`
+		LastUsed    time.Time `gorm:"column:last_used"`
+		DAU         int64     `gorm:"column:dau"`
+		WAU         int64     `gorm:"column:wau"`
+		MAU         int64     `gorm:"column:mau"`
+		ReturnUsers int64     `gorm:"column:return_users"`
 	}
 
-	// Calculate derived metrics
-	for feature, stats := range featureStats {
-		stats.UniqueUsers = len(featureUsers[feature])
-		stats.TotalUsers = int(totalUsers)
+	// Build the aggregation query
+	query := `
+		WITH feature_events AS (
+			SELECT 
+				properties->>'feature_name' as feature_name,
+				user_id,
+				timestamp,
+				ROW_NUMBER() OVER (PARTITION BY properties->>'feature_name', user_id ORDER BY timestamp) as rn
+			FROM events
+			WHERE account_id = $1 
+				AND project_id = $2
+				AND timestamp >= $3 AND timestamp < $4
+				AND event_type = 'feature_usage'
+				AND properties->>'feature_name' IS NOT NULL
+				AND properties->>'feature_name' != ''
+	`
 
+	args := []interface{}{accountID.(string), projectID, start, end}
+	argIndex := 5
+
+	if featureName != "" {
+		query += ` AND properties->>'feature_name' = $` + string('0'+byte(argIndex))
+		args = append(args, featureName)
+		argIndex++
+	}
+
+	query += `
+		)
+		SELECT 
+			feature_name,
+			COUNT(DISTINCT user_id) as unique_users,
+			COUNT(*) as total_usages,
+			MIN(timestamp) as first_used,
+			MAX(timestamp) as last_used,
+			COUNT(DISTINCT CASE WHEN timestamp > $` + string('0'+byte(argIndex)) + ` THEN user_id END) as dau,
+			COUNT(DISTINCT CASE WHEN timestamp > $` + string('0'+byte(argIndex+1)) + ` THEN user_id END) as wau,
+			COUNT(DISTINCT CASE WHEN timestamp > $` + string('0'+byte(argIndex+2)) + ` THEN user_id END) as mau,
+			COUNT(DISTINCT CASE WHEN rn > 1 THEN user_id END) as return_users
+		FROM feature_events
+		GROUP BY feature_name
+		ORDER BY total_usages DESC
+	`
+	args = append(args, oneDayAgo, oneWeekAgo, oneMonthAgo)
+
+	var featureAggs []FeatureAggregation
+	if err := s.db.Raw(query, args...).Scan(&featureAggs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch feature usage data"})
+		return
+	}
+
+	// Build response
+	var results []FeatureUsageStats
+	for _, agg := range featureAggs {
+		stats := FeatureUsageStats{
+			FeatureName:        agg.FeatureName,
+			UniqueUsers:        int(agg.UniqueUsers),
+			TotalUsers:         int(totalUsers),
+			TotalUsages:        int(agg.TotalUsages),
+			FirstUsed:          agg.FirstUsed,
+			LastUsed:           agg.LastUsed,
+			DailyActiveUsers:   int(agg.DAU),
+			WeeklyActiveUsers:  int(agg.WAU),
+			MonthlyActiveUsers: int(agg.MAU),
+		}
+
+		// Calculate derived metrics
 		if stats.UniqueUsers > 0 {
 			stats.AvgUsagePerUser = float64(stats.TotalUsages) / float64(stats.UniqueUsers)
-
-			// Calculate retention rate (users who used the feature more than once)
-			usersWithSecondUse := 0
-			for userID := range featureUsers[feature] {
-				if featureSecondUse[feature][userID] {
-					usersWithSecondUse++
-				}
-			}
-			stats.RetentionRate = float64(usersWithSecondUse) / float64(stats.UniqueUsers) * 100
+			stats.RetentionRate = float64(agg.ReturnUsers) / float64(stats.UniqueUsers) * 100
 		}
 
 		if totalUsers > 0 {
 			stats.AdoptionRate = float64(stats.UniqueUsers) / float64(totalUsers) * 100
 		}
-	}
 
-	// Convert map to slice
-	var results []FeatureUsageStats
-	for _, stats := range featureStats {
-		results = append(results, *stats)
+		results = append(results, stats)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

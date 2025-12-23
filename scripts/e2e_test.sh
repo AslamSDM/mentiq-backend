@@ -458,6 +458,107 @@ else
   echo "[WARN] Stripe customer analytics returned unexpected status $status"
 fi
 
+# 15) Test Feature Tracking & Onboarding endpoints
+echo ""
+echo "Testing Feature Tracking & Onboarding Analytics endpoints..."
+
+# Feature Usage
+echo ""
+echo "→ Fetching Feature Usage Analytics..."
+resp_and_code=$(api GET "/api/v1/projects/$PROJECT_ID/features/usage" "")
+body=$(echo "$resp_and_code" | sed '$d')
+status=$(echo "$resp_and_code" | tail -n 1)
+if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+  echo "[OK] Feature usage analytics (status $status)"
+  feature_count=$(echo "$body" | $JQ -r '.features // [] | length' 2>/dev/null || echo "0")
+  echo "  Features tracked: $feature_count"
+elif [ "$status" -eq 404 ] || [ "$status" -eq 400 ]; then
+  echo "[EXPECTED] No feature data yet (status $status)"
+else
+  echo "[WARN] Feature usage returned unexpected status $status"
+fi
+
+# Onboarding Stats
+echo ""
+echo "→ Fetching Onboarding Funnel Analytics..."
+resp_and_code=$(api GET "/api/v1/projects/$PROJECT_ID/onboarding/stats" "")
+body=$(echo "$resp_and_code" | sed '$d')
+status=$(echo "$resp_and_code" | tail -n 1)
+if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+  echo "[OK] Onboarding funnel analytics (status $status)"
+  echo "$body" | $JQ -r '
+    if .total_started then
+      "  Started: " + (.total_started | tostring),
+      "  Completed: " + (.total_completed | tostring),
+      "  Completion Rate: " + (.completion_rate | tostring) + "%",
+      "  Steps: " + (.steps | length | tostring)
+    else
+      "  (No onboarding data)"
+    end
+  ' 2>/dev/null || echo "  (No onboarding data)"
+elif [ "$status" -eq 404 ] || [ "$status" -eq 400 ]; then
+  echo "[EXPECTED] No onboarding data yet (status $status)"
+else
+  echo "[WARN] Onboarding stats returned unexpected status $status"
+fi
+
+# User Journey
+echo ""
+echo "→ Fetching User Journey..."
+resp_and_code=$(api GET "/api/v1/projects/$PROJECT_ID/users/user-e2e-1/journey" "")
+body=$(echo "$resp_and_code" | sed '$d')
+status=$(echo "$resp_and_code" | tail -n 1)
+if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+  echo "[OK] User journey analytics (status $status)"
+  echo "$body" | $JQ -r '
+    "  User: " + (.user_id // "unknown"),
+    "  Features Used: " + (.feature_count // 0 | tostring),
+    "  Onboarding: " + (.onboarding_status // "unknown"),
+    "  Engagement Score: " + (.engagement_score // 0 | tostring)
+  ' 2>/dev/null || echo "  (No user data)"
+elif [ "$status" -eq 404 ]; then
+  echo "[EXPECTED] User journey not found (status $status)"
+else
+  echo "[WARN] User journey returned unexpected status $status"
+fi
+
+# Optionally seed feature tracking data
+SEED_FEATURES=${SEED_FEATURES:-"false"}
+if [ "$SEED_FEATURES" = "true" ]; then
+  echo ""
+  echo "Seeding feature tracking & onboarding data..."
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  
+  if [ -f "$SCRIPT_DIR/seed_feature_tracking.sh" ]; then
+    BEARER_TOKEN="$TOKEN" \
+    PROJECT_ID="$PROJECT_ID" \
+    API_URL="$API_URL" \
+    NUM_USERS="${FEATURE_USERS:-30}" \
+    DAYS_BACK="${FEATURE_DAYS:-14}" \
+    "$SCRIPT_DIR/seed_feature_tracking.sh"
+    
+    echo ""
+    echo "Waiting 2 seconds for data processing..."
+    sleep 2
+    
+    # Re-query feature usage
+    echo ""
+    echo "→ Re-checking Feature Usage Analytics..."
+    resp_and_code=$(api GET "/api/v1/projects/$PROJECT_ID/features/usage" "")
+    body=$(echo "$resp_and_code" | sed '$d')
+    status=$(echo "$resp_and_code" | tail -n 1)
+    if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+      echo "[OK] Feature usage with seeded data (status $status)"
+      echo "$body" | $JQ -r '
+        .features // [] | .[0:3] | .[] | 
+        "  • " + .feature_name + " - " + (.unique_users | tostring) + " users, " + (.adoption_rate | tonumber | floor | tostring) + "% adoption"
+      ' 2>/dev/null || echo "  (Data available)"
+    fi
+  else
+    echo "[WARN] seed_feature_tracking.sh not found, skipping"
+  fi
+fi
+
 # Summary
 echo ""
 cat <<EOF
@@ -496,6 +597,14 @@ Stripe Integration:
   - Revenue metrics: tested (expected to fail without config)
   - Analytics: tested (expected to fail without config)
   - Customers: tested (expected to fail without config)
+
+Feature Tracking & Onboarding:
+  - Feature usage: tested
+  - Onboarding funnel: tested
+  - User journey: tested
+
+Tip: Set SEED_FEATURES=true to populate test data for feature tracking!
+  Example: SEED_FEATURES=true FEATURE_USERS=50 ./scripts/e2e_test.sh
 
 If all [OK] messages were shown, the core functionality is working correctly!
 ================================================================================

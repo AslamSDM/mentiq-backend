@@ -30,12 +30,21 @@ func InitWebhookSecret() {
 // ValidateWebhookSignature validates the HMAC signature of a webhook request
 func ValidateWebhookSignature(payload []byte, signature string) bool {
 	if WebhookSecret == "" {
+		log.Printf("🚨 WEBHOOK_SECRET is empty!")
 		return false
 	}
 
 	mac := hmac.New(sha256.New, []byte(WebhookSecret))
 	mac.Write(payload)
 	expectedSignature := hex.EncodeToString(mac.Sum(nil))
+
+	// Debug logging
+	log.Printf("🔐 Webhook signature validation:")
+	log.Printf("   Secret length: %d", len(WebhookSecret))
+	log.Printf("   Payload length: %d", len(payload))
+	log.Printf("   Received signature: %s", signature)
+	log.Printf("   Expected signature: %s", expectedSignature)
+	log.Printf("   Match: %v", hmac.Equal([]byte(signature), []byte(expectedSignature)))
 
 	return hmac.Equal([]byte(signature), []byte(expectedSignature))
 }
