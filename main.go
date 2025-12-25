@@ -714,9 +714,9 @@ func main() {
 	}
 
 	// Run migrations
-	// if err := MigrateDB(database); err != nil {
-	// 	log.Fatalf("Failed to run migrations: %v", err)
-	// }
+	if err := MigrateDB(database); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -764,6 +764,9 @@ func main() {
 	router.POST("/forgot-password", server.forgotPasswordHandler)
 	router.POST("/reset-password", server.resetPasswordHandler)
 	router.GET("/health", healthCheckHandler)
+
+	// Waitlist route (public, no auth required)
+	router.POST("/api/v1/waitlist", server.joinWaitlistHandler)
 
 	// Webhook routes (no authentication - secured by signature validation)
 	webhookRoutes := router.Group("/webhook")
@@ -863,6 +866,7 @@ func main() {
 		apiV1.GET("/projects/:project_id/analytics/churn-metrics", server.cacheResponseMiddleware(CacheTTLChurnMetrics), server.analyticsService.GetChurnMetricsHandler)
 		apiV1.GET("/projects/:project_id/analytics/subscription-health", server.cacheResponseMiddleware(CacheTTLSubscriptionHealth), server.analyticsService.GetSubscriptionHealthHandler)
 		apiV1.GET("/projects/:project_id/analytics/churn", server.cacheResponseMiddleware(CacheTTLChurnMetrics), server.enhancedAnalyticsService.ChurnRiskHandler)
+		apiV1.GET("/projects/:project_id/analytics/churn/export", server.enhancedAnalyticsService.ExportChurnRiskHandler) // Export endpoint - not cached
 		apiV1.GET("/projects/:project_id/analytics/funnels", server.cacheResponseMiddleware(CacheTTLFunnelAnalytics), server.enhancedAnalyticsService.ConversionFunnelHandler)
 		apiV1.GET("/projects/:project_id/analytics/sessions", server.cacheResponseMiddleware(CacheTTLSessionAnalytics), server.enhancedAnalyticsService.SessionAnalyticsHandler)
 

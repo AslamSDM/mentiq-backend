@@ -203,6 +203,118 @@ func (eas *EnhancedAnalyticsService) ChurnRiskHandler(c *gin.Context) {
 	})
 }
 
+// ExportChurnRiskHandler exports at-risk users as CSV for email campaigns
+func (eas *EnhancedAnalyticsService) ExportChurnRiskHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	riskThreshold := c.DefaultQuery("risk_threshold", "40") // Default to 40% to include medium risk
+	riskFilter := c.DefaultQuery("risk_level", "all")       // all, high, medium, critical
+	format := c.DefaultQuery("format", "csv")               // csv or json
+
+	threshold, _ := strconv.ParseFloat(riskThreshold, 64)
+	churnData, err := eas.calculateChurnRisk(projectID, threshold)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	atRiskUsers, ok := churnData["at_risk_users"].([]map[string]interface{})
+	if !ok {
+		atRiskUsers = []map[string]interface{}{}
+	}
+
+	// Filter by risk level if specified
+	filteredUsers := make([]map[string]interface{}, 0)
+	for _, user := range atRiskUsers {
+		category, _ := user["risk_category"].(string)
+
+		switch riskFilter {
+		case "critical":
+			if category == "Critical" {
+				filteredUsers = append(filteredUsers, user)
+			}
+		case "high":
+			if category == "Critical" || category == "High" {
+				filteredUsers = append(filteredUsers, user)
+			}
+		case "medium":
+			if category == "Critical" || category == "High" || category == "Medium" {
+				filteredUsers = append(filteredUsers, user)
+			}
+		default: // "all"
+			filteredUsers = append(filteredUsers, user)
+		}
+	}
+
+	if format == "json" {
+		// Return as JSON with just essential fields for email list
+		emailList := make([]map[string]interface{}, 0, len(filteredUsers))
+		for _, user := range filteredUsers {
+			emailList = append(emailList, map[string]interface{}{
+				"user_id":       user["user_id"],
+				"email":         user["email"],
+				"risk_score":    user["risk_score"],
+				"risk_category": user["risk_category"],
+				"last_active":   user["last_active"],
+				"days_inactive": user["days_inactive"],
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":      "success",
+			"total_users": len(emailList),
+			"risk_level":  riskFilter,
+			"users":       emailList,
+		})
+		return
+	}
+
+	// Generate CSV
+	var csvBuilder strings.Builder
+	csvBuilder.WriteString("user_id,email,risk_score,risk_category,last_active,days_inactive,total_events\n")
+
+	for _, user := range filteredUsers {
+		userID, _ := user["user_id"].(string)
+		email, _ := user["email"].(string)
+		riskScore, _ := user["risk_score"].(string)
+		riskCategory, _ := user["risk_category"].(string)
+		lastActive, _ := user["last_active"].(string)
+		daysInactive := fmt.Sprintf("%v", user["days_inactive"])
+		totalEvents := fmt.Sprintf("%v", user["total_events"])
+
+		// If email is empty, use user_id as fallback
+		if email == "" {
+			email = userID
+		}
+
+		// Escape any commas in fields
+		csvBuilder.WriteString(fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s\n",
+			escapeCSVField(userID),
+			escapeCSVField(email),
+			escapeCSVField(riskScore),
+			escapeCSVField(riskCategory),
+			escapeCSVField(lastActive),
+			escapeCSVField(daysInactive),
+			escapeCSVField(totalEvents),
+		))
+	}
+
+	// Set headers for CSV download
+	filename := fmt.Sprintf("at_risk_users_%s_%s.csv", projectID, time.Now().Format("2006-01-02"))
+	c.Header("Content-Type", "text/csv")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	c.Header("Content-Length", strconv.Itoa(len(csvBuilder.String())))
+
+	c.String(http.StatusOK, csvBuilder.String())
+}
+
+// escapeCSVField escapes a field for CSV output
+func escapeCSVField(field string) string {
+	// If field contains comma, quote, or newline, wrap in quotes and escape quotes
+	if strings.ContainsAny(field, ",\"\n") {
+		return "\"" + strings.ReplaceAll(field, "\"", "\"\"") + "\""
+	}
+	return field
+}
+
 // ConversionFunnelHandler provides conversion funnel analysis
 func (eas *EnhancedAnalyticsService) ConversionFunnelHandler(c *gin.Context) {
 	projectID := c.Param("project_id")

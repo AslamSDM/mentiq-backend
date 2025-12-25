@@ -60,6 +60,8 @@ func MigrateDB(db *gorm.DB) error {
 		&PlaybookStepExecution{},
 		&PlaybookAnalytics{},
 		&LLMPlaybookGeneration{},
+		// Waitlist
+		&Waitlist{},
 	)
 
 	if err != nil {

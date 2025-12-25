@@ -215,6 +215,61 @@ func (s *Server) getOnboardingTasksHandler(c *gin.Context) {
 		}
 	}
 
+	// Get the user's project to check for events
+	var project Project
+	hasProject := s.db.Where("account_id = ?", accountID).First(&project).Error == nil
+
+	// Auto-detect completed tasks based on actual data
+	now := time.Now()
+	updates := make(map[string]interface{})
+
+	// Check if project has events -> mark first_event as completed
+	if hasProject && !status.FirstEventTracked {
+		var eventCount int64
+		s.db.Model(&Event{}).Where("project_id = ?", project.ID).Count(&eventCount)
+		if eventCount > 0 {
+			updates["first_event_tracked"] = true
+			updates["first_event_tracked_at"] = now
+			status.FirstEventTracked = true
+			status.FirstEventTrackedAt = &now
+		}
+	}
+
+	// Check if Stripe key exists -> mark stripe_connected as completed
+	if hasProject && !status.StripeConnected {
+		if project.StripeAPIKey != "" {
+			updates["stripe_connected"] = true
+			updates["stripe_connected_at"] = now
+			status.StripeConnected = true
+			status.StripeConnectedAt = &now
+		}
+	}
+
+	// Check if team has members (other than owner) -> mark team_invited as completed
+	if !status.TeamMembersInvited {
+		var memberCount int64
+		s.db.Model(&User{}).Where("account_id = ? AND role != ?", accountID, "owner").Count(&memberCount)
+		if memberCount > 0 {
+			updates["team_members_invited"] = true
+			updates["team_members_invited_at"] = now
+			status.TeamMembersInvited = true
+			status.TeamMembersInvitedAt = &now
+		}
+	}
+
+	// Apply updates if any tasks were auto-completed
+	if len(updates) > 0 {
+		// Check if all tasks are now complete
+		allComplete := status.FirstEventTracked && status.StripeConnected && status.TeamMembersInvited
+		if allComplete && !status.OnboardingComplete {
+			updates["onboarding_complete"] = true
+			updates["completed_at"] = now
+			status.OnboardingComplete = true
+		}
+
+		s.db.Model(&status).Updates(updates)
+	}
+
 	type Task struct {
 		ID          string     `json:"id"`
 		Title       string     `json:"title"`
@@ -239,7 +294,7 @@ func (s *Server) getOnboardingTasksHandler(c *gin.Context) {
 			Description: "Add your Stripe API key to track revenue and churn",
 			Completed:   status.StripeConnected,
 			CompletedAt: status.StripeConnectedAt,
-			Route:       "/dashboard/pricing",
+			Route:       "/dashboard/revenue",
 		},
 		{
 			ID:          "team_invited",

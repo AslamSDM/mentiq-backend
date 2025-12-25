@@ -857,3 +857,20 @@ type LLMPlaybookGeneration struct {
 func (LLMPlaybookGeneration) TableName() string {
 	return "llm_playbook_generation"
 }
+
+// Waitlist represents a user who signed up for the waitlist
+type Waitlist struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	Email     string    `gorm:"uniqueIndex;not null" json:"email"`
+	FullName  string    `gorm:"not null" json:"full_name"`
+	Company   string    `json:"company"`
+	UserCount int       `json:"user_count"` // Optional: expected number of users
+	Source    string    `json:"source"`     // e.g., "landing_page", "pricing", "blog"
+	EmailSent bool      `gorm:"default:false" json:"email_sent"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (Waitlist) TableName() string {
+	return "waitlist"
+}

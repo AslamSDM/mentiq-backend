@@ -4,27 +4,66 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
-	"github.com/sendgrid/sendgrid-go"
-	"github.com/sendgrid/sendgrid-go/helpers/mail"
+	"github.com/resend/resend-go/v3"
 )
 
-// EmailService handles sending emails via SendGrid
+// EmailService handles sending emails via Resend
 type EmailService struct {
 	apiKey    string
 	fromEmail string
 	fromName  string
 	baseURL   string
+	client    *resend.Client
 }
 
 // NewEmailService creates a new email service instance
 func NewEmailService() *EmailService {
+	apiKey := os.Getenv("RESEND_API_KEY")
+	if apiKey == "" {
+		log.Println("Warning: RESEND_API_KEY not set. Email features will be disabled.")
+	}
+
+	var client *resend.Client
+	if apiKey != "" {
+		client = resend.NewClient(apiKey)
+	}
+
 	return &EmailService{
-		apiKey:    os.Getenv("SENDGRID_API_KEY"),
+		apiKey:    apiKey,
 		fromEmail: os.Getenv("EMAIL_FROM_ADDRESS"),
 		fromName:  os.Getenv("EMAIL_FROM_NAME"),
 		baseURL:   os.Getenv("FRONTEND_URL"),
+		client:    client,
 	}
+}
+
+// sendEmail is the internal helper to send emails via Resend
+func (es *EmailService) sendEmail(toEmail, toName, subject, htmlContent, plainTextContent string) error {
+	if es.apiKey == "" || es.client == nil {
+		log.Printf("Resend not configured, skipping email to %s", toEmail)
+		return nil
+	}
+
+	fromAddress := fmt.Sprintf("%s <%s>", es.fromName, es.fromEmail)
+
+	params := &resend.SendEmailRequest{
+		From:    fromAddress,
+		To:      []string{toEmail},
+		Subject: subject,
+		Html:    htmlContent,
+		Text:    plainTextContent,
+	}
+
+	sent, err := es.client.Emails.Send(params)
+	if err != nil {
+		log.Printf("Error sending email to %s via Resend: %v", toEmail, err)
+		return fmt.Errorf("failed to send email: %w", err)
+	}
+
+	log.Printf("Email sent successfully to %s. Message ID: %s", toEmail, sent.Id)
+	return nil
 }
 
 // SendInvitationEmail sends a team invitation email
@@ -32,16 +71,15 @@ func (es *EmailService) SendInvitationEmail(toEmail, toName, inviterName, accoun
 	log.Printf("Preparing to send invitation email to %s (Name: %s) for account %s initiated by %s", toEmail, toName, accountName, inviterName)
 
 	if es.apiKey == "" {
-		log.Println("SendGrid not configured, skipping email send")
+		log.Println("Resend not configured, skipping email send")
 		log.Printf("Would have sent invitation to %s from %s for account %s with token %s", toEmail, inviterName, accountName, token)
-		return nil // Don't fail if SendGrid is not configured
+		return nil
 	}
 
 	acceptURL := fmt.Sprintf("%s/accept-invitation?token=%s", es.baseURL, token)
 
 	subject := fmt.Sprintf("%s invited you to join %s on Mentiq", inviterName, accountName)
 
-	// Dark theme email template
 	htmlContent := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -134,26 +172,7 @@ This invitation expires in 7 days.
 If you didn't expect this invitation, you can safely ignore this email.
 `, accountName, getName(toName), inviterName, acceptURL)
 
-	from := mail.NewEmail(es.fromName, es.fromEmail)
-	to := mail.NewEmail(toName, toEmail)
-	message := mail.NewSingleEmail(from, subject, to, plainTextContent, htmlContent)
-
-	log.Printf("Sending email via SendGrid to %s...", toEmail)
-	client := sendgrid.NewSendClient(es.apiKey)
-	response, err := client.Send(message)
-
-	if err != nil {
-		log.Printf("Error sending email to %s: %v", toEmail, err)
-		return fmt.Errorf("failed to send email: %w", err)
-	}
-
-	if response.StatusCode >= 400 {
-		log.Printf("SendGrid API error for %s: Status %d, Body: %s", toEmail, response.StatusCode, response.Body)
-		return fmt.Errorf("email service error: status code %d - %s", response.StatusCode, response.Body)
-	}
-
-	log.Printf("Invitation email sent successfully to %s. Status Code: %d", toEmail, response.StatusCode)
-	return nil
+	return es.sendEmail(toEmail, toName, subject, htmlContent, plainTextContent)
 }
 
 // getName formats the name for email greeting
@@ -169,16 +188,15 @@ func (es *EmailService) SendVerificationEmail(toEmail, toName, token string) err
 	log.Printf("Preparing to send verification email to %s", toEmail)
 
 	if es.apiKey == "" {
-		log.Println("SendGrid not configured, skipping email send")
+		log.Println("Resend not configured, skipping email send")
 		log.Printf("Would have sent verification email to %s with token %s", toEmail, token)
-		return nil // Don't fail if SendGrid is not configured
+		return nil
 	}
 
 	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", es.baseURL, token)
 
 	subject := "Verify your email address - Mentiq"
 
-	// Dark theme email template
 	htmlContent := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -271,26 +289,7 @@ This link expires in 24 hours.
 If you didn't create an account, you can safely ignore this email.
 `, getName(toName), verifyURL)
 
-	from := mail.NewEmail(es.fromName, es.fromEmail)
-	to := mail.NewEmail(toName, toEmail)
-	message := mail.NewSingleEmail(from, subject, to, plainTextContent, htmlContent)
-
-	log.Printf("Sending verification email via SendGrid to %s...", toEmail)
-	client := sendgrid.NewSendClient(es.apiKey)
-	response, err := client.Send(message)
-
-	if err != nil {
-		log.Printf("Error sending verification email to %s: %v", toEmail, err)
-		return fmt.Errorf("failed to send email: %w", err)
-	}
-
-	if response.StatusCode >= 400 {
-		log.Printf("SendGrid API error for %s: Status %d, Body: %s", toEmail, response.StatusCode, response.Body)
-		return fmt.Errorf("email service error: status code %d - %s", response.StatusCode, response.Body)
-	}
-
-	log.Printf("Verification email sent successfully to %s. Status Code: %d", toEmail, response.StatusCode)
-	return nil
+	return es.sendEmail(toEmail, toName, subject, htmlContent, plainTextContent)
 }
 
 // SendPasswordResetEmail sends a password reset email
@@ -298,16 +297,15 @@ func (es *EmailService) SendPasswordResetEmail(toEmail, toName, token string) er
 	log.Printf("Preparing to send password reset email to %s", toEmail)
 
 	if es.apiKey == "" {
-		log.Println("SendGrid not configured, skipping email send")
+		log.Println("Resend not configured, skipping email send")
 		log.Printf("Would have sent password reset email to %s with token %s", toEmail, token)
-		return nil // Don't fail if SendGrid is not configured
+		return nil
 	}
 
 	resetURL := fmt.Sprintf("%s/reset-password?token=%s", es.baseURL, token)
 
 	subject := "Reset your password - Mentiq"
 
-	// Dark theme email template
 	htmlContent := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -400,24 +398,93 @@ This link expires in 1 hour for security reasons.
 If you didn't request this password reset, please ignore this email.
 `, getName(toName), resetURL)
 
-	from := mail.NewEmail(es.fromName, es.fromEmail)
-	to := mail.NewEmail(toName, toEmail)
-	message := mail.NewSingleEmail(from, subject, to, plainTextContent, htmlContent)
+	return es.sendEmail(toEmail, toName, subject, htmlContent, plainTextContent)
+}
 
-	log.Printf("Sending password reset email via SendGrid to %s...", toEmail)
-	client := sendgrid.NewSendClient(es.apiKey)
-	response, err := client.Send(message)
+// SendWaitlistEmail sends a confirmation email when someone joins the waitlist
+func (es *EmailService) SendWaitlistEmail(toEmail, toName string) error {
+	log.Printf("Sending waitlist confirmation email to %s", toEmail)
 
-	if err != nil {
-		log.Printf("Error sending password reset email to %s: %v", toEmail, err)
-		return fmt.Errorf("failed to send email: %w", err)
+	if es.apiKey == "" {
+		log.Println("Resend not configured, skipping waitlist email")
+		return nil
 	}
 
-	if response.StatusCode >= 400 {
-		log.Printf("SendGrid API error for %s: Status %d, Body: %s", toEmail, response.StatusCode, response.Body)
-		return fmt.Errorf("email service error: status code %d - %s", response.StatusCode, response.Body)
-	}
+	subject := "Welcome to the Mentiq Waitlist! 🎉"
 
-	log.Printf("Password reset email sent successfully to %s. Status Code: %d", toEmail, response.StatusCode)
-	return nil
+	htmlContent := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8f9fa; color: #1a1a1a;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #f8f9fa;">
+        <tr>
+            <td align="center" style="padding: 40px 20px;">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #e5e7eb; box-shadow: 0 4px 24px rgba(0,0,0,0.08);">
+                    <!-- Header -->
+                    <tr>
+                        <td style="padding: 40px 40px 30px; text-align: center; border-bottom: 1px solid #f0f0f0;">
+                            <h1 style="margin: 0; color: #7c3aed; font-size: 32px; font-weight: 700; letter-spacing: -0.5px;">Mentiq</h1>
+                        </td>
+                    </tr>
+                    
+                    <!-- Content -->
+                    <tr>
+                        <td style="padding: 40px;">
+                            <h2 style="margin: 0 0 20px; color: #1a1a1a; font-size: 24px; font-weight: 600;">You're on the list%s! 🎉</h2>
+                            
+                            <p style="margin: 0 0 24px; font-size: 16px; line-height: 1.7; color: #4b5563;">
+                                Thank you for joining the Mentiq waitlist. We're building the ultimate churn prevention platform for SaaS founders, and we're excited to have you along for the journey.
+                            </p>
+                            
+                            <div style="background: linear-gradient(135deg, #f3e8ff, #ede9fe); border: 1px solid #c4b5fd; border-radius: 12px; padding: 24px; margin: 24px 0;">
+                                <h3 style="margin: 0 0 12px; color: #7c3aed; font-size: 18px; font-weight: 600;">What to expect:</h3>
+                                <ul style="margin: 0; padding: 0 0 0 20px; color: #4b5563; line-height: 1.8;">
+                                    <li>Early access when we launch</li>
+                                    <li>Exclusive founder pricing</li>
+                                    <li>Direct input on features we build</li>
+                                    <li>Priority support from day one</li>
+                                </ul>
+                            </div>
+                            
+                            <p style="margin: 24px 0 0; font-size: 16px; line-height: 1.7; color: #4b5563;">
+                                We'll be in touch soon with updates on our progress. In the meantime, feel free to reply to this email if you have any questions.
+                            </p>
+                        </td>
+                    </tr>
+                    
+                    <!-- Footer -->
+                    <tr>
+                        <td style="padding: 30px 40px; background-color: #f9fafb; border-top: 1px solid #f0f0f0; border-radius: 0 0 16px 16px; text-align: center;">
+                            <p style="margin: 0; font-size: 14px; color: #9ca3af;">
+                                &copy; %d Mentiq. All rights reserved.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+`, getName(toName), time.Now().Year())
+
+	plainTextContent := fmt.Sprintf(`
+Welcome to the Mentiq Waitlist!
+
+Hi%s,
+
+Thank you for joining the Mentiq waitlist. We're building the ultimate churn prevention platform for SaaS founders, and we're excited to have you along for the journey.
+
+
+We'll be in touch soon with updates on our progress. Feel free to reply to this email if you have any questions.
+
+Best,
+The Mentiq Team
+`, getName(toName))
+
+	return es.sendEmail(toEmail, toName, subject, htmlContent, plainTextContent)
 }
