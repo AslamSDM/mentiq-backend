@@ -767,6 +767,7 @@ func main() {
 
 	// Waitlist route (public, no auth required)
 	router.POST("/api/v1/waitlist", server.joinWaitlistHandler)
+	router.GET("/api/v1/unsubscribe", server.unsubscribeHandler)
 
 	// Webhook routes (no authentication - secured by signature validation)
 	webhookRoutes := router.Group("/webhook")
@@ -808,6 +809,11 @@ func main() {
 		apiV1.PUT("/onboarding/status", server.updateOnboardingStatusHandler)
 		apiV1.POST("/onboarding/tasks/:task/complete", server.markTaskCompleteHandler)
 		apiV1.GET("/onboarding/tasks", server.getOnboardingTasksHandler)
+
+		// Account settings routes
+		apiV1.GET("/account/profile", server.getAccountProfileHandler)
+		apiV1.PUT("/account/profile", server.updateAccountProfileHandler)
+		apiV1.POST("/account/change-password", server.changePasswordHandler)
 
 		// Project and API Key management
 		apiV1.POST("/projects", server.createProjectHandler)
@@ -2921,11 +2927,23 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create project"})
 		return
 	}
-
 	// Cache the new project and invalidate account projects list
 	s.setCachedProject(&project)
 	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
 	s.invalidateCachedEntity(cacheKey, s.projectCache)
+
+	// Auto-create a default API key for the new project
+	apiKey := APIKey{
+		ID:        uuid.New().String(),
+		Key:       "mentiq_live_" + uuid.New().String(),
+		Name:      "Default API Key",
+		ProjectID: project.ID,
+		IsActive:  true,
+	}
+	if err := s.db.Create(&apiKey).Error; err != nil {
+		// Log error but don't fail the project creation
+		log.Printf("Warning: Failed to create default API key for project %s: %v", project.ID, err)
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"id":        project.ID,
@@ -2933,6 +2951,7 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 		"accountId": project.AccountID,
 		"createdAt": project.CreatedAt,
 		"updatedAt": project.UpdatedAt,
+		"apiKey":    apiKey.Key, // Return the auto-generated API key
 	})
 }
 

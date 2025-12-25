@@ -10,6 +10,7 @@ type Account struct {
 	Name      string    `json:"name"`                     // Company/Organization name
 	Email     string    `gorm:"uniqueIndex" json:"email"` // Primary contact email
 	Password  string    `json:"-"`                        // Keep for backward compatibility during migration
+	AvatarURL string    `json:"avatar_url,omitempty"`     // Profile picture URL
 	IsAdmin   bool      `gorm:"default:false" json:"is_admin"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -860,15 +861,18 @@ func (LLMPlaybookGeneration) TableName() string {
 
 // Waitlist represents a user who signed up for the waitlist
 type Waitlist struct {
-	ID        string    `gorm:"primaryKey" json:"id"`
-	Email     string    `gorm:"uniqueIndex;not null" json:"email"`
-	FullName  string    `gorm:"not null" json:"full_name"`
-	Company   string    `json:"company"`
-	UserCount int       `json:"user_count"` // Optional: expected number of users
-	Source    string    `json:"source"`     // e.g., "landing_page", "pricing", "blog"
-	EmailSent bool      `gorm:"default:false" json:"email_sent"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID               string     `gorm:"primaryKey" json:"id"`
+	Email            string     `gorm:"uniqueIndex;not null" json:"email"`
+	FullName         string     `gorm:"not null" json:"full_name"`
+	Company          string     `json:"company"`
+	UserCount        int        `json:"user_count"` // Optional: expected number of users
+	Source           string     `json:"source"`     // e.g., "landing_page", "pricing", "blog"
+	EmailSent        bool       `gorm:"default:false" json:"email_sent"`
+	PromoEmailsOptIn bool       `gorm:"default:true" json:"promo_emails_opt_in"` // User consented to promotional emails
+	UnsubscribeToken string     `gorm:"uniqueIndex" json:"-"`                    // Token for secure unsubscribe links
+	UnsubscribedAt   *time.Time `json:"unsubscribed_at,omitempty"`               // When user unsubscribed
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 func (Waitlist) TableName() string {

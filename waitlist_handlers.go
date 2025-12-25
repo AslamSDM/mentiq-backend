@@ -1,20 +1,31 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
+// generateUnsubscribeToken creates a secure random token for unsubscribe links
+func generateUnsubscribeToken() string {
+	bytes := make([]byte, 32)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
 // JoinWaitlistRequest represents the request to join the waitlist
 type JoinWaitlistRequest struct {
-	Email     string `json:"email" binding:"required,email"`
-	FullName  string `json:"full_name" binding:"required"`
-	Company   string `json:"company"`
-	UserCount int    `json:"user_count"`
-	Source    string `json:"source"`
+	Email            string `json:"email" binding:"required,email"`
+	FullName         string `json:"full_name" binding:"required"`
+	Company          string `json:"company"`
+	UserCount        int    `json:"user_count"`
+	Source           string `json:"source"`
+	PromoEmailsOptIn bool   `json:"promo_emails_opt_in"`
 }
 
 // joinWaitlistHandler handles waitlist signups
@@ -40,14 +51,19 @@ func (s *Server) joinWaitlistHandler(c *gin.Context) {
 		return
 	}
 
+	// Generate unsubscribe token
+	unsubscribeToken := generateUnsubscribeToken()
+
 	// Create new waitlist entry
 	waitlistEntry := Waitlist{
-		ID:        uuid.New().String(),
-		Email:     email,
-		FullName:  fullName,
-		Company:   req.Company,
-		UserCount: req.UserCount,
-		Source:    req.Source,
+		ID:               uuid.New().String(),
+		Email:            email,
+		FullName:         fullName,
+		Company:          req.Company,
+		UserCount:        req.UserCount,
+		Source:           req.Source,
+		PromoEmailsOptIn: req.PromoEmailsOptIn,
+		UnsubscribeToken: unsubscribeToken,
 	}
 
 	if err := s.db.Create(&waitlistEntry).Error; err != nil {
@@ -57,7 +73,7 @@ func (s *Server) joinWaitlistHandler(c *gin.Context) {
 
 	// Send waitlist confirmation email
 	go func() {
-		if err := s.emailService.SendWaitlistEmail(email, fullName); err != nil {
+		if err := s.emailService.SendWaitlistEmail(email, fullName, unsubscribeToken); err != nil {
 			// Log error but don't fail the request
 			println("Failed to send waitlist email:", err.Error())
 		} else {
@@ -70,6 +86,61 @@ func (s *Server) joinWaitlistHandler(c *gin.Context) {
 		"message": "Welcome to the waitlist! Check your email for confirmation.",
 		"success": true,
 	})
+}
+
+// unsubscribeHandler handles email unsubscribe requests
+func (s *Server) unsubscribeHandler(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.HTML(http.StatusBadRequest, "", `
+			<html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
+				<h2>Invalid Request</h2>
+				<p>Missing unsubscribe token.</p>
+			</body></html>
+		`)
+		return
+	}
+
+	var entry Waitlist
+	if err := s.db.Where("unsubscribe_token = ?", token).First(&entry).Error; err != nil {
+		c.HTML(http.StatusNotFound, "", `
+			<html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
+				<h2>Link Expired</h2>
+				<p>This unsubscribe link is no longer valid.</p>
+			</body></html>
+		`)
+		return
+	}
+
+	// Update preferences
+	now := time.Now()
+	s.db.Model(&entry).Updates(map[string]interface{}{
+		"promo_emails_opt_in": false,
+		"unsubscribed_at":     now,
+	})
+
+	c.Header("Content-Type", "text/html")
+	c.String(http.StatusOK, `
+		<html>
+		<head>
+			<meta name="viewport" content="width=device-width, initial-scale=1.0">
+			<style>
+				body { font-family: 'Segoe UI', sans-serif; padding: 40px 20px; text-align: center; background: #f8f9fa; }
+				.container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+				h2 { color: #1a1a1a; margin-bottom: 16px; }
+				p { color: #4b5563; line-height: 1.6; }
+				.check { font-size: 48px; margin-bottom: 20px; }
+			</style>
+		</head>
+		<body>
+			<div class="container">
+				<div class="check">✓</div>
+				<h2>You've been unsubscribed</h2>
+				<p>You will no longer receive promotional emails from Mentiq. We're sorry to see you go!</p>
+			</div>
+		</body>
+		</html>
+	`)
 }
 
 // getWaitlistHandler returns all waitlist entries (admin only)

@@ -402,7 +402,7 @@ If you didn't request this password reset, please ignore this email.
 }
 
 // SendWaitlistEmail sends a confirmation email when someone joins the waitlist
-func (es *EmailService) SendWaitlistEmail(toEmail, toName string) error {
+func (es *EmailService) SendWaitlistEmail(toEmail, toName, unsubscribeToken string) error {
 	log.Printf("Sending waitlist confirmation email to %s", toEmail)
 
 	if es.apiKey == "" {
@@ -410,6 +410,7 @@ func (es *EmailService) SendWaitlistEmail(toEmail, toName string) error {
 		return nil
 	}
 
+	unsubscribeURL := fmt.Sprintf("%s/api/v1/unsubscribe?token=%s", es.baseURL, unsubscribeToken)
 	subject := "Welcome to the Mentiq Waitlist! 🎉"
 
 	htmlContent := fmt.Sprintf(`
@@ -459,9 +460,10 @@ func (es *EmailService) SendWaitlistEmail(toEmail, toName string) error {
                     <!-- Footer -->
                     <tr>
                         <td style="padding: 30px 40px; background-color: #f9fafb; border-top: 1px solid #f0f0f0; border-radius: 0 0 16px 16px; text-align: center;">
-                            <p style="margin: 0; font-size: 14px; color: #9ca3af;">
+                            <p style="margin: 0 0 12px; font-size: 14px; color: #9ca3af;">
                                 &copy; %d Mentiq. All rights reserved.
                             </p>
+                            <a href="%s" style="font-size: 12px; color: #9ca3af; text-decoration: underline;">Unsubscribe from promotional emails</a>
                         </td>
                     </tr>
                 </table>
@@ -470,7 +472,7 @@ func (es *EmailService) SendWaitlistEmail(toEmail, toName string) error {
     </table>
 </body>
 </html>
-`, getName(toName), time.Now().Year())
+`, getName(toName), time.Now().Year(), unsubscribeURL)
 
 	plainTextContent := fmt.Sprintf(`
 Welcome to the Mentiq Waitlist!
@@ -479,12 +481,20 @@ Hi%s,
 
 Thank you for joining the Mentiq waitlist. We're building the ultimate churn prevention platform for SaaS founders, and we're excited to have you along for the journey.
 
+What to expect:
+- Early access when we launch
+- Exclusive founder pricing
+- Direct input on features we build
+- Priority support from day one
 
 We'll be in touch soon with updates on our progress. Feel free to reply to this email if you have any questions.
 
 Best,
 The Mentiq Team
-`, getName(toName))
+
+---
+To unsubscribe from promotional emails: %s
+`, getName(toName), unsubscribeURL)
 
 	return es.sendEmail(toEmail, toName, subject, htmlContent, plainTextContent)
 }
