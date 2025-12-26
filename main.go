@@ -953,6 +953,13 @@ func main() {
 		apiV1.GET("/team/members", server.listAccountMembersHandler)
 		apiV1.PUT("/team/members/:id", server.updateAccountMemberHandler)
 		apiV1.DELETE("/team/members/:id", server.removeAccountMemberHandler)
+
+		// Support Ticket routes
+		apiV1.POST("/tickets", CreateTicketHandler(server.db))
+		apiV1.GET("/tickets", GetTicketsHandler(server.db))
+		apiV1.GET("/tickets/:id", GetTicketHandler(server.db))
+		apiV1.PUT("/tickets/:id", UpdateTicketHandler(server.db))
+		apiV1.POST("/tickets/:id/comments", AddCommentHandler(server.db))
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)
@@ -978,6 +985,10 @@ func main() {
 		adminAPI.GET("/users-with-projects", server.adminGetAllUsersWithProjectsHandler)
 		adminAPI.GET("/projects/:project_id/data", server.adminGetProjectDataHandler)
 		adminAPI.PUT("/accounts/:account_id/admin", server.adminToggleAdminHandler)
+
+		// Admin Support Ticket routes
+		adminAPI.GET("/tickets", GetAllTicketsHandler(server.db))
+		adminAPI.GET("/tickets/stats", GetTicketStatsHandler(server.db))
 	}
 
 	// Setup graceful shutdown
