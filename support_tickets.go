@@ -9,22 +9,20 @@ import (
 	"gorm.io/gorm"
 )
 
-// SupportTicket represents a customer support ticket
 type SupportTicket struct {
 	ID          string     `gorm:"primaryKey" json:"id"`
 	AccountID   string     `gorm:"index;not null" json:"account_id"`
 	UserID      string     `gorm:"index;not null" json:"user_id"`
 	Subject     string     `gorm:"not null" json:"subject"`
 	Description string     `gorm:"type:text;not null" json:"description"`
-	Priority    string     `gorm:"default:'medium'" json:"priority"`  // low, medium, high, urgent
-	Status      string     `gorm:"default:'open'" json:"status"`      // open, in_progress, resolved, closed
-	Category    string     `gorm:"default:'general'" json:"category"` // bug, feature_request, billing, general, technical
+	Priority    string     `gorm:"default:'medium'" json:"priority"`
+	Status      string     `gorm:"default:'open'" json:"status"`
+	Category    string     `gorm:"default:'general'" json:"category"`
 	AssignedTo  *string    `json:"assigned_to"`
 	ResolvedAt  *time.Time `json:"resolved_at"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
 
-	// Relations
 	Account  Account         `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
 	User     User            `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"`
 	Assignee *User           `gorm:"foreignKey:AssignedTo;references:ID" json:"assignee,omitempty"`
@@ -35,17 +33,15 @@ func (SupportTicket) TableName() string {
 	return "support_tickets"
 }
 
-// TicketComment represents a comment on a support ticket
 type TicketComment struct {
 	ID         string    `gorm:"primaryKey" json:"id"`
 	TicketID   string    `gorm:"index;not null" json:"ticket_id"`
 	UserID     string    `gorm:"not null" json:"user_id"`
 	Content    string    `gorm:"type:text;not null" json:"content"`
-	IsInternal bool      `gorm:"default:false" json:"is_internal"` // Internal notes visible only to admins
+	IsInternal bool      `gorm:"default:false" json:"is_internal"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 
-	// Relations
 	Ticket SupportTicket `gorm:"foreignKey:TicketID;references:ID" json:"ticket,omitempty"`
 	User   User          `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"`
 }
@@ -54,15 +50,13 @@ func (TicketComment) TableName() string {
 	return "ticket_comments"
 }
 
-// CreateTicketRequest represents the request body for creating a ticket
 type CreateTicketRequest struct {
-	Subject     string `json:"subject" binding:"required"`
-	Description string `json:"description" binding:"required"`
+	Subject     string `json:"subject" binding:"required,min=3,max=200"`
+	Description string `json:"description" binding:"required,min=10,max=5000"`
 	Priority    string `json:"priority"`
 	Category    string `json:"category"`
 }
 
-// UpdateTicketRequest represents the request body for updating a ticket
 type UpdateTicketRequest struct {
 	Subject     *string `json:"subject"`
 	Description *string `json:"description"`
@@ -72,13 +66,15 @@ type UpdateTicketRequest struct {
 	AssignedTo  *string `json:"assigned_to"`
 }
 
-// CreateCommentRequest represents the request body for creating a comment
 type CreateCommentRequest struct {
-	Content    string `json:"content" binding:"required"`
+	Content    string `json:"content" binding:"required,min=1,max=5000"`
 	IsInternal bool   `json:"is_internal"`
 }
 
-// CreateTicketHandler creates a new support ticket
+var validPriorities = map[string]bool{"low": true, "medium": true, "high": true, "urgent": true}
+var validStatuses = map[string]bool{"open": true, "in_progress": true, "resolved": true, "closed": true}
+var validCategories = map[string]bool{"bug": true, "feature_request": true, "billing": true, "general": true, "technical": true}
+
 func CreateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -87,7 +83,6 @@ func CreateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Get user and account
 		var user User
 		if err := db.First(&user, "id = ?", userID).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
@@ -100,13 +95,21 @@ func CreateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Set defaults
 		priority := "medium"
 		if req.Priority != "" {
+			if !validPriorities[req.Priority] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid priority"})
+				return
+			}
 			priority = req.Priority
 		}
+
 		category := "general"
 		if req.Category != "" {
+			if !validCategories[req.Category] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid category"})
+				return
+			}
 			category = req.Category
 		}
 
@@ -126,14 +129,11 @@ func CreateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Load relations
 		db.Preload("User").Preload("Account").First(&ticket, "id = ?", ticket.ID)
-
 		c.JSON(http.StatusCreated, ticket)
 	}
 }
 
-// GetTicketsHandler lists tickets for the current user/account
 func GetTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -142,7 +142,6 @@ func GetTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Get user
 		var user User
 		if err := db.First(&user, "id = ?", userID).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
@@ -152,24 +151,21 @@ func GetTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 		var tickets []SupportTicket
 		query := db.Where("account_id = ?", user.AccountID)
 
-		// Apply filters
-		if status := c.Query("status"); status != "" {
+		if status := c.Query("status"); status != "" && validStatuses[status] {
 			query = query.Where("status = ?", status)
 		}
-		if priority := c.Query("priority"); priority != "" {
+		if priority := c.Query("priority"); priority != "" && validPriorities[priority] {
 			query = query.Where("priority = ?", priority)
 		}
-		if category := c.Query("category"); category != "" {
+		if category := c.Query("category"); category != "" && validCategories[category] {
 			query = query.Where("category = ?", category)
 		}
 
 		query.Preload("User").Order("created_at DESC").Find(&tickets)
-
 		c.JSON(http.StatusOK, tickets)
 	}
 }
 
-// GetTicketHandler gets a specific ticket with comments
 func GetTicketHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -179,6 +175,10 @@ func GetTicketHandler(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		ticketID := c.Param("id")
+		if ticketID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Ticket ID required"})
+			return
+		}
 
 		var ticket SupportTicket
 		if err := db.Preload("User").Preload("Account").Preload("Assignee").Preload("Comments", func(db *gorm.DB) *gorm.DB {
@@ -188,17 +188,14 @@ func GetTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Get user to check access
 		var user User
 		db.First(&user, "id = ?", userID)
 
-		// Check if user has access (same account or admin)
 		if ticket.AccountID != user.AccountID && user.Role != "admin" {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 			return
 		}
 
-		// Filter out internal comments for non-admins
 		if user.Role != "admin" {
 			var publicComments []TicketComment
 			for _, comment := range ticket.Comments {
@@ -213,7 +210,6 @@ func GetTicketHandler(db *gorm.DB) gin.HandlerFunc {
 	}
 }
 
-// UpdateTicketHandler updates a ticket
 func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -223,6 +219,10 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		ticketID := c.Param("id")
+		if ticketID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Ticket ID required"})
+			return
+		}
 
 		var ticket SupportTicket
 		if err := db.First(&ticket, "id = ?", ticketID).Error; err != nil {
@@ -230,11 +230,9 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Get user to check access
 		var user User
 		db.First(&user, "id = ?", userID)
 
-		// Check if user has access
 		if ticket.AccountID != user.AccountID && user.Role != "admin" {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 			return
@@ -246,7 +244,6 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Update fields
 		if req.Subject != nil {
 			ticket.Subject = *req.Subject
 		}
@@ -254,9 +251,17 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			ticket.Description = *req.Description
 		}
 		if req.Priority != nil {
+			if !validPriorities[*req.Priority] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid priority"})
+				return
+			}
 			ticket.Priority = *req.Priority
 		}
 		if req.Status != nil {
+			if !validStatuses[*req.Status] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status"})
+				return
+			}
 			ticket.Status = *req.Status
 			if *req.Status == "resolved" || *req.Status == "closed" {
 				now := time.Now()
@@ -264,6 +269,10 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			}
 		}
 		if req.Category != nil {
+			if !validCategories[*req.Category] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid category"})
+				return
+			}
 			ticket.Category = *req.Category
 		}
 		if req.AssignedTo != nil && user.Role == "admin" {
@@ -276,12 +285,10 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		db.Preload("User").Preload("Account").Preload("Assignee").First(&ticket, "id = ?", ticket.ID)
-
 		c.JSON(http.StatusOK, ticket)
 	}
 }
 
-// AddCommentHandler adds a comment to a ticket
 func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -291,6 +298,10 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		ticketID := c.Param("id")
+		if ticketID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Ticket ID required"})
+			return
+		}
 
 		var ticket SupportTicket
 		if err := db.First(&ticket, "id = ?", ticketID).Error; err != nil {
@@ -298,11 +309,9 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Get user to check access
 		var user User
 		db.First(&user, "id = ?", userID)
 
-		// Check if user has access
 		if ticket.AccountID != user.AccountID && user.Role != "admin" {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 			return
@@ -314,7 +323,6 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Only admins can create internal comments
 		isInternal := req.IsInternal && user.Role == "admin"
 
 		comment := TicketComment{
@@ -330,7 +338,6 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// If ticket was closed/resolved, reopen it when customer comments
 		if user.Role != "admin" && (ticket.Status == "resolved" || ticket.Status == "closed") {
 			ticket.Status = "open"
 			ticket.ResolvedAt = nil
@@ -338,12 +345,10 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		db.Preload("User").First(&comment, "id = ?", comment.ID)
-
 		c.JSON(http.StatusCreated, comment)
 	}
 }
 
-// GetAllTicketsHandler gets all tickets (admin only)
 func GetAllTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -352,7 +357,6 @@ func GetAllTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Check if user is admin
 		var user User
 		if err := db.First(&user, "id = ?", userID).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
@@ -367,14 +371,13 @@ func GetAllTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 		var tickets []SupportTicket
 		query := db.Model(&SupportTicket{})
 
-		// Apply filters
-		if status := c.Query("status"); status != "" {
+		if status := c.Query("status"); status != "" && validStatuses[status] {
 			query = query.Where("status = ?", status)
 		}
-		if priority := c.Query("priority"); priority != "" {
+		if priority := c.Query("priority"); priority != "" && validPriorities[priority] {
 			query = query.Where("priority = ?", priority)
 		}
-		if category := c.Query("category"); category != "" {
+		if category := c.Query("category"); category != "" && validCategories[category] {
 			query = query.Where("category = ?", category)
 		}
 		if assignedTo := c.Query("assigned_to"); assignedTo != "" {
@@ -386,12 +389,10 @@ func GetAllTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		query.Preload("User").Preload("Account").Preload("Assignee").Order("created_at DESC").Find(&tickets)
-
 		c.JSON(http.StatusOK, tickets)
 	}
 }
 
-// GetTicketStatsHandler gets ticket statistics (admin only)
 func GetTicketStatsHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -400,7 +401,6 @@ func GetTicketStatsHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Check if user is admin
 		var user User
 		if err := db.First(&user, "id = ?", userID).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
