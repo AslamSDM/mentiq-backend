@@ -714,9 +714,9 @@ func main() {
 	}
 
 	// Run migrations
-	if err := MigrateDB(database); err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
-	}
+	// if err := MigrateDB(database); err != nil {
+	// 	log.Fatalf("Failed to run migrations: %v", err)
+	// }
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -989,6 +989,9 @@ func main() {
 		// Admin Support Ticket routes
 		adminAPI.GET("/tickets", GetAllTicketsHandler(server.db))
 		adminAPI.GET("/tickets/stats", GetTicketStatsHandler(server.db))
+
+		// Admin Test User creation route
+		adminAPI.POST("/test-users", server.adminCreateTestUserHandler)
 	}
 
 	// Setup graceful shutdown
@@ -3875,5 +3878,105 @@ func (s *Server) testGetRecordingBySessionHandler(c *gin.Context) {
 		"event_count":  len(events),
 		"storage_type": storageType,
 		"message":      "Test endpoint - disable in production",
+	})
+}
+
+// adminCreateTestUserHandler creates a test user that bypasses email verification and paywall (admin only)
+func (s *Server) adminCreateTestUserHandler(c *gin.Context) {
+	// Parse request body
+	var req struct {
+		Name                  string `json:"name" binding:"required"`
+		Email                 string `json:"email" binding:"required,email"`
+		Password              string `json:"password" binding:"required,min=8"`
+		SkipEmailVerification bool   `json:"skip_email_verification"`
+		SkipPaywall           bool   `json:"skip_paywall"`
+		CreateProject         bool   `json:"create_project"`
+		ProjectName           string `json:"project_name"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Check if user already exists
+	var existingAccount Account
+	if err := s.db.Where("email = ?", req.Email).First(&existingAccount).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "User with this email already exists"})
+		return
+	}
+
+	// Hash password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		return
+	}
+
+	// Create account with test user flags
+	accountID := uuid.New().String()
+	account := Account{
+		ID:            accountID,
+		Name:          req.Name,
+		Email:         req.Email,
+		Password:      string(hashedPassword),
+		EmailVerified: req.SkipEmailVerification, // Bypass email verification if requested
+		IsAdmin:       false,
+	}
+
+	if err := s.db.Create(&account).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create account"})
+		return
+	}
+
+	var projectID string
+
+	// Create a project if requested
+	if req.CreateProject {
+		projectName := req.ProjectName
+		if projectName == "" {
+			projectName = "Test Project"
+		}
+
+		projectID = uuid.New().String()
+		project := Project{
+			ID:        projectID,
+			Name:      projectName,
+			AccountID: accountID,
+		}
+
+		if err := s.db.Create(&project).Error; err != nil {
+			log.Printf("Failed to create project for test user: %v", err)
+			projectID = ""
+		}
+	}
+
+	// If skip_paywall is true, create a subscription record to bypass paywall
+	if req.SkipPaywall {
+		subscriptionID := uuid.New().String()
+		subscription := AccountSubscription{
+			ID:                   subscriptionID,
+			AccountID:            accountID,
+			Tier:                 "test",
+			Status:               "active",
+			UserCount:            100,
+			MonthlyPrice:         0,
+			StripeSubscriptionID: "test_sub_" + accountID[:8],
+			CurrentPeriodStart:   time.Now(),
+			CurrentPeriodEnd:     time.Now().AddDate(1, 0, 0), // 1 year from now
+		}
+
+		if err := s.db.Create(&subscription).Error; err != nil {
+			log.Printf("Failed to create subscription for test user: %v", err)
+		}
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"message":          "Test user created successfully",
+		"account_id":       account.ID,
+		"email":            account.Email,
+		"email_verified":   account.EmailVerified,
+		"has_subscription": req.SkipPaywall,
+		"project_id":       projectID,
 	})
 }
