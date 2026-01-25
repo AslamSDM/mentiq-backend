@@ -871,10 +871,73 @@ type Waitlist struct {
 	PromoEmailsOptIn bool       `gorm:"default:true" json:"promo_emails_opt_in"` // User consented to promotional emails
 	UnsubscribeToken string     `gorm:"uniqueIndex" json:"-"`                    // Token for secure unsubscribe links
 	UnsubscribedAt   *time.Time `json:"unsubscribed_at,omitempty"`               // When user unsubscribed
+	AccessGranted    bool       `gorm:"default:false" json:"access_granted"`     // Whether access was granted
+	AccessGrantedAt  *time.Time `json:"access_granted_at,omitempty"`             // When access was granted
+	AccessGrantedBy  string     `json:"access_granted_by,omitempty"`             // Admin account ID who granted access
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 func (Waitlist) TableName() string {
 	return "waitlist"
+}
+
+// =====================
+// INTEGRATIONS
+// =====================
+
+// ProjectIntegration stores OAuth credentials for third-party services (Mailchimp, SendGrid, etc.)
+type ProjectIntegration struct {
+	ID           string                 `gorm:"primaryKey" json:"id"`
+	ProjectID    string                 `gorm:"index;not null" json:"project_id"`
+	Provider     string                 `gorm:"index;not null" json:"provider"` // "mailchimp", "sendgrid", "customer_io"
+	AccessToken  string                 `json:"-"`                              // Encrypted, not exposed in JSON
+	RefreshToken string                 `json:"-"`                              // Encrypted, not exposed in JSON
+	ExpiresAt    *time.Time             `json:"expires_at,omitempty"`
+	Settings     map[string]interface{} `gorm:"type:jsonb;serializer:json" json:"settings"` // Provider-specific config
+	IsActive     bool                   `gorm:"default:true" json:"is_active"`
+	LastSyncAt   *time.Time             `json:"last_sync_at,omitempty"`
+	SyncStatus   string                 `gorm:"default:'idle'" json:"sync_status"` // "idle", "syncing", "error"
+	LastError    string                 `json:"last_error,omitempty"`
+	CreatedAt    time.Time              `json:"created_at"`
+	UpdatedAt    time.Time              `json:"updated_at"`
+
+	// Relations
+	Project  Project              `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
+	SyncLogs []IntegrationSyncLog `gorm:"foreignKey:IntegrationID" json:"sync_logs,omitempty"`
+}
+
+func (ProjectIntegration) TableName() string {
+	return "project_integration"
+}
+
+// IntegrationSyncLog tracks sync operations for integrations
+type IntegrationSyncLog struct {
+	ID              string    `gorm:"primaryKey" json:"id"`
+	IntegrationID   string    `gorm:"index;not null" json:"integration_id"`
+	SyncType        string    `json:"sync_type"`        // "auto", "manual", "playbook"
+	ContactsSynced  int       `json:"contacts_synced"`  // Number of contacts successfully synced
+	ContactsFailed  int       `json:"contacts_failed"`  // Number of contacts that failed to sync
+	ContactsSkipped int       `json:"contacts_skipped"` // Already synced, no update needed
+	ErrorMessage    string    `json:"error_message,omitempty"`
+	Duration        int       `json:"duration"` // Duration in milliseconds
+	CreatedAt       time.Time `json:"created_at"`
+
+	// Relations
+	Integration ProjectIntegration `gorm:"foreignKey:IntegrationID;references:ID" json:"integration,omitempty"`
+}
+
+func (IntegrationSyncLog) TableName() string {
+	return "integration_sync_log"
+}
+
+// MailchimpSettings stores Mailchimp-specific configuration
+type MailchimpSettings struct {
+	ServerPrefix  string `json:"server_prefix"`  // e.g., "us21" - extracted from OAuth metadata
+	AudienceID    string `json:"audience_id"`    // Selected Mailchimp list/audience
+	AudienceName  string `json:"audience_name"`  // Display name
+	SyncHighRisk  bool   `json:"sync_high_risk"` // Auto-sync at-risk users
+	RiskThreshold int    `json:"risk_threshold"` // Churn risk score threshold (default: 70)
+	AddTags       bool   `json:"add_tags"`       // Tag synced contacts
+	TagName       string `json:"tag_name"`       // e.g., "churn_risk_high"
 }

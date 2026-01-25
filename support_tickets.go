@@ -12,7 +12,7 @@ import (
 type SupportTicket struct {
 	ID          string     `gorm:"primaryKey" json:"id"`
 	AccountID   string     `gorm:"index;not null" json:"account_id"`
-	UserID      string     `gorm:"index;not null" json:"user_id"`
+	UserID      *string    `gorm:"index" json:"user_id"` // Nullable - may not have user record for JWT auth
 	Subject     string     `gorm:"not null" json:"subject"`
 	Description string     `gorm:"type:text;not null" json:"description"`
 	Priority    string     `gorm:"default:'medium'" json:"priority"`
@@ -24,7 +24,7 @@ type SupportTicket struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 
 	Account  Account         `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
-	User     User            `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"`
+	User     *User           `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"` // Pointer since UserID is nullable
 	Assignee *User           `gorm:"foreignKey:AssignedTo;references:ID" json:"assignee,omitempty"`
 	Comments []TicketComment `gorm:"foreignKey:TicketID" json:"comments,omitempty"`
 }
@@ -36,14 +36,14 @@ func (SupportTicket) TableName() string {
 type TicketComment struct {
 	ID         string    `gorm:"primaryKey" json:"id"`
 	TicketID   string    `gorm:"index;not null" json:"ticket_id"`
-	UserID     string    `gorm:"not null" json:"user_id"`
+	UserID     *string   `gorm:"" json:"user_id"` // Nullable - may not have user record
 	Content    string    `gorm:"type:text;not null" json:"content"`
 	IsInternal bool      `gorm:"default:false" json:"is_internal"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 
 	Ticket SupportTicket `gorm:"foreignKey:TicketID;references:ID" json:"ticket,omitempty"`
-	User   User          `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"`
+	User   *User         `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"` // Pointer since UserID is nullable
 }
 
 func (TicketComment) TableName() string {
@@ -75,17 +75,45 @@ var validPriorities = map[string]bool{"low": true, "medium": true, "high": true,
 var validStatuses = map[string]bool{"open": true, "in_progress": true, "resolved": true, "closed": true}
 var validCategories = map[string]bool{"bug": true, "feature_request": true, "billing": true, "general": true, "technical": true}
 
+// Helper function to get account ID and user ID from context
+// Returns accountID, userID (nullable), isAdmin, error
+func getAuthContext(c *gin.Context, db *gorm.DB) (string, *string, bool, error) {
+	userID := c.GetString("user_id")
+	accountID, accountExists := c.Get("account_id")
+	isAdmin := c.GetBool("is_admin")
+
+	var accountIDStr string
+	var userIDPtr *string
+
+	if userID != "" {
+		// We have a user_id, get account from user
+		var user User
+		if err := db.First(&user, "id = ?", userID).Error; err == nil {
+			accountIDStr = user.AccountID
+			userIDPtr = &userID
+			if user.Role == "admin" {
+				isAdmin = true
+			}
+		}
+	}
+
+	// Fallback to account_id from JWT context
+	if accountIDStr == "" && accountExists && accountID != nil {
+		accountIDStr = accountID.(string)
+	}
+
+	if accountIDStr == "" {
+		return "", nil, false, gorm.ErrRecordNotFound
+	}
+
+	return accountIDStr, userIDPtr, isAdmin, nil
+}
+
 func CreateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.GetString("user_id")
-		if userID == "" {
+		accountIDStr, userIDPtr, _, err := getAuthContext(c, db)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-			return
-		}
-
-		var user User
-		if err := db.First(&user, "id = ?", userID).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
 			return
 		}
 
@@ -115,8 +143,8 @@ func CreateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 
 		ticket := SupportTicket{
 			ID:          uuid.New().String(),
-			AccountID:   user.AccountID,
-			UserID:      userID,
+			AccountID:   accountIDStr,
+			UserID:      userIDPtr, // Nil if user lookup failed
 			Subject:     req.Subject,
 			Description: req.Description,
 			Priority:    priority,
@@ -136,20 +164,14 @@ func CreateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 
 func GetTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.GetString("user_id")
-		if userID == "" {
+		accountIDStr, _, _, err := getAuthContext(c, db)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
 
-		var user User
-		if err := db.First(&user, "id = ?", userID).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
-			return
-		}
-
 		var tickets []SupportTicket
-		query := db.Where("account_id = ?", user.AccountID)
+		query := db.Where("account_id = ?", accountIDStr)
 
 		if status := c.Query("status"); status != "" && validStatuses[status] {
 			query = query.Where("status = ?", status)
@@ -168,8 +190,8 @@ func GetTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 
 func GetTicketHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.GetString("user_id")
-		if userID == "" {
+		accountIDStr, _, isAdmin, err := getAuthContext(c, db)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
@@ -188,15 +210,14 @@ func GetTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		var user User
-		db.First(&user, "id = ?", userID)
-
-		if ticket.AccountID != user.AccountID && user.Role != "admin" {
+		// Check access - must own ticket or be admin
+		if ticket.AccountID != accountIDStr && !isAdmin {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 			return
 		}
 
-		if user.Role != "admin" {
+		// Filter internal comments for non-admins
+		if !isAdmin {
 			var publicComments []TicketComment
 			for _, comment := range ticket.Comments {
 				if !comment.IsInternal {
@@ -212,8 +233,8 @@ func GetTicketHandler(db *gorm.DB) gin.HandlerFunc {
 
 func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.GetString("user_id")
-		if userID == "" {
+		accountIDStr, _, isAdmin, err := getAuthContext(c, db)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
@@ -230,10 +251,8 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		var user User
-		db.First(&user, "id = ?", userID)
-
-		if ticket.AccountID != user.AccountID && user.Role != "admin" {
+		// Check access - must own ticket or be admin
+		if ticket.AccountID != accountIDStr && !isAdmin {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 			return
 		}
@@ -275,7 +294,7 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 			}
 			ticket.Category = *req.Category
 		}
-		if req.AssignedTo != nil && user.Role == "admin" {
+		if req.AssignedTo != nil && isAdmin {
 			ticket.AssignedTo = req.AssignedTo
 		}
 
@@ -291,8 +310,8 @@ func UpdateTicketHandler(db *gorm.DB) gin.HandlerFunc {
 
 func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.GetString("user_id")
-		if userID == "" {
+		accountIDStr, userIDPtr, isAdmin, err := getAuthContext(c, db)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
@@ -309,10 +328,8 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		var user User
-		db.First(&user, "id = ?", userID)
-
-		if ticket.AccountID != user.AccountID && user.Role != "admin" {
+		// Check access - must own ticket or be admin
+		if ticket.AccountID != accountIDStr && !isAdmin {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 			return
 		}
@@ -323,14 +340,14 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		isInternal := req.IsInternal && user.Role == "admin"
+		isInternalComment := req.IsInternal && isAdmin
 
 		comment := TicketComment{
 			ID:         uuid.New().String(),
 			TicketID:   ticketID,
-			UserID:     userID,
+			UserID:     userIDPtr, // May be nil
 			Content:    req.Content,
-			IsInternal: isInternal,
+			IsInternal: isInternalComment,
 		}
 
 		if err := db.Create(&comment).Error; err != nil {
@@ -338,7 +355,8 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		if user.Role != "admin" && (ticket.Status == "resolved" || ticket.Status == "closed") {
+		// Reopen ticket if user adds comment to resolved/closed ticket
+		if !isAdmin && (ticket.Status == "resolved" || ticket.Status == "closed") {
 			ticket.Status = "open"
 			ticket.ResolvedAt = nil
 			db.Save(&ticket)
@@ -351,19 +369,13 @@ func AddCommentHandler(db *gorm.DB) gin.HandlerFunc {
 
 func GetAllTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.GetString("user_id")
-		if userID == "" {
+		_, _, isAdmin, err := getAuthContext(c, db)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
 
-		var user User
-		if err := db.First(&user, "id = ?", userID).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
-			return
-		}
-
-		if user.Role != "admin" {
+		if !isAdmin {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
 			return
 		}
@@ -395,19 +407,13 @@ func GetAllTicketsHandler(db *gorm.DB) gin.HandlerFunc {
 
 func GetTicketStatsHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.GetString("user_id")
-		if userID == "" {
+		_, _, isAdmin, err := getAuthContext(c, db)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
 
-		var user User
-		if err := db.First(&user, "id = ?", userID).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
-			return
-		}
-
-		if user.Role != "admin" {
+		if !isAdmin {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
 			return
 		}

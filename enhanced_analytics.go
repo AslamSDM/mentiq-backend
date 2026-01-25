@@ -404,6 +404,11 @@ func (eas *EnhancedAnalyticsService) calculateLocationAnalytics(projectID string
 			res.City = "Unknown"
 		}
 
+		// Skip Local and Unknown countries from display
+		if res.Country == "Local" || res.Country == "Unknown" {
+			continue
+		}
+
 		// Country aggregation
 		if _, exists := countryMap[res.Country]; !exists {
 			countryMap[res.Country] = map[string]interface{}{
@@ -531,6 +536,11 @@ func (eas *EnhancedAnalyticsService) calculateDeviceAnalytics(projectID string, 
 		}
 		if res.Browser == "" {
 			res.Browser = "Unknown"
+		}
+
+		// Skip entries where all device info is Unknown
+		if res.Device == "Unknown" && res.OS == "Unknown" && res.Browser == "Unknown" {
+			continue
 		}
 
 		// Device aggregation

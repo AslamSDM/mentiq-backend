@@ -498,3 +498,123 @@ To unsubscribe from promotional emails: %s
 
 	return es.sendEmail(toEmail, toName, subject, htmlContent, plainTextContent)
 }
+
+// SendWaitlistAccessGrantedEmail sends an email when a waitlist user is granted access
+func (es *EmailService) SendWaitlistAccessGrantedEmail(toEmail, toName string) error {
+	log.Printf("Sending access granted email to %s", toEmail)
+
+	if es.apiKey == "" {
+		log.Println("Resend not configured, skipping access granted email")
+		return nil
+	}
+
+	signupURL := fmt.Sprintf("%s/signup", es.baseURL)
+	subject := "🎉 You're In! Your Mentiq Access is Ready"
+
+	htmlContent := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #000000; color: #ffffff;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #000000;">
+        <tr>
+            <td align="center" style="padding: 40px 0;">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #111111; border-radius: 12px; border: 1px solid #333333; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+                    <!-- Header -->
+                    <tr>
+                        <td style="padding: 40px 40px 30px; text-align: center; border-bottom: 1px solid #222222;">
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;">Mentiq</h1>
+                        </td>
+                    </tr>
+
+                    <!-- Body -->
+                    <tr>
+                        <td style="padding: 40px;">
+                            <h2 style="margin: 0 0 20px; color: #ffffff; font-size: 24px; font-weight: 600;">You're In! 🎉</h2>
+                            
+                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                                Hi%s,
+                            </p>
+
+                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                                Great news! Your access to <strong>Mentiq</strong> has been approved. You can now create your account and start analyzing, optimizing, and retaining your users.
+                            </p>
+
+                            <p style="margin: 0 0 30px; color: #999999; font-size: 14px; line-height: 1.6;">
+                                Click the button below to set up your account and get started.
+                            </p>
+
+                            <!-- CTA Button -->
+                            <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0">
+                                <tr>
+                                    <td align="center" style="padding: 10px 0 30px;">
+                                        <a href="%s" style="display: inline-block; background: linear-gradient(135deg, #7c3aed 0%%, #4f46e5 100%%); color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 8px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);">
+                                            Create Your Account
+                                        </a>
+                                    </td>
+                                </tr>
+                            </table>
+
+                            <!-- What's included -->
+                            <div style="background-color: #1a1a1a; border-radius: 8px; padding: 20px; margin-top: 20px; border: 1px solid #333333;">
+                                <h3 style="margin: 0 0 12px; color: #a78bfa; font-size: 16px; font-weight: 600;">What you get:</h3>
+                                <ul style="margin: 0; padding: 0 0 0 20px; color: #999999; font-size: 14px; line-height: 1.8;">
+                                    <li>Churn prediction & prevention tools</li>
+                                    <li>User behavior analytics</li>
+                                    <li>Automated playbooks</li>
+                                    <li>Revenue & subscription insights</li>
+                                </ul>
+                            </div>
+
+                            <!-- Alternative Link -->
+                            <p style="margin: 20px 0 0; padding: 15px; background-color: #1a1a1a; border-radius: 6px; color: #888888; font-size: 12px; line-height: 1.6; border: 1px solid #333333;">
+                                <strong>Or copy and paste this link:</strong><br>
+                                <a href="%s" style="color: #a78bfa; word-break: break-all; text-decoration: none;">%s</a>
+                            </p>
+                        </td>
+                    </tr>
+
+                    <!-- Footer -->
+                    <tr>
+                        <td style="padding: 30px; text-align: center; background-color: #0a0a0a; border-radius: 0 0 12px 12px; border-top: 1px solid #222222;">
+                            <p style="margin: 0; color: #555555; font-size: 12px;">
+                                © %d Mentiq. All rights reserved.<br>
+                                Questions? Just reply to this email.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+`, getName(toName), signupURL, signupURL, signupURL, time.Now().Year())
+
+	plainTextContent := fmt.Sprintf(`
+You're In! Your Mentiq Access is Ready 🎉
+
+Hi%s,
+
+Great news! Your access to Mentiq has been approved. You can now create your account and start analyzing, optimizing, and retaining your users.
+
+Click the link below to set up your account and get started:
+%s
+
+What you get:
+- Churn prediction & prevention tools
+- User behavior analytics
+- Automated playbooks
+- Revenue & subscription insights
+
+Questions? Just reply to this email.
+
+Best,
+The Mentiq Team
+`, getName(toName), signupURL)
+
+	return es.sendEmail(toEmail, toName, subject, htmlContent, plainTextContent)
+}

@@ -174,3 +174,66 @@ func (s *Server) getWaitlistHandler(c *gin.Context) {
 		"total":   len(entries),
 	})
 }
+
+// grantWaitlistAccessHandler grants access to a user on the waitlist (admin only)
+func (s *Server) grantWaitlistAccessHandler(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Check if user is admin
+	var account Account
+	if err := s.db.Where("id = ?", accountID).First(&account).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	if !account.IsAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+		return
+	}
+
+	waitlistID := c.Param("id")
+	if waitlistID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Waitlist ID required"})
+		return
+	}
+
+	// Find the waitlist entry
+	var entry Waitlist
+	if err := s.db.Where("id = ?", waitlistID).First(&entry).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Waitlist entry not found"})
+		return
+	}
+
+	// Check if already granted
+	if entry.AccessGranted {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Access already granted to this user"})
+		return
+	}
+
+	// Grant access
+	now := time.Now()
+	entry.AccessGranted = true
+	entry.AccessGrantedAt = &now
+	entry.AccessGrantedBy = accountID
+
+	if err := s.db.Save(&entry).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to grant access"})
+		return
+	}
+
+	// Send access granted email
+	go func() {
+		if err := s.emailService.SendWaitlistAccessGrantedEmail(entry.Email, entry.FullName); err != nil {
+			println("Failed to send access granted email:", err.Error())
+		}
+	}()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Access granted successfully",
+		"entry":   entry,
+	})
+}

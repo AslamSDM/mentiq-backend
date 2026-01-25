@@ -110,6 +110,7 @@ type Server struct {
 	playbookExecutor         *PlaybookExecutor
 	triggerEvaluator         *TriggerEvaluator
 	autoUpgradeService       *AutoUpgradeService
+	integrationsService      *IntegrationsService
 
 	// Entity caches with TTL
 	projectCache     map[string]*CacheEntry // Key: projectID
@@ -138,8 +139,11 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		sessionStorage = nil
 	}
 
+	// Initialize Mailchimp service
+	mailchimpService := NewMailchimpService(db)
+
 	// Initialize playbook executor and trigger evaluator
-	playbookExecutor := NewPlaybookExecutor(db, emailService)
+	playbookExecutor := NewPlaybookExecutor(db, emailService, mailchimpService)
 	triggerEvaluator := NewTriggerEvaluator(db)
 
 	server := &Server{
@@ -152,6 +156,7 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		playbookExecutor:         playbookExecutor,
 		triggerEvaluator:         triggerEvaluator,
 		autoUpgradeService:       NewAutoUpgradeService(db),
+		integrationsService:      NewIntegrationsService(db),
 		projectCache:             make(map[string]*CacheEntry),
 		accountCache:             make(map[string]*CacheEntry),
 		apiKeyCache:              make(map[string]*CacheEntry),
@@ -776,6 +781,9 @@ func main() {
 		webhookRoutes.POST("/payment", server.webhookPaymentHandler)
 	}
 
+	// OAuth callback routes (no authentication - OAuth flow handles security)
+	router.GET("/api/v1/integrations/mailchimp/callback", server.integrationsService.MailchimpCallbackHandler)
+
 	// Serve static dashboard
 	router.Static("/static", "./")
 	router.GET("/", func(c *gin.Context) {
@@ -960,6 +968,20 @@ func main() {
 		apiV1.GET("/tickets/:id", GetTicketHandler(server.db))
 		apiV1.PUT("/tickets/:id", UpdateTicketHandler(server.db))
 		apiV1.POST("/tickets/:id/comments", AddCommentHandler(server.db))
+
+		// ========================================
+		// Integration routes (Mailchimp, etc.)
+		// ========================================
+		apiV1.GET("/projects/:project_id/integrations", server.integrationsService.GetIntegrationsHandler)
+		apiV1.GET("/projects/:project_id/integrations/:provider", server.integrationsService.GetIntegrationHandler)
+
+		// Mailchimp-specific routes
+		apiV1.POST("/projects/:project_id/integrations/mailchimp/connect", server.integrationsService.ConnectMailchimpHandler)
+		apiV1.DELETE("/projects/:project_id/integrations/mailchimp", server.integrationsService.DisconnectMailchimpHandler)
+		apiV1.GET("/projects/:project_id/integrations/mailchimp/audiences", server.integrationsService.GetMailchimpAudiencesHandler)
+		apiV1.PUT("/projects/:project_id/integrations/mailchimp/settings", server.integrationsService.UpdateMailchimpSettingsHandler)
+		apiV1.POST("/projects/:project_id/integrations/mailchimp/sync", server.integrationsService.TriggerMailchimpSyncHandler)
+		apiV1.GET("/projects/:project_id/integrations/mailchimp/logs", server.integrationsService.GetMailchimpSyncLogsHandler)
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)
@@ -992,6 +1014,10 @@ func main() {
 
 		// Admin Test User creation route
 		adminAPI.POST("/test-users", server.adminCreateTestUserHandler)
+
+		// Admin Waitlist routes
+		adminAPI.GET("/waitlist", server.getWaitlistHandler)
+		adminAPI.POST("/waitlist/:id/grant-access", server.grantWaitlistAccessHandler)
 	}
 
 	// Setup graceful shutdown

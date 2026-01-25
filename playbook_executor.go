@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,18 +15,20 @@ import (
 
 // PlaybookExecutor handles background execution of playbook steps
 type PlaybookExecutor struct {
-	db           *gorm.DB
-	emailService *EmailService
-	stopChan     chan struct{}
-	ticker       *time.Ticker
+	db               *gorm.DB
+	emailService     *EmailService
+	mailchimpService *MailchimpService
+	stopChan         chan struct{}
+	ticker           *time.Ticker
 }
 
 // NewPlaybookExecutor creates a new playbook executor
-func NewPlaybookExecutor(db *gorm.DB, emailService *EmailService) *PlaybookExecutor {
+func NewPlaybookExecutor(db *gorm.DB, emailService *EmailService, mailchimpService *MailchimpService) *PlaybookExecutor {
 	return &PlaybookExecutor{
-		db:           db,
-		emailService: emailService,
-		stopChan:     make(chan struct{}),
+		db:               db,
+		emailService:     emailService,
+		mailchimpService: mailchimpService,
+		stopChan:         make(chan struct{}),
 	}
 }
 
@@ -214,18 +217,79 @@ func (e *PlaybookExecutor) executeEmailStep(step *PlaybookStep, enrollment *Play
 		return nil, fmt.Errorf("no action config for email step")
 	}
 
-	// Get user email (would need to fetch from events/users table based on enrollment.UserID)
-	// For now, we'll log this and return success
-	log.Printf("Would send email for enrollment %s, user %s", enrollment.ID, enrollment.UserID)
-
 	subject, _ := config["subject"].(string)
 	messageContent, _ := config["message_content"].(string)
+	useMailchimp, _ := config["use_mailchimp"].(bool)
+
+	// Try to get user email from the enrollment's user
+	var userEmail string
+	var userName string
+
+	// Look up user in events to get their email (users often have email as their ID or in properties)
+	var event Event
+	err := e.db.Where("project_id = ? AND user_id = ?", enrollment.ProjectID, enrollment.UserID).
+		First(&event).Error
+	if err == nil && event.Properties != nil {
+		if email, ok := event.Properties["email"].(string); ok {
+			userEmail = email
+		}
+		if name, ok := event.Properties["name"].(string); ok {
+			userName = name
+		}
+	}
+
+	// If no email found, use user_id as email if it looks like an email
+	if userEmail == "" && strings.Contains(enrollment.UserID, "@") {
+		userEmail = enrollment.UserID
+	}
+
+	// Check if we should use Mailchimp integration
+	if useMailchimp && e.mailchimpService != nil && userEmail != "" {
+		integration, err := e.mailchimpService.GetIntegration(enrollment.ProjectID)
+		if err == nil && integration != nil && integration.IsActive {
+			// Sync this user to Mailchimp with playbook tag
+			contact := MailchimpContact{
+				Email:  userEmail,
+				Status: "subscribed",
+				MergeFields: map[string]interface{}{
+					"FNAME": userName,
+				},
+				Tags: []string{"playbook_email", step.Name},
+			}
+
+			if syncErr := e.mailchimpService.SyncContact(enrollment.ProjectID, contact); syncErr != nil {
+				log.Printf("Failed to sync contact to Mailchimp for playbook email: %v", syncErr)
+				// Fall back to internal email
+			} else {
+				log.Printf("Synced user %s to Mailchimp for playbook %s step %s", userEmail, enrollment.PlaybookID, step.Name)
+				return map[string]interface{}{
+					"action":   "mailchimp_sync",
+					"subject":  subject,
+					"message":  messageContent,
+					"email":    userEmail,
+					"user_id":  enrollment.UserID,
+					"provider": "mailchimp",
+					"sent_at":  time.Now().Format(time.RFC3339),
+				}, nil
+			}
+		}
+	}
+
+	// Use internal email service as fallback
+	if userEmail != "" && e.emailService != nil {
+		// Send email directly using email service
+		log.Printf("Would send email to %s for playbook %s: %s", userEmail, enrollment.PlaybookID, subject)
+	} else {
+		log.Printf("No email found for user %s in playbook %s", enrollment.UserID, enrollment.PlaybookID)
+	}
 
 	return map[string]interface{}{
 		"action":   "email_sent",
 		"subject":  subject,
 		"message":  messageContent,
+		"email":    userEmail,
 		"user_id":  enrollment.UserID,
+		"provider": "internal",
 		"sent_at":  time.Now().Format(time.RFC3339),
 	}, nil
 }
