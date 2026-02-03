@@ -220,6 +220,7 @@ func (e *PlaybookExecutor) executeEmailStep(step *PlaybookStep, enrollment *Play
 	subject, _ := config["subject"].(string)
 	messageContent, _ := config["message_content"].(string)
 	useMailchimp, _ := config["use_mailchimp"].(bool)
+	useAutomation, _ := config["use_automation"].(bool)
 
 	// Try to get user email from the enrollment's user
 	var userEmail string
@@ -241,6 +242,15 @@ func (e *PlaybookExecutor) executeEmailStep(step *PlaybookStep, enrollment *Play
 	// If no email found, use user_id as email if it looks like an email
 	if userEmail == "" && strings.Contains(enrollment.UserID, "@") {
 		userEmail = enrollment.UserID
+	}
+
+	// Check if we should use automation integration for discount codes
+	if useAutomation {
+		// Check if this is an automation campaign step
+		automationType, _ := config["automation_type"].(string)
+		if automationType == "discount_campaign" {
+			return e.executeAutomationCampaignStep(step, enrollment, config)
+		}
 	}
 
 	// Check if we should use Mailchimp integration
@@ -616,4 +626,148 @@ func (t *TriggerEvaluator) enrollUserIfEligible(userID string, trigger *Playbook
 	}
 
 	log.Printf("Enrolled user %s in playbook %s via trigger %s", userID, playbook.ID, trigger.ID)
+}
+
+// executeAutomationCampaignStep handles a playbook step that triggers an automation discount campaign
+func (e *PlaybookExecutor) executeAutomationCampaignStep(step *PlaybookStep, enrollment *PlaybookEnrollment, config map[string]interface{}) (map[string]interface{}, error) {
+	discountPercentage := 20
+	if dp, ok := config["discount_percentage"].(float64); ok {
+		discountPercentage = int(dp)
+	}
+
+	// Get user information
+	var userEmail string
+	var userName string
+	var userChurnRisk float64
+
+	var event Event
+	err := e.db.Where("project_id = ? AND user_id = ?", enrollment.ProjectID, enrollment.UserID).
+		First(&event).Error
+	if err == nil && event.Properties != nil {
+		if email, ok := event.Properties["email"].(string); ok {
+			userEmail = email
+		}
+		if name, ok := event.Properties["name"].(string); ok {
+			userName = name
+		}
+		if risk, ok := event.Properties["churn_risk_score"].(float64); ok {
+			userChurnRisk = risk
+		}
+	}
+
+	if userEmail == "" && strings.Contains(enrollment.UserID, "@") {
+		userEmail = enrollment.UserID
+	}
+
+	// Generate discount code
+	discountCode := fmt.Sprintf("SAVE%d-%s", discountPercentage, strings.ToUpper(uuid.New().String()[:6]))
+
+	// Generate email content
+	content := e.generateAutomationEmailContent(userName, userChurnRisk, discountCode, discountPercentage)
+
+	// If we have Mailchimp integration, create campaign
+	if e.mailchimpService != nil {
+		integration, mcErr := e.mailchimpService.GetIntegration(enrollment.ProjectID)
+		if mcErr == nil && integration != nil && integration.IsActive {
+			campaignRequest := &MailchimpCampaignRequest{
+				Type: "regular",
+				Recipients: struct {
+					ListID string `json:"list_id"`
+				}{
+					ListID: getString(integration.Settings, "audience_id"),
+				},
+				Settings: struct {
+					SubjectLine string `json:"subject_line"`
+					PreviewText string `json:"preview_text"`
+					Title       string `json:"title"`
+					FromName    string `json:"from_name"`
+					ReplyTo     string `json:"reply_to"`
+				}{
+					SubjectLine: content.Subject,
+					PreviewText: "Special offer just for you",
+					Title:       fmt.Sprintf("Special Offer - %s", userName),
+					FromName:    "Customer Success Team",
+					ReplyTo:     "support@yourcompany.com",
+				},
+				Tracking: struct {
+					Opens      bool `json:"opens"`
+					HtmlClicks bool `json:"html_clicks"`
+					TextClicks bool `json:"text_clicks"`
+				}{
+					Opens:      true,
+					HtmlClicks: true,
+					TextClicks: true,
+				},
+			}
+
+			_, sendErr := e.mailchimpService.CreateAndSendCampaign(enrollment.ProjectID, campaignRequest, content.HTMLContent)
+			if sendErr != nil {
+				log.Printf("Error sending campaign for user %s: %v", enrollment.UserID, sendErr)
+				return nil, fmt.Errorf("failed to send Mailchimp campaign: %w", sendErr)
+			}
+
+			log.Printf("Sent automation campaign to user %s with discount code %s", enrollment.UserID, discountCode)
+
+			return map[string]interface{}{
+				"action":           "automation_campaign_sent",
+				"subject":          content.Subject,
+				"email":            userEmail,
+				"user_id":          enrollment.UserID,
+				"discount_code":    discountCode,
+				"discount_percent": discountPercentage,
+				"provider":         "mailchimp",
+				"sent_at":          time.Now().Format(time.RFC3339),
+			}, nil
+		}
+	}
+
+	// Fallback to log message if no Mailchimp integration
+	log.Printf("Would send email to %s with discount code %s (%d%% off)", userEmail, discountCode, discountPercentage)
+
+	return map[string]interface{}{
+		"action":           "automation_campaign_logged",
+		"subject":          content.Subject,
+		"email":            userEmail,
+		"user_id":          enrollment.UserID,
+		"discount_code":    discountCode,
+		"discount_percent": discountPercentage,
+		"provider":         "none",
+		"sent_at":          time.Now().Format(time.RFC3339),
+	}, nil
+}
+
+// playbookEmailContent is a simple email content structure for playbook-generated emails
+type playbookEmailContent struct {
+	Subject     string
+	HTMLContent string
+}
+
+// generateAutomationEmailContent produces templated email content for a discount campaign
+func (e *PlaybookExecutor) generateAutomationEmailContent(userName string, churnRisk float64, discountCode string, discountPercent int) *playbookEmailContent {
+	if userName == "" {
+		userName = "Valued Customer"
+	}
+
+	subject := fmt.Sprintf("%s, here's %d%% off — just for you!", userName, discountPercent)
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+  <h2 style="color:#333;">Hi %s,</h2>
+  <p>We noticed you haven't been around lately and we miss you! Your success means the world to us.</p>
+  <p>As a thank-you for being part of our community, here's an exclusive offer:</p>
+  <div style="background:#f0f7ff;border:2px solid #4318FF;border-radius:8px;padding:20px;text-align:center;margin:20px 0;">
+    <p style="font-size:24px;font-weight:bold;color:#4318FF;margin:0;">%d%% OFF</p>
+    <p style="font-size:14px;color:#666;margin:8px 0 0;">Use code: <strong>%s</strong></p>
+  </div>
+  <p>We'd love to help you get the most out of our product. Reply to this email if there's anything we can do!</p>
+  <p style="color:#666;font-size:12px;margin-top:30px;">This offer was created just for you.</p>
+</body>
+</html>`, userName, discountPercent, discountCode)
+
+	return &playbookEmailContent{
+		Subject:     subject,
+		HTMLContent: html,
+	}
 }

@@ -607,3 +607,334 @@ func (s *MailchimpService) decrypt(ciphertext string) (string, error) {
 
 	return string(plaintext), nil
 }
+
+// =====================
+// CAMPAIGN MANAGEMENT
+// =====================
+
+// MailchimpCampaign represents a Mailchimp campaign
+type MailchimpCampaign struct {
+	ID          string `json:"id"`
+	WebID       int    `json:"web_id"`
+	Type        string `json:"type"`
+	CreateTime  string `json:"create_time"`
+	ArchiveURL  string `json:"archive_url"`
+	Status      string `json:"status"`
+	EmailsSent  int    `json:"emails_sent"`
+	SendTime    string `json:"send_time"`
+	ContentType string `json:"content_type"`
+	Recipients  struct {
+		ListID         string `json:"list_id"`
+		ListName       string `json:"list_name"`
+		RecipientCount int    `json:"recipient_count"`
+	} `json:"recipients"`
+	Settings struct {
+		SubjectLine string `json:"subject_line"`
+		PreviewText string `json:"preview_text"`
+		Title       string `json:"title"`
+		FromName    string `json:"from_name"`
+		ReplyTo     string `json:"reply_to"`
+	} `json:"settings"`
+	Tracking struct {
+		Opens      bool `json:"opens"`
+		HtmlClicks bool `json:"html_clicks"`
+		TextClicks bool `json:"text_clicks"`
+	} `json:"tracking"`
+}
+
+// MailchimpCampaignRequest represents request to create/update a campaign
+type MailchimpCampaignRequest struct {
+	Type       string `json:"type"`
+	Recipients struct {
+		ListID string `json:"list_id"`
+	} `json:"recipients"`
+	Settings struct {
+		SubjectLine string `json:"subject_line"`
+		PreviewText string `json:"preview_text"`
+		Title       string `json:"title"`
+		FromName    string `json:"from_name"`
+		ReplyTo     string `json:"reply_to"`
+	} `json:"settings"`
+	Tracking struct {
+		Opens      bool `json:"opens"`
+		HtmlClicks bool `json:"html_clicks"`
+		TextClicks bool `json:"text_clicks"`
+	} `json:"tracking"`
+}
+
+// CreateCampaign creates a new Mailchimp campaign
+func (s *MailchimpService) CreateCampaign(projectID string, campaignRequest *MailchimpCampaignRequest) (*MailchimpCampaign, error) {
+	integration, err := s.getIntegration(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get integration: %w", err)
+	}
+
+	accessToken, err := s.decrypt(integration.AccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt access token: %w", err)
+	}
+
+	serverPrefix, ok := integration.Settings["server_prefix"].(string)
+	if !ok {
+		return nil, fmt.Errorf("server prefix not found in integration settings")
+	}
+
+	apiURL := fmt.Sprintf("https://%s.api.mailchimp.com/3.0/campaigns", serverPrefix)
+
+	jsonData, err := json.Marshal(campaignRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal campaign request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("mailchimp API error: %s", string(body))
+	}
+
+	var campaign MailchimpCampaign
+	if err := json.NewDecoder(resp.Body).Decode(&campaign); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &campaign, nil
+}
+
+// SetCampaignContent sets the HTML content for a campaign
+func (s *MailchimpService) SetCampaignContent(projectID string, campaignID string, htmlContent string) error {
+	integration, err := s.getIntegration(projectID)
+	if err != nil {
+		return fmt.Errorf("failed to get integration: %w", err)
+	}
+
+	accessToken, err := s.decrypt(integration.AccessToken)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt access token: %w", err)
+	}
+
+	serverPrefix, ok := integration.Settings["server_prefix"].(string)
+	if !ok {
+		return fmt.Errorf("server prefix not found in integration settings")
+	}
+
+	apiURL := fmt.Sprintf("https://%s.api.mailchimp.com/3.0/campaigns/%s/content", serverPrefix, campaignID)
+
+	contentRequest := map[string]interface{}{
+		"html": htmlContent,
+	}
+
+	jsonData, err := json.Marshal(contentRequest)
+	if err != nil {
+		return fmt.Errorf("failed to marshal content request: %w", err)
+	}
+
+	req, err := http.NewRequest("PUT", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mailchimp API error: %s", string(body))
+	}
+
+	return nil
+}
+
+// SendCampaign sends a campaign
+func (s *MailchimpService) SendCampaign(projectID string, campaignID string) error {
+	integration, err := s.getIntegration(projectID)
+	if err != nil {
+		return fmt.Errorf("failed to get integration: %w", err)
+	}
+
+	accessToken, err := s.decrypt(integration.AccessToken)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt access token: %w", err)
+	}
+
+	serverPrefix, ok := integration.Settings["server_prefix"].(string)
+	if !ok {
+		return fmt.Errorf("server prefix not found in integration settings")
+	}
+
+	apiURL := fmt.Sprintf("https://%s.api.mailchimp.com/3.0/campaigns/%s/actions/send", serverPrefix, campaignID)
+
+	req, err := http.NewRequest("POST", apiURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mailchimp API error: %s", string(body))
+	}
+
+	return nil
+}
+
+// CreateAndSendCampaign creates a campaign, sets content, and sends it
+func (s *MailchimpService) CreateAndSendCampaign(projectID string, campaignRequest *MailchimpCampaignRequest, htmlContent string) (*MailchimpCampaign, error) {
+	// Create campaign
+	campaign, err := s.CreateCampaign(projectID, campaignRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create campaign: %w", err)
+	}
+
+	// Set content
+	if err := s.SetCampaignContent(projectID, campaign.ID, htmlContent); err != nil {
+		return nil, fmt.Errorf("failed to set campaign content: %w", err)
+	}
+
+	// Send campaign
+	if err := s.SendCampaign(projectID, campaign.ID); err != nil {
+		return nil, fmt.Errorf("failed to send campaign: %w", err)
+	}
+
+	return campaign, nil
+}
+
+// MailchimpSegment represents a Mailchimp segment/condition
+type MailchimpSegment struct {
+	Name        string `json:"name"`
+	SegmentType string `json:"type"` // "static", "saved"
+	Options     struct {
+		Match      string `json:"match"` // "any", "all"
+		Conditions []struct {
+			Field    string `json:"field"`
+			Operator string `json:"op"` // "is", "gt", "lt", etc.
+			Value    string `json:"value"`
+		} `json:"conditions"`
+	} `json:"options"`
+}
+
+// CreateSegment creates a new segment in Mailchimp audience
+func (s *MailchimpService) CreateSegment(projectID string, segmentRequest *MailchimpSegment) error {
+	integration, err := s.getIntegration(projectID)
+	if err != nil {
+		return fmt.Errorf("failed to get integration: %w", err)
+	}
+
+	accessToken, err := s.decrypt(integration.AccessToken)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt access token: %w", err)
+	}
+
+	serverPrefix, ok := integration.Settings["server_prefix"].(string)
+	if !ok {
+		return fmt.Errorf("server prefix not found in integration settings")
+	}
+
+	audienceID, ok := integration.Settings["audience_id"].(string)
+	if !ok {
+		return fmt.Errorf("audience ID not found in integration settings")
+	}
+
+	apiURL := fmt.Sprintf("https://%s.api.mailchimp.com/3.0/lists/%s/segments", serverPrefix, audienceID)
+
+	jsonData, err := json.Marshal(segmentRequest)
+	if err != nil {
+		return fmt.Errorf("failed to marshal segment request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mailchimp API error: %s", string(body))
+	}
+
+	return nil
+}
+
+// GetCampaignAnalytics retrieves campaign performance data
+func (s *MailchimpService) GetCampaignAnalytics(projectID string, campaignID string) (map[string]interface{}, error) {
+	integration, err := s.getIntegration(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get integration: %w", err)
+	}
+
+	accessToken, err := s.decrypt(integration.AccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt access token: %w", err)
+	}
+
+	serverPrefix, ok := integration.Settings["server_prefix"].(string)
+	if !ok {
+		return nil, fmt.Errorf("server prefix not found in integration settings")
+	}
+
+	apiURL := fmt.Sprintf("https://%s.api.mailchimp.com/3.0/reports/%s", serverPrefix, campaignID)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("mailchimp API error: %s", string(body))
+	}
+
+	var analytics map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&analytics); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return analytics, nil
+}

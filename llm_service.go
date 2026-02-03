@@ -760,6 +760,64 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+// generateContent generates content using Claude API for automation service
+func (s *LLMService) generateContent(prompt string) (string, error) {
+	if s.apiKey == "" {
+		return "", fmt.Errorf("LLM service not configured - ANTHROPIC_API_KEY not set")
+	}
+
+	claudeReq := ClaudeRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 4096,
+		Messages: []ClaudeMessage{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+	}
+
+	reqBody, err := json.Marshal(claudeReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequest("POST", s.baseURL+"/messages", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", s.apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Claude API error: %s", string(body))
+	}
+
+	var claudeResp ClaudeResponse
+	if err := json.Unmarshal(body, &claudeResp); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if len(claudeResp.Content) > 0 && claudeResp.Content[0].Type == "text" {
+		return claudeResp.Content[0].Text, nil
+	}
+
+	return "", fmt.Errorf("no content in Claude response")
+}
+
 // ==================
 // HTTP Handlers
 // ==================

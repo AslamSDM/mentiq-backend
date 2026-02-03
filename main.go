@@ -111,6 +111,7 @@ type Server struct {
 	triggerEvaluator         *TriggerEvaluator
 	autoUpgradeService       *AutoUpgradeService
 	integrationsService      *IntegrationsService
+	automationExecutor       *AutomationExecutor
 
 	// Entity caches with TTL
 	projectCache     map[string]*CacheEntry // Key: projectID
@@ -125,6 +126,11 @@ type Server struct {
 	// Response cache for analytics endpoints (aggressive caching)
 	responseCache      map[string]*CachedResponse
 	responseCacheMutex sync.RWMutex
+
+	// Rate limiters
+	globalLimiter *RateLimiter // general API rate limit
+	authLimiter   *RateLimiter // login/signup rate limit (stricter)
+	eventLimiter  *RateLimiter // event ingestion rate limit (higher)
 }
 
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
@@ -142,9 +148,18 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 	// Initialize Mailchimp service
 	mailchimpService := NewMailchimpService(db)
 
+	// Initialize LLM service for automation
+	llmService := NewLLMService(db)
+
+	// Initialize automation service
+	automationService := NewAutomationService(db, llmService, mailchimpService)
+
 	// Initialize playbook executor and trigger evaluator
 	playbookExecutor := NewPlaybookExecutor(db, emailService, mailchimpService)
 	triggerEvaluator := NewTriggerEvaluator(db)
+
+	// Initialize automation executor
+	automationExecutor := NewAutomationExecutor(db, automationService, mailchimpService)
 
 	server := &Server{
 		db:                       db,
@@ -157,17 +172,22 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		triggerEvaluator:         triggerEvaluator,
 		autoUpgradeService:       NewAutoUpgradeService(db),
 		integrationsService:      NewIntegrationsService(db),
+		automationExecutor:       automationExecutor,
 		projectCache:             make(map[string]*CacheEntry),
 		accountCache:             make(map[string]*CacheEntry),
 		apiKeyCache:              make(map[string]*CacheEntry),
 		recordingCache:           make(map[string]*CacheEntry),
 		stopChan:                 make(chan struct{}),
 		responseCache:            make(map[string]*CachedResponse),
+		globalLimiter:            NewRateLimiter(100, 1*time.Minute),
+		authLimiter:              NewRateLimiter(10, 1*time.Minute),
+		eventLimiter:             NewRateLimiter(500, 1*time.Minute),
 	}
 
 	// Start background workers
 	playbookExecutor.Start()
 	triggerEvaluator.Start()
+	automationExecutor.Start()
 
 	// Start entity cache cleanup (every 15 minutes)
 	go server.startEntityCacheCleanup()
@@ -210,6 +230,22 @@ func (s *Server) Shutdown() {
 	if s.triggerEvaluator != nil {
 		log.Println("Stopping trigger evaluator...")
 		s.triggerEvaluator.Stop()
+	}
+
+	if s.automationExecutor != nil {
+		log.Println("Stopping automation executor...")
+		s.automationExecutor.Stop()
+	}
+
+	// Stop rate limiters
+	if s.globalLimiter != nil {
+		s.globalLimiter.Stop()
+	}
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
+	}
+	if s.eventLimiter != nil {
+		s.eventLimiter.Stop()
 	}
 
 	// Signal entity cache cleanup to stop
@@ -758,16 +794,17 @@ func main() {
 	config.AllowCredentials = true
 	router.Use(cors.New(config))
 
-	// Public routes
-	router.POST("/signup", server.signupHandler)
-	router.POST("/login", server.loginHandler)
+	// Public routes (auth routes have stricter IP-based rate limiting)
+	authRL := IPRateLimitMiddleware(server.authLimiter)
+	router.POST("/signup", authRL, server.signupHandler)
+	router.POST("/login", authRL, server.loginHandler)
 	router.POST("/refresh", server.refreshTokenHandler)
 	router.POST("/api/v1/invitations/accept", server.acceptInvitationHandler)
 	router.GET("/verify-email", server.verifyEmailHandler)
 	router.POST("/resend-verification", server.resendVerificationHandler)
-	router.POST("/api/auth/google", server.googleAuthHandler)
-	router.POST("/forgot-password", server.forgotPasswordHandler)
-	router.POST("/reset-password", server.resetPasswordHandler)
+	router.POST("/api/auth/google", authRL, server.googleAuthHandler)
+	router.POST("/forgot-password", authRL, server.forgotPasswordHandler)
+	router.POST("/reset-password", authRL, server.resetPasswordHandler)
 	router.GET("/health", healthCheckHandler)
 
 	// Waitlist route (public, no auth required)
@@ -794,12 +831,15 @@ func main() {
 	apiV1 := router.Group("/api/v1")
 
 	apiV1.Use(server.authMiddleware) // Apply auth middleware to all v1 routes
+	apiV1.Use(AccountRateLimitMiddleware(server.globalLimiter))
 	{
 		// User endpoints
 		apiV1.GET("/me", server.getMeHandler)
 
-		apiV1.POST("/events", server.analyticsService.ingestEventHandler)
-		apiV1.POST("/events/batch", server.analyticsService.batchIngestHandler)
+		// Event ingestion routes use a higher rate limit
+		eventRL := AccountRateLimitMiddleware(server.eventLimiter)
+		apiV1.POST("/events", eventRL, server.analyticsService.ingestEventHandler)
+		apiV1.POST("/events/batch", eventRL, server.analyticsService.batchIngestHandler)
 		apiV1.GET("/analytics", server.analyticsService.GetAnalyticsHandler)
 		apiV1.GET("/dashboard", server.analyticsService.GetDashboardHandler)
 		apiV1.GET("/realtime", server.analyticsService.GetRealTimeHandler)
@@ -977,11 +1017,40 @@ func main() {
 
 		// Mailchimp-specific routes
 		apiV1.POST("/projects/:project_id/integrations/mailchimp/connect", server.integrationsService.ConnectMailchimpHandler)
+		apiV1.POST("/projects/:project_id/integrations/mailchimp/callback", server.integrationsService.MailchimpCallbackAPIHandler)
 		apiV1.DELETE("/projects/:project_id/integrations/mailchimp", server.integrationsService.DisconnectMailchimpHandler)
 		apiV1.GET("/projects/:project_id/integrations/mailchimp/audiences", server.integrationsService.GetMailchimpAudiencesHandler)
 		apiV1.PUT("/projects/:project_id/integrations/mailchimp/settings", server.integrationsService.UpdateMailchimpSettingsHandler)
 		apiV1.POST("/projects/:project_id/integrations/mailchimp/sync", server.integrationsService.TriggerMailchimpSyncHandler)
 		apiV1.GET("/projects/:project_id/integrations/mailchimp/logs", server.integrationsService.GetMailchimpSyncLogsHandler)
+
+		// ========================================
+		// Automation routes
+		// ========================================
+		// Automation settings
+		apiV1.POST("/projects/:project_id/automations", server.createAutomationHandler)
+		apiV1.GET("/projects/:project_id/automations", server.getAutomationsHandler)
+		apiV1.GET("/projects/:project_id/automations/:automation_id", server.getAutomationHandler)
+		apiV1.PUT("/projects/:project_id/automations/:automation_id", server.updateAutomationHandler)
+		apiV1.DELETE("/projects/:project_id/automations/:automation_id", server.deleteAutomationHandler)
+
+		// Email templates
+		apiV1.POST("/projects/:project_id/email-templates", server.createEmailTemplateHandler)
+		apiV1.GET("/projects/:project_id/email-templates", server.getEmailTemplatesHandler)
+		apiV1.PUT("/projects/:project_id/email-templates/:template_id", server.updateEmailTemplateHandler)
+		apiV1.DELETE("/projects/:project_id/email-templates/:template_id", server.deleteEmailTemplateHandler)
+
+		// Discount codes
+		apiV1.POST("/projects/:project_id/discount-codes", server.createDiscountCodeHandler)
+		apiV1.GET("/projects/:project_id/discount-codes", server.getDiscountCodesHandler)
+		apiV1.PUT("/projects/:project_id/discount-codes/:code_id", server.updateDiscountCodeHandler)
+
+		// Automation executions (read-only for now - created by automation engine)
+		apiV1.GET("/projects/:project_id/automation-executions", server.getAutomationExecutionsHandler)
+
+		// Automation testing/triggering
+		apiV1.POST("/projects/:project_id/automations/:automation_id/trigger", server.triggerAutomationHandler)
+		apiV1.POST("/projects/:project_id/automations/:automation_id/test", server.testAutomationHandler)
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)

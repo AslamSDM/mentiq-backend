@@ -60,6 +60,14 @@ func MigrateDB(db *gorm.DB) error {
 		&PlaybookStepExecution{},
 		&PlaybookAnalytics{},
 		&LLMPlaybookGeneration{},
+		// Automation models
+		&AutomationSettings{},
+		&EmailTemplate{},
+		&DiscountCode{},
+		&AutomationExecution{},
+		// Integration models
+		&ProjectIntegration{},
+		&IntegrationSyncLog{},
 		// Waitlist
 		&Waitlist{},
 		// Support Tickets

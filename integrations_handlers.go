@@ -24,7 +24,7 @@ func NewIntegrationsService(db *gorm.DB) *IntegrationsService {
 
 // GetIntegrationsHandler returns all integrations for a project
 func (s *IntegrationsService) GetIntegrationsHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 
 	var integrations []ProjectIntegration
 	err := s.db.Where("project_id = ?", projectID).Find(&integrations).Error
@@ -38,7 +38,7 @@ func (s *IntegrationsService) GetIntegrationsHandler(c *gin.Context) {
 
 // GetIntegrationHandler returns a specific integration
 func (s *IntegrationsService) GetIntegrationHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 	provider := c.Param("provider")
 
 	var integration ProjectIntegration
@@ -61,7 +61,7 @@ func (s *IntegrationsService) GetIntegrationHandler(c *gin.Context) {
 
 // ConnectMailchimpHandler initiates Mailchimp OAuth flow
 func (s *IntegrationsService) ConnectMailchimpHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 
 	// Check if Mailchimp is configured
 	if !s.mailchimpService.IsConfigured() {
@@ -120,9 +120,38 @@ func (s *IntegrationsService) MailchimpCallbackHandler(c *gin.Context) {
 		"/dashboard/settings/integrations/mailchimp?success=connected")
 }
 
+// MailchimpCallbackAPIHandler handles the OAuth callback via API (POST with code in body)
+func (s *IntegrationsService) MailchimpCallbackAPIHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req struct {
+		Code string `json:"code"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil || req.Code == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing authorization code"})
+		return
+	}
+
+	// Exchange code for token
+	integration, err := s.mailchimpService.ExchangeCodeForToken(projectID, req.Code)
+	if err != nil {
+		log.Printf("Failed to exchange Mailchimp code: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to exchange authorization code"})
+		return
+	}
+
+	log.Printf("Mailchimp connected for project %s, integration ID: %s", projectID, integration.ID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Mailchimp connected successfully",
+		"integration": integration,
+	})
+}
+
 // DisconnectMailchimpHandler removes Mailchimp integration
 func (s *IntegrationsService) DisconnectMailchimpHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 
 	err := s.mailchimpService.Disconnect(projectID)
 	if err != nil {
@@ -135,7 +164,7 @@ func (s *IntegrationsService) DisconnectMailchimpHandler(c *gin.Context) {
 
 // GetMailchimpAudiencesHandler returns available Mailchimp audiences
 func (s *IntegrationsService) GetMailchimpAudiencesHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 
 	audiences, err := s.mailchimpService.GetAudiences(projectID)
 	if err != nil {
@@ -158,7 +187,7 @@ type UpdateMailchimpSettingsRequest struct {
 
 // UpdateMailchimpSettingsHandler updates Mailchimp integration settings
 func (s *IntegrationsService) UpdateMailchimpSettingsHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 
 	var req UpdateMailchimpSettingsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -200,7 +229,7 @@ func (s *IntegrationsService) UpdateMailchimpSettingsHandler(c *gin.Context) {
 
 // TriggerMailchimpSyncHandler manually triggers a sync
 func (s *IntegrationsService) TriggerMailchimpSyncHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 
 	syncLog, err := s.mailchimpService.SyncHighRiskUsers(projectID)
 	if err != nil {
@@ -219,7 +248,7 @@ func (s *IntegrationsService) TriggerMailchimpSyncHandler(c *gin.Context) {
 
 // GetMailchimpSyncLogsHandler returns sync history
 func (s *IntegrationsService) GetMailchimpSyncLogsHandler(c *gin.Context) {
-	projectID := c.Param("projectId")
+	projectID := c.Param("project_id")
 
 	// Get integration first
 	var integration ProjectIntegration
