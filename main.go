@@ -111,6 +111,7 @@ type Server struct {
 	triggerEvaluator         *TriggerEvaluator
 	autoUpgradeService       *AutoUpgradeService
 	integrationsService      *IntegrationsService
+	automationService        *AutomationService
 	automationExecutor       *AutomationExecutor
 
 	// Entity caches with TTL
@@ -172,6 +173,7 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		triggerEvaluator:         triggerEvaluator,
 		autoUpgradeService:       NewAutoUpgradeService(db),
 		integrationsService:      NewIntegrationsService(db),
+		automationService:        automationService,
 		automationExecutor:       automationExecutor,
 		projectCache:             make(map[string]*CacheEntry),
 		accountCache:             make(map[string]*CacheEntry),
@@ -755,9 +757,9 @@ func main() {
 	}
 
 	// Run migrations
-	// if err := MigrateDB(database); err != nil {
-	// 	log.Fatalf("Failed to run migrations: %v", err)
-	// }
+	if err := MigrateDB(database); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {

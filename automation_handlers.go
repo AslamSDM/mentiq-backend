@@ -486,9 +486,9 @@ func (s *Server) triggerAutomationHandler(c *gin.Context) {
 	go s.automationExecutor.ProcessSingleAutomation(&automation)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Automation triggered successfully",
+		"message":       "Automation triggered successfully",
 		"automation_id": automationID,
-		"type": automation.Type,
+		"type":          automation.Type,
 	})
 }
 
@@ -545,24 +545,35 @@ func (s *Server) testAutomationHandler(c *gin.Context) {
 	// If automation service is available, generate email content
 	var emailContent map[string]string
 	if s.automationService != nil {
-		userInfo := map[string]interface{}{
-			"name":             req.Name,
-			"email":            req.Email,
-			"user_id":          req.UserID,
-			"churn_risk_score": 85.0,
-		}
-		productInfo := map[string]interface{}{
-			"product_name":    "Your Product",
-			"discount_code":   "TEST20",
-			"discount_amount": "20%",
+		genReq := GenerateEmailContentRequest{
+			TemplateType: automation.Type,
+			UserContext: map[string]interface{}{
+				"name":             req.Name,
+				"email":            req.Email,
+				"user_id":          req.UserID,
+				"churn_risk_score": 85.0,
+			},
+			ProductContext: map[string]interface{}{
+				"product_name":    "Your Product",
+				"discount_code":   "TEST20",
+				"discount_amount": "20%",
+			},
+			Personalization: map[string]interface{}{
+				"discount_code":   "TEST20",
+				"discount_amount": "20%",
+			},
 		}
 
-		content, err := s.automationService.GenerateEmailContent(automation.Type, userInfo, productInfo)
+		content, err := s.automationService.GenerateEmailContent(genReq)
 		if err == nil {
-			emailContent = content
+			emailContent = map[string]string{
+				"subject": content.Subject,
+				"html":    content.HTMLContent,
+				"text":    content.PlainText,
+			}
 			// Update execution with generated content
-			execution.Personalization["generated_subject"] = content["subject"]
-			execution.Personalization["generated_body"] = content["html"]
+			execution.Personalization["generated_subject"] = content.Subject
+			execution.Personalization["generated_body"] = content.HTMLContent
 			s.db.Save(&execution)
 		}
 	}
