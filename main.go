@@ -56,40 +56,43 @@ func (Event) TableName() string {
 	return "events"
 }
 
-// CacheEntry represents a cached item with TTL
-type CacheEntry struct {
-	Data      interface{}
-	ExpiresAt time.Time
-}
-
 // CachedResponse represents a cached HTTP response
 type CachedResponse struct {
 	StatusCode int
 	Body       []byte
 	Headers    map[string]string
-	ExpiresAt  time.Time
 }
+
+// Cache size limits
+const (
+	MaxEventsCacheSize    = 500  // event query results (can be large per entry)
+	MaxDashboardCacheSize = 200  // dashboard snapshots
+	MaxMetricsCacheSize   = 1000 // individual metric values
+	MaxEntityCacheSize    = 500  // projects, accounts, api keys each
+	MaxResponseCacheSize  = 1000 // cached HTTP responses
+)
 
 type AnalyticsService struct {
 	db           *gorm.DB
 	stripeClient *client.API
 	stopChan     chan struct{}
+	eventQueue   *EventQueue
 
-	// Data caches with TTL
-	eventsCache    map[string]*CacheEntry // Key: accountID:projectID:startDate:endDate
-	dashboardCache map[string]*CacheEntry // Key: accountID:projectID:date
-	metricsCache   map[string]*CacheEntry // Key: accountID:projectID:metric:date
-	dataCacheMutex sync.RWMutex
+	// Bounded data caches with TTL + LRU eviction
+	eventsCache    *BoundedCache[interface{}]
+	dashboardCache *BoundedCache[interface{}]
+	metricsCache   *BoundedCache[interface{}]
 }
 
 func NewAnalyticsService(db *gorm.DB) (*AnalyticsService, error) {
 	service := &AnalyticsService{
 		db:             db,
 		stripeClient:   NewStripeClient(),
-		eventsCache:    make(map[string]*CacheEntry),
-		dashboardCache: make(map[string]*CacheEntry),
-		metricsCache:   make(map[string]*CacheEntry),
+		eventsCache:    NewBoundedCache[interface{}](MaxEventsCacheSize),
+		dashboardCache: NewBoundedCache[interface{}](MaxDashboardCacheSize),
+		metricsCache:   NewBoundedCache[interface{}](MaxMetricsCacheSize),
 		stopChan:       make(chan struct{}),
+		eventQueue:     NewEventQueue(db, DefaultEventQueueConfig()),
 	}
 
 	// Start the background workers
@@ -114,19 +117,18 @@ type Server struct {
 	automationService        *AutomationService
 	automationExecutor       *AutomationExecutor
 
-	// Entity caches with TTL
-	projectCache     map[string]*CacheEntry // Key: projectID
-	accountCache     map[string]*CacheEntry // Key: accountID
-	apiKeyCache      map[string]*CacheEntry // Key: apiKey token
-	recordingCache   map[string]*CacheEntry // Key: recordingID
-	entityCacheMutex sync.RWMutex
+	// Bounded entity caches with TTL + LRU eviction
+	projectCache     *BoundedCache[*Project]
+	projectListCache *BoundedCache[[]Project] // account_projects:accountID -> []Project
+	accountCache     *BoundedCache[*Account]
+	apiKeyCache      *BoundedCache[*APIKey]
+	recordingCache   *BoundedCache[*SessionRecording]
 
 	// Graceful shutdown
 	stopChan chan struct{}
 
-	// Response cache for analytics endpoints (aggressive caching)
-	responseCache      map[string]*CachedResponse
-	responseCacheMutex sync.RWMutex
+	// Bounded response cache for analytics endpoints
+	responseCache *BoundedCache[*CachedResponse]
 
 	// Rate limiters
 	globalLimiter *RateLimiter // general API rate limit
@@ -175,15 +177,16 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		integrationsService:      NewIntegrationsService(db),
 		automationService:        automationService,
 		automationExecutor:       automationExecutor,
-		projectCache:             make(map[string]*CacheEntry),
-		accountCache:             make(map[string]*CacheEntry),
-		apiKeyCache:              make(map[string]*CacheEntry),
-		recordingCache:           make(map[string]*CacheEntry),
+		projectCache:             NewBoundedCache[*Project](MaxEntityCacheSize),
+		projectListCache:         NewBoundedCache[[]Project](200),
+		accountCache:             NewBoundedCache[*Account](MaxEntityCacheSize),
+		apiKeyCache:              NewBoundedCache[*APIKey](MaxEntityCacheSize),
+		recordingCache:           NewBoundedCache[*SessionRecording](MaxEntityCacheSize),
 		stopChan:                 make(chan struct{}),
-		responseCache:            make(map[string]*CachedResponse),
+		responseCache:            NewBoundedCache[*CachedResponse](MaxResponseCacheSize),
 		globalLimiter:            NewRateLimiter(100, 1*time.Minute),
 		authLimiter:              NewRateLimiter(10, 1*time.Minute),
-		eventLimiter:             NewRateLimiter(500, 1*time.Minute),
+		eventLimiter:             NewRateLimiter(5000, 1*time.Minute),
 	}
 
 	// Start background workers
@@ -426,39 +429,6 @@ func ValidateJWT(tokenString string) (*JWTClaims, error) {
 
 // Entity cache helper methods
 
-func (s *Server) getCachedEntity(cacheKey string, cacheMap map[string]*CacheEntry) (interface{}, bool) {
-	s.entityCacheMutex.RLock()
-	defer s.entityCacheMutex.RUnlock()
-
-	entry, exists := cacheMap[cacheKey]
-	if !exists {
-		return nil, false
-	}
-
-	if time.Now().After(entry.ExpiresAt) {
-		return nil, false
-	}
-
-	return entry.Data, true
-}
-
-func (s *Server) setCachedEntity(cacheKey string, data interface{}, ttl time.Duration, cacheMap map[string]*CacheEntry) {
-	s.entityCacheMutex.Lock()
-	defer s.entityCacheMutex.Unlock()
-
-	cacheMap[cacheKey] = &CacheEntry{
-		Data:      data,
-		ExpiresAt: time.Now().Add(ttl),
-	}
-}
-
-func (s *Server) invalidateCachedEntity(cacheKey string, cacheMap map[string]*CacheEntry) {
-	s.entityCacheMutex.Lock()
-	defer s.entityCacheMutex.Unlock()
-
-	delete(cacheMap, cacheKey)
-}
-
 func (s *Server) startEntityCacheCleanup() {
 	cleanupTicker := time.NewTicker(15 * time.Minute)
 	defer cleanupTicker.Stop()
@@ -466,7 +436,14 @@ func (s *Server) startEntityCacheCleanup() {
 	for {
 		select {
 		case <-cleanupTicker.C:
-			s.cleanExpiredEntityCache()
+			cleaned := s.projectCache.CleanExpired()
+			cleaned += s.projectListCache.CleanExpired()
+			cleaned += s.accountCache.CleanExpired()
+			cleaned += s.apiKeyCache.CleanExpired()
+			cleaned += s.recordingCache.CleanExpired()
+			if cleaned > 0 {
+				log.Printf("Entity cache cleanup: removed %d expired entries", cleaned)
+			}
 		case <-s.stopChan:
 			log.Println("Entity cache cleanup worker stopped")
 			return
@@ -474,98 +451,46 @@ func (s *Server) startEntityCacheCleanup() {
 	}
 }
 
-func (s *Server) cleanExpiredEntityCache() {
-	s.entityCacheMutex.Lock()
-	defer s.entityCacheMutex.Unlock()
-
-	now := time.Now()
-	cleaned := 0
-
-	for key, entry := range s.projectCache {
-		if now.After(entry.ExpiresAt) {
-			delete(s.projectCache, key)
-			cleaned++
-		}
-	}
-
-	for key, entry := range s.accountCache {
-		if now.After(entry.ExpiresAt) {
-			delete(s.accountCache, key)
-			cleaned++
-		}
-	}
-
-	for key, entry := range s.apiKeyCache {
-		if now.After(entry.ExpiresAt) {
-			delete(s.apiKeyCache, key)
-			cleaned++
-		}
-	}
-
-	for key, entry := range s.recordingCache {
-		if now.After(entry.ExpiresAt) {
-			delete(s.recordingCache, key)
-			cleaned++
-		}
-	}
-
-	if cleaned > 0 {
-		log.Printf("Entity cache cleanup: removed %d expired entries", cleaned)
-	}
-}
-
 // Cached entity retrieval methods
 
 func (s *Server) getCachedProject(projectID string) (*Project, bool) {
-	if data, found := s.getCachedEntity(projectID, s.projectCache); found {
-		return data.(*Project), true
-	}
-	return nil, false
+	return s.projectCache.Get(projectID)
 }
 
 func (s *Server) setCachedProject(project *Project) {
-	s.setCachedEntity(project.ID, project, 30*time.Minute, s.projectCache)
+	s.projectCache.Set(project.ID, project, 30*time.Minute)
 }
 
 func (s *Server) invalidateProjectCache(projectID string) {
-	s.invalidateCachedEntity(projectID, s.projectCache)
+	s.projectCache.Delete(projectID)
 }
 
 func (s *Server) getCachedAccount(accountID string) (*Account, bool) {
-	if data, found := s.getCachedEntity(accountID, s.accountCache); found {
-		return data.(*Account), true
-	}
-	return nil, false
+	return s.accountCache.Get(accountID)
 }
 
 func (s *Server) setCachedAccount(account *Account) {
-	s.setCachedEntity(account.ID, account, 30*time.Minute, s.accountCache)
+	s.accountCache.Set(account.ID, account, 30*time.Minute)
 }
 
 func (s *Server) getCachedAPIKey(token string) (*APIKey, bool) {
-	if data, found := s.getCachedEntity(token, s.apiKeyCache); found {
-		return data.(*APIKey), true
-	}
-	return nil, false
+	return s.apiKeyCache.Get(token)
 }
 
 func (s *Server) setCachedAPIKey(apiKey *APIKey) {
-	s.setCachedEntity(apiKey.Key, apiKey, 30*time.Minute, s.apiKeyCache)
+	s.apiKeyCache.Set(apiKey.Key, apiKey, 30*time.Minute)
 }
 
 func (s *Server) invalidateAPIKeyCache(token string) {
-	s.invalidateCachedEntity(token, s.apiKeyCache)
+	s.apiKeyCache.Delete(token)
 }
 
 func (s *Server) getCachedRecording(recordingID string) (*SessionRecording, bool) {
-	if data, found := s.getCachedEntity(recordingID, s.recordingCache); found {
-		return data.(*SessionRecording), true
-	}
-	return nil, false
+	return s.recordingCache.Get(recordingID)
 }
 
 func (s *Server) setCachedRecording(recording *SessionRecording) {
-	s.setCachedEntity(recording.ID, recording, 15*time.Minute, s.recordingCache)
+	s.recordingCache.Set(recording.ID, recording, 15*time.Minute)
 }
 
 // ========================================
@@ -602,52 +527,16 @@ func (s *Server) generateResponseCacheKey(c *gin.Context) string {
 
 // getCachedResponse retrieves a cached response if valid
 func (s *Server) getCachedResponse(cacheKey string) (*CachedResponse, bool) {
-	s.responseCacheMutex.RLock()
-	defer s.responseCacheMutex.RUnlock()
-
-	cached, exists := s.responseCache[cacheKey]
-	if !exists {
-		return nil, false
-	}
-
-	if time.Now().After(cached.ExpiresAt) {
-		return nil, false
-	}
-
-	return cached, true
+	return s.responseCache.Get(cacheKey)
 }
 
 // setCachedResponse stores a response in the cache
 func (s *Server) setCachedResponse(cacheKey string, statusCode int, body []byte, headers map[string]string, ttl time.Duration) {
-	s.responseCacheMutex.Lock()
-	defer s.responseCacheMutex.Unlock()
-
-	s.responseCache[cacheKey] = &CachedResponse{
+	s.responseCache.Set(cacheKey, &CachedResponse{
 		StatusCode: statusCode,
 		Body:       body,
 		Headers:    headers,
-		ExpiresAt:  time.Now().Add(ttl),
-	}
-}
-
-// cleanExpiredResponseCache removes expired response cache entries
-func (s *Server) cleanExpiredResponseCache() {
-	s.responseCacheMutex.Lock()
-	defer s.responseCacheMutex.Unlock()
-
-	now := time.Now()
-	cleaned := 0
-
-	for key, entry := range s.responseCache {
-		if now.After(entry.ExpiresAt) {
-			delete(s.responseCache, key)
-			cleaned++
-		}
-	}
-
-	if cleaned > 0 {
-		log.Printf("Response cache cleanup: removed %d expired entries", cleaned)
-	}
+	}, ttl)
 }
 
 // startResponseCacheCleanup periodically cleans up expired response cache entries
@@ -656,7 +545,10 @@ func (s *Server) startResponseCacheCleanup() {
 	defer cleanupTicker.Stop()
 
 	for range cleanupTicker.C {
-		s.cleanExpiredResponseCache()
+		cleaned := s.responseCache.CleanExpired()
+		if cleaned > 0 {
+			log.Printf("Response cache cleanup: removed %d expired entries", cleaned)
+		}
 	}
 }
 
@@ -677,7 +569,6 @@ func (s *Server) cacheResponseMiddleware(ttl time.Duration) gin.HandlerFunc {
 		if cached, found := s.getCachedResponse(cacheKey); found {
 			// Add cache hit header for debugging
 			c.Header("X-Cache", "HIT")
-			c.Header("X-Cache-Expires", cached.ExpiresAt.Format(time.RFC3339))
 
 			// Set any cached headers
 			for key, value := range cached.Headers {
@@ -757,9 +648,9 @@ func main() {
 	}
 
 	// Run migrations
-	if err := MigrateDB(database); err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
-	}
+	// if err := MigrateDB(database); err != nil {
+	// 	log.Fatalf("Failed to run migrations: %v", err)
+	// }
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -1145,32 +1036,13 @@ func (as *AnalyticsService) generateCacheKey(cacheType, accountID, projectID str
 }
 
 // getCachedData retrieves data from cache if it exists and hasn't expired
-func (as *AnalyticsService) getCachedData(cacheKey string, cacheMap map[string]*CacheEntry) (interface{}, bool) {
-	as.dataCacheMutex.RLock()
-	defer as.dataCacheMutex.RUnlock()
-
-	entry, exists := cacheMap[cacheKey]
-	if !exists {
-		return nil, false
-	}
-
-	// Check if cache entry has expired
-	if time.Now().After(entry.ExpiresAt) {
-		return nil, false
-	}
-
-	return entry.Data, true
+func (as *AnalyticsService) getCachedData(cacheKey string, cacheMap *BoundedCache[interface{}]) (interface{}, bool) {
+	return cacheMap.Get(cacheKey)
 }
 
 // setCachedData stores data in cache with TTL
-func (as *AnalyticsService) setCachedData(cacheKey string, data interface{}, ttl time.Duration, cacheMap map[string]*CacheEntry) {
-	as.dataCacheMutex.Lock()
-	defer as.dataCacheMutex.Unlock()
-
-	cacheMap[cacheKey] = &CacheEntry{
-		Data:      data,
-		ExpiresAt: time.Now().Add(ttl),
-	}
+func (as *AnalyticsService) setCachedData(cacheKey string, data interface{}, ttl time.Duration, cacheMap *BoundedCache[interface{}]) {
+	cacheMap.Set(cacheKey, data, ttl)
 }
 
 // getCachedEvents retrieves events from cache
@@ -1234,35 +1106,9 @@ func (as *AnalyticsService) startCacheCleanup() {
 
 // cleanExpiredCache removes expired entries from all caches
 func (as *AnalyticsService) cleanExpiredCache() {
-	as.dataCacheMutex.Lock()
-	defer as.dataCacheMutex.Unlock()
-
-	now := time.Now()
-	cleaned := 0
-
-	// Clean events cache
-	for key, entry := range as.eventsCache {
-		if now.After(entry.ExpiresAt) {
-			delete(as.eventsCache, key)
-			cleaned++
-		}
-	}
-
-	// Clean dashboard cache
-	for key, entry := range as.dashboardCache {
-		if now.After(entry.ExpiresAt) {
-			delete(as.dashboardCache, key)
-			cleaned++
-		}
-	}
-
-	// Clean metrics cache
-	for key, entry := range as.metricsCache {
-		if now.After(entry.ExpiresAt) {
-			delete(as.metricsCache, key)
-			cleaned++
-		}
-	}
+	cleaned := as.eventsCache.CleanExpired()
+	cleaned += as.dashboardCache.CleanExpired()
+	cleaned += as.metricsCache.CleanExpired()
 
 	if cleaned > 0 {
 		log.Printf("Cache cleanup: removed %d expired entries", cleaned)
@@ -1278,6 +1124,10 @@ func (as *AnalyticsService) Stop() {
 	default:
 		close(as.stopChan)
 	}
+
+	if as.eventQueue != nil {
+		as.eventQueue.Stop()
+	}
 }
 
 // addEventToCache persists an event directly to TimescaleDB (no R2/S3 cache)
@@ -1290,9 +1140,7 @@ func (as *AnalyticsService) addEventToCache(event Event) {
 
 // getCacheSize returns the current logical cache size (eventsCache length)
 func (as *AnalyticsService) getCacheSize() int {
-	as.dataCacheMutex.RLock()
-	defer as.dataCacheMutex.RUnlock()
-	return len(as.eventsCache)
+	return as.eventsCache.Len()
 }
 
 // Global GeoIP database reader (initialized once)
@@ -1371,18 +1219,14 @@ func healthCheckHandler(c *gin.Context) {
 
 // clearDataCacheHandler allows manual clearing of data caches (for testing/admin purposes)
 func (as *AnalyticsService) clearDataCacheHandler(c *gin.Context) {
-	as.dataCacheMutex.Lock()
+	eventsCount := as.eventsCache.Len()
+	dashboardCount := as.dashboardCache.Len()
+	metricsCount := as.metricsCache.Len()
 
-	eventsCount := len(as.eventsCache)
-	dashboardCount := len(as.dashboardCache)
-	metricsCount := len(as.metricsCache)
-
-	// Clear all caches
-	as.eventsCache = make(map[string]*CacheEntry)
-	as.dashboardCache = make(map[string]*CacheEntry)
-	as.metricsCache = make(map[string]*CacheEntry)
-
-	as.dataCacheMutex.Unlock()
+	// Replace with fresh bounded caches
+	as.eventsCache = NewBoundedCache[interface{}](MaxEventsCacheSize)
+	as.dashboardCache = NewBoundedCache[interface{}](MaxDashboardCacheSize)
+	as.metricsCache = NewBoundedCache[interface{}](MaxMetricsCacheSize)
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "All data caches cleared successfully",
@@ -2947,8 +2791,7 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 
 	// Try to get from cache first
 	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
-	if data, found := s.getCachedEntity(cacheKey, s.projectCache); found {
-		projects := data.([]Project)
+	if projects, found := s.projectListCache.Get(cacheKey); found {
 		var response []gin.H
 		for _, project := range projects {
 			response = append(response, gin.H{
@@ -2970,7 +2813,7 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 	}
 
 	// Cache the projects list
-	s.setCachedEntity(cacheKey, projects, 10*time.Minute, s.projectCache)
+	s.projectListCache.Set(cacheKey, projects, 10*time.Minute)
 
 	// Convert to response format
 	var response []gin.H
@@ -3041,7 +2884,7 @@ func (s *Server) createProjectHandler(c *gin.Context) {
 	// Cache the new project and invalidate account projects list
 	s.setCachedProject(&project)
 	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
-	s.invalidateCachedEntity(cacheKey, s.projectCache)
+	s.projectListCache.Delete(cacheKey)
 
 	// Auto-create a default API key for the new project
 	apiKey := APIKey{
@@ -3104,7 +2947,7 @@ func (s *Server) updateProjectHandler(c *gin.Context) {
 	// Invalidate caches
 	s.invalidateProjectCache(project.ID)
 	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
-	s.invalidateCachedEntity(cacheKey, s.projectCache)
+	s.projectListCache.Delete(cacheKey)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":        project.ID,
@@ -3148,7 +2991,7 @@ func (s *Server) deleteProjectHandler(c *gin.Context) {
 	// Invalidate caches
 	s.invalidateProjectCache(projectID)
 	cacheKey := fmt.Sprintf("account_projects:%s", accountID.(string))
-	s.invalidateCachedEntity(cacheKey, s.projectCache)
+	s.projectListCache.Delete(cacheKey)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Project deleted successfully"})
 }

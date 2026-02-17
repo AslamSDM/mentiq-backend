@@ -3,17 +3,31 @@ package main
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
-// InitDB initializes a GORM database connection
+// InitDB initializes a GORM database connection with connection pooling
 func InitDB(databaseURL string) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(databaseURL), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+
+	// Connection pool settings
+	sqlDB.SetMaxOpenConns(50)                  // Max connections to PostgreSQL (keep below pg max_connections, typically 100)
+	sqlDB.SetMaxIdleConns(10)                  // Keep idle connections ready to avoid reconnect overhead
+	sqlDB.SetConnMaxLifetime(30 * time.Minute) // Recycle connections to pick up DNS/config changes
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)  // Close idle connections after 5 min to free resources
+
+	log.Println("Database connection pool configured: maxOpen=50, maxIdle=10, maxLifetime=30m, maxIdleTime=5m")
 
 	return db, nil
 }
@@ -195,9 +209,17 @@ func CreateIndices(db *gorm.DB) error {
 	}
 
 	for _, idx := range indices {
-		// Check if index exists before creating
 		if !db.Migrator().HasIndex(idx.model, idx.index) {
-			log.Printf("Creating index: %s", idx.index)
+			log.Printf("Creating index: %s on column(s): %s", idx.index, idx.column)
+			stmt := &gorm.Statement{DB: db}
+			if err := stmt.Parse(idx.model); err != nil {
+				log.Printf("Warning: Could not parse model for index %s: %v", idx.index, err)
+				continue
+			}
+			tableName := stmt.Schema.Table
+			if err := db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)", idx.index, tableName, idx.column)).Error; err != nil {
+				log.Printf("Warning: Could not create index %s: %v", idx.index, err)
+			}
 		}
 	}
 

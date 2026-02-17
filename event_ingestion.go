@@ -97,20 +97,20 @@ func (as *AnalyticsService) ingestEventHandler(c *gin.Context) {
 		return
 	}
 
-	// Save event directly to TimescaleDB
-	if err := as.db.Create(&event).Error; err != nil {
-		log.Printf("Failed to save event to database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save event"})
+	// Enqueue event for async batch insert
+	if !as.eventQueue.Enqueue(event) {
+		log.Printf("Event queue full, dropping event %s", event.EventID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "Event queue is full, try again shortly",
+			"retryable": true,
+		})
 		return
 	}
 
-	log.Printf("Event %s saved successfully to TimescaleDB", event.EventID)
-
-	// Return success response
-	c.JSON(http.StatusOK, gin.H{
-		"status":   "success",
+	c.JSON(http.StatusAccepted, gin.H{
+		"status":   "accepted",
 		"event_id": event.EventID,
-		"message":  "Event saved to TimescaleDB",
+		"queued":   true,
 	})
 }
 
@@ -226,26 +226,28 @@ func (as *AnalyticsService) batchIngestHandler(c *gin.Context) {
 		}
 	}
 
-	// Save all events to TimescaleDB in a single transaction
-	start := time.Now()
-	result := as.db.Create(&events)
-	if result.Error != nil {
-		log.Printf("Failed to save batch events to database: %v", result.Error)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "Failed to save batch events",
-			"details": result.Error.Error(),
+	// Enqueue all events for async batch insert
+	enqueued := as.eventQueue.EnqueueBatch(events)
+
+	if enqueued == 0 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":     "Event queue is full, try again shortly",
+			"retryable": true,
 		})
 		return
 	}
 
-	duration := time.Since(start)
-	log.Printf("Batch of %d events saved successfully to TimescaleDB in %v", len(events), duration)
+	status := http.StatusAccepted
+	message := fmt.Sprintf("%d events queued for processing", enqueued)
+	if enqueued < len(events) {
+		message = fmt.Sprintf("%d of %d events queued (queue near capacity)", enqueued, len(events))
+	}
 
-	// Return success response
-	c.JSON(http.StatusOK, gin.H{
-		"status":           "success",
-		"events_processed": len(events),
-		"message":          fmt.Sprintf("Batch saved to TimescaleDB in %v", duration),
+	c.JSON(status, gin.H{
+		"status":           "accepted",
+		"events_queued":    enqueued,
+		"events_submitted": len(events),
+		"message":          message,
 	})
 }
 
