@@ -92,23 +92,13 @@ func (s *Server) joinWaitlistHandler(c *gin.Context) {
 func (s *Server) unsubscribeHandler(c *gin.Context) {
 	token := c.Query("token")
 	if token == "" {
-		c.HTML(http.StatusBadRequest, "", `
-			<html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
-				<h2>Invalid Request</h2>
-				<p>Missing unsubscribe token.</p>
-			</body></html>
-		`)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing unsubscribe token."})
 		return
 	}
 
 	var entry Waitlist
 	if err := s.db.Where("unsubscribe_token = ?", token).First(&entry).Error; err != nil {
-		c.HTML(http.StatusNotFound, "", `
-			<html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
-				<h2>Link Expired</h2>
-				<p>This unsubscribe link is no longer valid.</p>
-			</body></html>
-		`)
+		c.JSON(http.StatusNotFound, gin.H{"error": "This unsubscribe link is no longer valid."})
 		return
 	}
 
@@ -119,28 +109,7 @@ func (s *Server) unsubscribeHandler(c *gin.Context) {
 		"unsubscribed_at":     now,
 	})
 
-	c.Header("Content-Type", "text/html")
-	c.String(http.StatusOK, `
-		<html>
-		<head>
-			<meta name="viewport" content="width=device-width, initial-scale=1.0">
-			<style>
-				body { font-family: 'Segoe UI', sans-serif; padding: 40px 20px; text-align: center; background: #f8f9fa; }
-				.container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
-				h2 { color: #1a1a1a; margin-bottom: 16px; }
-				p { color: #4b5563; line-height: 1.6; }
-				.check { font-size: 48px; margin-bottom: 20px; }
-			</style>
-		</head>
-		<body>
-			<div class="container">
-				<div class="check">✓</div>
-				<h2>You've been unsubscribed</h2>
-				<p>You will no longer receive promotional emails from Mentiq. We're sorry to see you go!</p>
-			</div>
-		</body>
-		</html>
-	`)
+	c.JSON(http.StatusOK, gin.H{"message": "You have been unsubscribed successfully. You will no longer receive promotional emails from Mentiq."})
 }
 
 // getWaitlistHandler returns all waitlist entries (admin only)

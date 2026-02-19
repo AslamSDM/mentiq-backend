@@ -410,7 +410,7 @@ func (es *EmailService) SendWaitlistEmail(toEmail, toName, unsubscribeToken stri
 		return nil
 	}
 
-	unsubscribeURL := fmt.Sprintf("%s/api/v1/unsubscribe?token=%s", es.baseURL, unsubscribeToken)
+	unsubscribeURL := fmt.Sprintf("%s/unsubscribe?token=%s", es.baseURL, unsubscribeToken)
 	subject := "Welcome to the Mentiq Waitlist! 🎉"
 
 	htmlContent := fmt.Sprintf(`
