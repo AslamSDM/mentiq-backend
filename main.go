@@ -783,9 +783,10 @@ func main() {
 		// Stripe Revenue Analytics routes (CACHED)
 		// ========================================
 		apiV1.POST("/projects/:project_id/stripe/sync", server.stripeService.SyncStripeDataHandler)
-		apiV1.GET("/projects/:project_id/stripe/metrics", server.cacheResponseMiddleware(CacheTTLStripeMetrics), server.stripeService.GetRevenueMetricsHandler)
-		apiV1.GET("/projects/:project_id/stripe/analytics", server.cacheResponseMiddleware(CacheTTLStripeAnalytics), server.stripeService.GetRevenueAnalyticsHandler)
-		apiV1.GET("/projects/:project_id/stripe/customers", server.cacheResponseMiddleware(CacheTTLStripeAnalytics), server.stripeService.GetCustomerAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/stripe/test-timeseries", server.stripeService.TestStripeTimeSeriesHandler)
+		apiV1.GET("/projects/:project_id/stripe/metrics", server.stripeService.GetRevenueMetricsHandler)
+		apiV1.GET("/projects/:project_id/stripe/analytics", server.stripeService.GetRevenueAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/stripe/customers", server.stripeService.GetCustomerAnalyticsHandler)
 
 		// ========================================
 		// Session Recording routes (CACHED)

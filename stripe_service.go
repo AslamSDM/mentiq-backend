@@ -298,14 +298,28 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 		return
 	}
 
-	// Fetch daily revenue for time series graph
-	timeSeries, err := s.fetchDailyRevenue(sc, days)
+	// Fetch complete time series
+	timeSeries, err := s.fetchTimeSeries(sc, days)
 	if err != nil {
-		log.Printf("Warning: Failed to fetch daily revenue: %v", err)
-		timeSeries = []map[string]interface{}{} // Empty array on error
+		log.Printf("Warning: Failed to fetch time series: %v", err)
+		timeSeries = []map[string]interface{}{}
 	}
 
-	// Construct response with both summary metrics and time series
+	// Count new subscriptions in the period by checking subscription creation dates
+	thirtyDaysAgo := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+	newSubs := 0
+	subParams := &stripe.SubscriptionListParams{}
+	subParams.Limit = stripe.Int64(100)
+	subIter := sc.Subscriptions.List(subParams)
+	for subIter.Next() {
+		sub := subIter.Subscription()
+		createdDay := time.Unix(sub.Created, 0).Format("2006-01-02")
+		if createdDay >= thirtyDaysAgo {
+			newSubs++
+		}
+	}
+
+	// Construct response with all fields the frontend expects
 	response := map[string]interface{}{
 		"mrr":                          metrics.MRR,
 		"arr":                          metrics.ARR,
@@ -325,10 +339,12 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 			"start": time.Now().AddDate(0, 0, -days).Format("2006-01-02"),
 			"end":   time.Now().Format("2006-01-02"),
 		},
-		// Additional fields for dashboard compatibility
-		"growth_rate":           0.0, // Could be calculated with historical data
-		"new_subscriptions":     0,   // Could be calculated from subscription creation dates
+		"growth_rate":           0.0,
+		"new_subscriptions":     newSubs,
 		"churned_subscriptions": metrics.CanceledSubscriptions,
+		"expansion_revenue":     0.0,
+		"contraction_revenue":   0.0,
+		"net_revenue":           metrics.TotalRevenue,
 	}
 
 	// Cache the results
@@ -362,26 +378,37 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 	for subIter.Next() {
 		sub := subIter.Subscription()
 
+		custID := ""
+		if sub.Customer != nil {
+			custID = sub.Customer.ID
+		}
+
 		switch sub.Status {
 		case stripe.SubscriptionStatusActive:
 			activeCount++
-			activeCustomers[sub.Customer.ID] = true
+			if custID != "" {
+				activeCustomers[custID] = true
+			}
 
 			// Calculate MRR from active subscriptions
 			if len(sub.Items.Data) > 0 {
 				item := sub.Items.Data[0]
-				amount := item.Price.UnitAmount * item.Quantity
+				if item.Price != nil {
+					amount := item.Price.UnitAmount * item.Quantity
 
-				// Normalize to monthly
-				switch item.Price.Recurring.Interval {
-				case stripe.PriceRecurringIntervalYear:
-					amount = amount / 12
-				case stripe.PriceRecurringIntervalWeek:
-					amount = amount * 4
-				case stripe.PriceRecurringIntervalDay:
-					amount = amount * 30
+					// Normalize to monthly
+					if item.Price.Recurring != nil {
+						switch item.Price.Recurring.Interval {
+						case stripe.PriceRecurringIntervalYear:
+							amount = amount / 12
+						case stripe.PriceRecurringIntervalWeek:
+							amount = amount * 4
+						case stripe.PriceRecurringIntervalDay:
+							amount = amount * 30
+						}
+					}
+					mrr += amount
 				}
-				mrr += amount
 			}
 
 		case stripe.SubscriptionStatusCanceled:
@@ -389,11 +416,15 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 
 		case stripe.SubscriptionStatusPastDue:
 			pastDueCount++
-			activeCustomers[sub.Customer.ID] = true
+			if custID != "" {
+				activeCustomers[custID] = true
+			}
 
 		case stripe.SubscriptionStatusTrialing:
 			trialingCount++
-			activeCustomers[sub.Customer.ID] = true
+			if custID != "" {
+				activeCustomers[custID] = true
+			}
 		}
 	}
 
@@ -419,7 +450,7 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 	chargeParams := &stripe.ChargeListParams{}
 	chargeParams.Limit = stripe.Int64(100)
 	thirtyDaysAgo := time.Now().AddDate(0, 0, -30).Unix()
-	chargeParams.Created = &thirtyDaysAgo
+	chargeParams.CreatedRange = &stripe.RangeQueryParams{GreaterThanOrEqual: thirtyDaysAgo}
 
 	var totalRevenue int64 = 0
 	chargeIter := sc.Charges.List(chargeParams)
@@ -536,7 +567,13 @@ func (s *StripeService) fetchLiveCustomers(sc *client.API) ([]StripeCustomerInfo
 	subIter := sc.Subscriptions.List(subParams)
 	for subIter.Next() {
 		sub := subIter.Subscription()
-		custID := sub.Customer.ID
+		custID := ""
+		if sub.Customer != nil {
+			custID = sub.Customer.ID
+		}
+		if custID == "" {
+			continue
+		}
 
 		if sub.Status == stripe.SubscriptionStatusActive {
 			customerStatus[custID] = "active"
@@ -544,18 +581,22 @@ func (s *StripeService) fetchLiveCustomers(sc *client.API) ([]StripeCustomerInfo
 
 			if len(sub.Items.Data) > 0 {
 				item := sub.Items.Data[0]
-				amount := float64(item.Price.UnitAmount*item.Quantity) / 100
+				if item.Price != nil {
+					amount := float64(item.Price.UnitAmount*item.Quantity) / 100
 
-				// Normalize to monthly
-				switch item.Price.Recurring.Interval {
-				case stripe.PriceRecurringIntervalYear:
-					amount = amount / 12
-				case stripe.PriceRecurringIntervalWeek:
-					amount = amount * 4
-				case stripe.PriceRecurringIntervalDay:
-					amount = amount * 30
+					// Normalize to monthly
+					if item.Price.Recurring != nil {
+						switch item.Price.Recurring.Interval {
+						case stripe.PriceRecurringIntervalYear:
+							amount = amount / 12
+						case stripe.PriceRecurringIntervalWeek:
+							amount = amount * 4
+						case stripe.PriceRecurringIntervalDay:
+							amount = amount * 30
+						}
+					}
+					customerMRR[custID] += amount
 				}
-				customerMRR[custID] += amount
 			}
 		} else if customerStatus[custID] == "" {
 			customerStatus[custID] = string(sub.Status)
@@ -672,18 +713,26 @@ func (s *StripeService) fetchLiveSubscriptions(sc *client.API, statusFilter stri
 
 		if len(sub.Items.Data) > 0 {
 			item := sub.Items.Data[0]
-			amount = float64(item.Price.UnitAmount*item.Quantity) / 100
-			currency = string(item.Price.Currency)
-			interval = string(item.Price.Recurring.Interval)
-
-			if item.Price.Product != nil {
-				productName = item.Price.Product.Name
+			if item.Price != nil {
+				amount = float64(item.Price.UnitAmount*item.Quantity) / 100
+				currency = string(item.Price.Currency)
+				if item.Price.Recurring != nil {
+					interval = string(item.Price.Recurring.Interval)
+				}
+				if item.Price.Product != nil {
+					productName = item.Price.Product.Name
+				}
 			}
+		}
+
+		custID := ""
+		if sub.Customer != nil {
+			custID = sub.Customer.ID
 		}
 
 		subscriptions = append(subscriptions, StripeSubscriptionInfo{
 			ID:                 sub.ID,
-			CustomerID:         sub.Customer.ID,
+			CustomerID:         custID,
 			CustomerEmail:      "", // Would need additional API call to get
 			Status:             string(sub.Status),
 			CurrentPeriodStart: time.Unix(sub.CurrentPeriodStart, 0),
@@ -737,25 +786,36 @@ func (s *StripeService) GetRevenueAnalyticsHandler(c *gin.Context) {
 
 	log.Printf("📡 Fetching live Stripe analytics for project %s", projectID)
 
-	// Get current metrics
-	metrics, err := s.fetchLiveMetrics(sc)
+	// Fetch complete time series with all fields the dashboard needs
+	timeSeries, err := s.fetchTimeSeries(sc, days)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"status": "error",
-			"error":  fmt.Sprintf("Failed to fetch metrics: %v", err),
+			"error":  fmt.Sprintf("Failed to fetch analytics: %v", err),
 		})
 		return
 	}
 
-	// Fetch daily revenue from charges
-	timeSeries, err := s.fetchDailyRevenue(sc, days)
+	// Also get current summary metrics
+	metrics, err := s.fetchLiveMetrics(sc)
 	if err != nil {
-		log.Printf("Warning: Failed to fetch daily revenue: %v", err)
-		timeSeries = []map[string]interface{}{} // Empty array on error
+		log.Printf("Warning: Failed to fetch summary metrics: %v", err)
+	}
+
+	summary := map[string]interface{}{}
+	if metrics != nil {
+		summary = map[string]interface{}{
+			"current_mrr":            metrics.MRR,
+			"current_arr":            metrics.ARR,
+			"active_subscriptions":   metrics.ActiveSubscriptions,
+			"churn_rate":             metrics.ChurnRate,
+			"arpu":                   metrics.ARPU,
+			"trial_conversion_rate":  metrics.TrialToPayConversionRate,
+		}
 	}
 
 	response := map[string]interface{}{
-		"summary":     metrics,
+		"summary":     summary,
 		"time_series": timeSeries,
 		"date_range": map[string]string{
 			"start": time.Now().AddDate(0, 0, -days).Format("2006-01-02"),
@@ -773,40 +833,163 @@ func (s *StripeService) GetRevenueAnalyticsHandler(c *gin.Context) {
 	})
 }
 
-// fetchDailyRevenue fetches daily revenue from charges
-func (s *StripeService) fetchDailyRevenue(sc *client.API, days int) ([]map[string]interface{}, error) {
+// fetchTimeSeries builds a complete daily time series with mrr, revenue,
+// active_subscriptions, churn_rate, and arpu from live Stripe data.
+func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]interface{}, error) {
 	startDate := time.Now().AddDate(0, 0, -days)
+	startUnix := startDate.Unix()
 
-	// Group revenue by day
+	// ── 1. Daily revenue from charges ──
 	dailyRevenue := make(map[string]int64)
+	chargeParams := &stripe.ChargeListParams{}
+	chargeParams.Limit = stripe.Int64(100)
+	chargeParams.CreatedRange = &stripe.RangeQueryParams{GreaterThanOrEqual: startUnix}
 
-	params := &stripe.ChargeListParams{}
-	params.Limit = stripe.Int64(100)
-	created := startDate.Unix()
-	params.Created = &created
+	chargeIter := sc.Charges.List(chargeParams)
+	for chargeIter.Next() {
+		ch := chargeIter.Charge()
+		if ch.Paid && !ch.Refunded {
+			day := time.Unix(ch.Created, 0).Format("2006-01-02")
+			dailyRevenue[day] += ch.Amount - ch.AmountRefunded
+		}
+	}
+	if err := chargeIter.Err(); err != nil {
+		log.Printf("Warning: failed to fetch charges for time series: %v", err)
+	}
 
-	iter := sc.Charges.List(params)
-	for iter.Next() {
-		charge := iter.Charge()
-		if charge.Paid && !charge.Refunded {
-			day := time.Unix(charge.Created, 0).Format("2006-01-02")
-			dailyRevenue[day] += charge.Amount - charge.AmountRefunded
+	// ── 2. Subscription events: created / canceled dates ──
+	type subEvent struct {
+		createdDay   string
+		canceledDay  string
+		monthlyAmt   int64 // in cents, normalized to monthly
+		isActive     bool
+		isCanceled   bool
+	}
+	var subs []subEvent
+
+	subParams := &stripe.SubscriptionListParams{Status: "all"}
+	subParams.Limit = stripe.Int64(100)
+	subIter := sc.Subscriptions.List(subParams)
+	for subIter.Next() {
+		sub := subIter.Subscription()
+
+		var monthlyAmt int64
+		if len(sub.Items.Data) > 0 {
+			item := sub.Items.Data[0]
+			if item.Price != nil {
+				amount := item.Price.UnitAmount * item.Quantity
+				if item.Price.Recurring != nil {
+					switch item.Price.Recurring.Interval {
+					case stripe.PriceRecurringIntervalYear:
+						amount = amount / 12
+					case stripe.PriceRecurringIntervalWeek:
+						amount = amount * 4
+					case stripe.PriceRecurringIntervalDay:
+						amount = amount * 30
+					}
+				}
+				monthlyAmt = amount
+			}
+		}
+
+		ev := subEvent{
+			createdDay: time.Unix(sub.Created, 0).Format("2006-01-02"),
+			monthlyAmt: monthlyAmt,
+			isActive:   sub.Status == stripe.SubscriptionStatusActive || sub.Status == stripe.SubscriptionStatusTrialing,
+			isCanceled: sub.Status == stripe.SubscriptionStatusCanceled,
+		}
+		if sub.CanceledAt > 0 {
+			ev.canceledDay = time.Unix(sub.CanceledAt, 0).Format("2006-01-02")
+		}
+		subs = append(subs, ev)
+	}
+	if err := subIter.Err(); err != nil {
+		log.Printf("Warning: failed to fetch subscriptions for time series: %v", err)
+	}
+
+	// ── 3. Customer count by creation date ──
+	dailyNewCustomers := make(map[string]int)
+	custParams := &stripe.CustomerListParams{}
+	custParams.Limit = stripe.Int64(100)
+	custIter := sc.Customers.List(custParams)
+	for custIter.Next() {
+		cust := custIter.Customer()
+		day := time.Unix(cust.Created, 0).Format("2006-01-02")
+		dailyNewCustomers[day]++
+	}
+	if err := custIter.Err(); err != nil {
+		log.Printf("Warning: failed to fetch customers for time series: %v", err)
+	}
+
+	// ── 4. Build daily time series ──
+	// Sort all customer creation dates to compute cumulative count
+	var allCustomerDays []string
+	for day := range dailyNewCustomers {
+		allCustomerDays = append(allCustomerDays, day)
+	}
+
+	// Count customers created before the time window
+	customersBeforeWindow := 0
+	windowStart := startDate.Format("2006-01-02")
+	custParams2 := &stripe.CustomerListParams{}
+	custParams2.Limit = stripe.Int64(100)
+	custIter2 := sc.Customers.List(custParams2)
+	for custIter2.Next() {
+		cust := custIter2.Customer()
+		day := time.Unix(cust.Created, 0).Format("2006-01-02")
+		if day < windowStart {
+			customersBeforeWindow++
 		}
 	}
 
-	if err := iter.Err(); err != nil {
-		return nil, err
-	}
+	cumulativeCustomers := customersBeforeWindow
 
-	// Convert to sorted time series
 	var timeSeries []map[string]interface{}
-	for i := 0; i < days; i++ {
+	for i := 0; i <= days; i++ { // include today
 		day := startDate.AddDate(0, 0, i).Format("2006-01-02")
+
+		// Accumulate customers
+		cumulativeCustomers += dailyNewCustomers[day]
+
+		// Count active subs and MRR as of end of this day
+		activeSubs := 0
+		canceledOnDay := 0
+		var mrrCents int64
+		for _, sub := range subs {
+			createdBefore := sub.createdDay <= day
+			canceledAfter := sub.canceledDay == "" || sub.canceledDay > day
+			if createdBefore && canceledAfter {
+				activeSubs++
+				mrrCents += sub.monthlyAmt
+			}
+			if sub.canceledDay == day {
+				canceledOnDay++
+			}
+		}
+
+		mrr := float64(mrrCents) / 100
 		revenue := float64(dailyRevenue[day]) / 100
 
+		churnRate := 0.0
+		if activeSubs+canceledOnDay > 0 {
+			churnRate = float64(canceledOnDay) / float64(activeSubs+canceledOnDay) * 100
+		}
+
+		arpu := 0.0
+		if activeSubs > 0 {
+			arpu = mrr / float64(activeSubs)
+		}
+
 		timeSeries = append(timeSeries, map[string]interface{}{
-			"date":    day,
-			"revenue": revenue,
+			"date":                 day,
+			"mrr":                  mrr,
+			"arr":                  mrr * 12,
+			"revenue":              revenue,
+			"active_subscriptions": activeSubs,
+			"churn_rate":           churnRate,
+			"arpu":                 arpu,
+			"new_customers":        dailyNewCustomers[day],
+			"total_customers":      cumulativeCustomers,
 		})
 	}
 
@@ -963,5 +1146,143 @@ func (s *StripeService) SyncStripeDataHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Stripe connection verified. Data is now fetched live from Stripe API with caching.",
 		"note":    "Manual sync is no longer needed. Metrics are calculated in real-time.",
+	})
+}
+
+// TestStripeTimeSeriesHandler is a debug endpoint that returns raw data from Stripe (no cache).
+func (s *StripeService) TestStripeTimeSeriesHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	accountID, exists := c.Get("account_id")
+	if !exists || accountID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	sc, err := s.getStripeClient(projectID, accountID.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Raw subscription dump (all statuses)
+	var rawSubs []map[string]interface{}
+
+	// Fetch active subscriptions
+	subParams := &stripe.SubscriptionListParams{}
+	subParams.Limit = stripe.Int64(100)
+	subIter := sc.Subscriptions.List(subParams)
+	for subIter.Next() {
+		sub := subIter.Subscription()
+		var amount int64
+		var interval string
+		if len(sub.Items.Data) > 0 {
+			item := sub.Items.Data[0]
+			if item.Price != nil {
+				amount = item.Price.UnitAmount * item.Quantity
+				if item.Price.Recurring != nil {
+					interval = string(item.Price.Recurring.Interval)
+				}
+			}
+		}
+		custID := ""
+		if sub.Customer != nil {
+			custID = sub.Customer.ID
+		}
+		rawSubs = append(rawSubs, map[string]interface{}{
+			"id":         sub.ID,
+			"status":     string(sub.Status),
+			"created":    time.Unix(sub.Created, 0).Format(time.RFC3339),
+			"amount":     amount,
+			"interval":   interval,
+			"customer":   custID,
+			"canceled_at": sub.CanceledAt,
+		})
+	}
+	subErr := ""
+	if subIter.Err() != nil {
+		subErr = subIter.Err().Error()
+	}
+
+	// Also fetch canceled/all subscriptions
+	subParamsAll := &stripe.SubscriptionListParams{Status: "all"}
+	subParamsAll.Limit = stripe.Int64(100)
+	subIterAll := sc.Subscriptions.List(subParamsAll)
+	var allSubCount int
+	for subIterAll.Next() {
+		allSubCount++
+		sub := subIterAll.Subscription()
+		// Only add if not already in rawSubs (i.e., non-active)
+		if sub.Status != stripe.SubscriptionStatusActive {
+			var amount int64
+			var interval string
+			if len(sub.Items.Data) > 0 {
+				item := sub.Items.Data[0]
+				if item.Price != nil {
+					amount = item.Price.UnitAmount * item.Quantity
+					if item.Price.Recurring != nil {
+						interval = string(item.Price.Recurring.Interval)
+					}
+				}
+			}
+			custID := ""
+			if sub.Customer != nil {
+				custID = sub.Customer.ID
+			}
+			rawSubs = append(rawSubs, map[string]interface{}{
+				"id":          sub.ID,
+				"status":      string(sub.Status),
+				"created":     time.Unix(sub.Created, 0).Format(time.RFC3339),
+				"amount":      amount,
+				"interval":    interval,
+				"customer":    custID,
+				"canceled_at": sub.CanceledAt,
+			})
+		}
+	}
+	allSubErr := ""
+	if subIterAll.Err() != nil {
+		allSubErr = subIterAll.Err().Error()
+	}
+
+	// Raw charge dump
+	var rawCharges []map[string]interface{}
+	chargeParams := &stripe.ChargeListParams{}
+	chargeParams.Limit = stripe.Int64(100)
+	chargeIter := sc.Charges.List(chargeParams)
+	for chargeIter.Next() {
+		ch := chargeIter.Charge()
+		rawCharges = append(rawCharges, map[string]interface{}{
+			"id":       ch.ID,
+			"amount":   ch.Amount,
+			"paid":     ch.Paid,
+			"refunded": ch.Refunded,
+			"created":  time.Unix(ch.Created, 0).Format(time.RFC3339),
+			"customer": func() string { if ch.Customer != nil { return ch.Customer.ID }; return "" }(),
+		})
+	}
+	chargeErr := ""
+	if chargeIter.Err() != nil {
+		chargeErr = chargeIter.Err().Error()
+	}
+
+	timeSeries, tsErr := s.fetchTimeSeries(sc, 30)
+	tsErrStr := ""
+	if tsErr != nil {
+		tsErrStr = tsErr.Error()
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"raw_subscriptions":           rawSubs,
+		"raw_subscriptions_count":     len(rawSubs),
+		"raw_subscriptions_error":     subErr,
+		"all_subscriptions_count":     allSubCount,
+		"all_subscriptions_error":     allSubErr,
+		"raw_charges":                 rawCharges,
+		"raw_charges_count":           len(rawCharges),
+		"raw_charges_error":           chargeErr,
+		"time_series_count":           len(timeSeries),
+		"time_series":                 timeSeries,
+		"time_series_error":           tsErrStr,
 	})
 }
