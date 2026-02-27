@@ -126,6 +126,21 @@ func (c *BoundedCache[V]) Len() int {
 	return c.order.Len()
 }
 
+// DeleteByPrefix removes all entries whose key starts with the given prefix.
+func (c *BoundedCache[V]) DeleteByPrefix(prefix string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	deleted := 0
+	for key := range c.entries {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			c.removeLocked(key)
+			deleted++
+		}
+	}
+	return deleted
+}
+
 func (c *BoundedCache[V]) removeLocked(key string) {
 	elem, exists := c.entries[key]
 	if !exists {

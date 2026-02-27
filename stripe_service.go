@@ -16,8 +16,10 @@ import (
 
 // StripeService handles all Stripe-related operations with live data fetching
 type StripeService struct {
-	db    *gorm.DB
-	cache *StripeCache
+	db               *gorm.DB
+	cache            *StripeCache
+	projectListCache *BoundedCache[[]Project]
+	responseCache    *BoundedCache[*CachedResponse]
 }
 
 // StripeCache provides in-memory caching for Stripe data
@@ -89,6 +91,25 @@ func (c *StripeCache) invalidateProject(projectID string) {
 		if len(key) > len(projectID) && key[:len(projectID)] == projectID {
 			delete(c.entries, key)
 		}
+	}
+}
+
+// invalidateAllCaches clears all cached data for a project across all cache layers
+func (s *StripeService) invalidateAllCaches(projectID, accountID string) {
+	// 1. Invalidate Stripe service cache
+	s.cache.invalidateProject(projectID)
+
+	// 2. Invalidate HTTP response cache for stripe endpoints
+	if s.responseCache != nil {
+		// Response cache keys use format: resp:/api/v1/projects/<projectID>/stripe/...:projectID:accountID:...
+		prefix := fmt.Sprintf("resp:/api/v1/projects/%s/stripe/", projectID)
+		s.responseCache.DeleteByPrefix(prefix)
+	}
+
+	// 3. Invalidate project list cache so frontend picks up hasStripeKey change
+	if s.projectListCache != nil {
+		cacheKey := fmt.Sprintf("account_projects:%s", accountID)
+		s.projectListCache.Delete(cacheKey)
 	}
 }
 
@@ -222,8 +243,8 @@ func (s *StripeService) UpdateStripeAPIKeyHandler(c *gin.Context) {
 		return
 	}
 
-	// Invalidate cache for this project
-	s.cache.invalidateProject(projectID)
+	// Invalidate ALL cache layers for this project
+	s.invalidateAllCaches(projectID, accountID.(string))
 
 	c.JSON(http.StatusOK, gin.H{"message": "Stripe API key updated successfully"})
 }
@@ -897,8 +918,8 @@ func (s *StripeService) RefreshCacheHandler(c *gin.Context) {
 		return
 	}
 
-	// Invalidate all caches for this project
-	s.cache.invalidateProject(projectID)
+	// Invalidate ALL cache layers for this project
+	s.invalidateAllCaches(projectID, accountID.(string))
 
 	log.Printf("🗑️ Cleared Stripe cache for project %s", projectID)
 
@@ -936,8 +957,8 @@ func (s *StripeService) SyncStripeDataHandler(c *gin.Context) {
 		return
 	}
 
-	// Clear cache to force fresh data
-	s.cache.invalidateProject(projectID)
+	// Clear ALL cache layers to force fresh data
+	s.invalidateAllCaches(projectID, accountID.(string))
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Stripe connection verified. Data is now fetched live from Stripe API with caching.",

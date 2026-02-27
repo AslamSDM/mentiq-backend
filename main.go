@@ -189,6 +189,10 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		eventLimiter:             NewRateLimiter(5000, 1*time.Minute),
 	}
 
+	// Give StripeService access to caches for invalidation on key update
+	server.stripeService.projectListCache = server.projectListCache
+	server.stripeService.responseCache = server.responseCache
+
 	// Start background workers
 	playbookExecutor.Start()
 	triggerEvaluator.Start()
@@ -766,7 +770,7 @@ func main() {
 		apiV1.GET("/projects/:project_id/apikeys", server.listApiKeysHandler)
 		apiV1.PUT("/projects/:project_id/apikeys/:key_id", server.updateApiKeyHandler)
 		apiV1.DELETE("/projects/:project_id/apikeys/:key_id", server.deleteApiKeyHandler)
-		apiV1.PUT("/projects/:project_id/stripe-key", server.updateProjectStripeApiKeyHandler)
+		apiV1.PUT("/projects/:project_id/stripe-key", server.stripeService.UpdateStripeAPIKeyHandler)
 
 		// Project Member management
 		apiV1.POST("/projects/:project_id/members", server.addProjectMemberHandler)
@@ -2795,11 +2799,12 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 		var response []gin.H
 		for _, project := range projects {
 			response = append(response, gin.H{
-				"id":        project.ID,
-				"name":      project.Name,
-				"accountId": project.AccountID,
-				"createdAt": project.CreatedAt,
-				"updatedAt": project.UpdatedAt,
+				"id":            project.ID,
+				"name":          project.Name,
+				"accountId":     project.AccountID,
+				"createdAt":     project.CreatedAt,
+				"updatedAt":     project.UpdatedAt,
+				"hasStripeKey":  project.StripeAPIKey != "",
 			})
 		}
 		c.JSON(http.StatusOK, response)
@@ -2819,11 +2824,12 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 	var response []gin.H
 	for _, project := range projects {
 		response = append(response, gin.H{
-			"id":        project.ID,
-			"name":      project.Name,
-			"accountId": project.AccountID,
-			"createdAt": project.CreatedAt,
-			"updatedAt": project.UpdatedAt,
+			"id":            project.ID,
+			"name":          project.Name,
+			"accountId":     project.AccountID,
+			"createdAt":     project.CreatedAt,
+			"updatedAt":     project.UpdatedAt,
+			"hasStripeKey":  project.StripeAPIKey != "",
 		})
 	}
 
