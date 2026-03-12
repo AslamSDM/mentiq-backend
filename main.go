@@ -985,6 +985,7 @@ func main() {
 		// Admin Waitlist routes
 		adminAPI.GET("/waitlist", server.getWaitlistHandler)
 		adminAPI.POST("/waitlist/:id/grant-access", server.grantWaitlistAccessHandler)
+		adminAPI.DELETE("/waitlist/:id", server.deleteWaitlistHandler)
 	}
 
 	// Setup graceful shutdown
