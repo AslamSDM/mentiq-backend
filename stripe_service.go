@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"math"
+
 	"github.com/stripe/stripe-go/v72"
 	"github.com/stripe/stripe-go/v72/client"
 	"github.com/stripe/stripe-go/v72/customer"
@@ -127,6 +129,10 @@ type StripeMetrics struct {
 	ChurnRate                float64   `json:"churn_rate"`
 	ARPU                     float64   `json:"arpu"`
 	TrialToPayConversionRate float64   `json:"trial_to_pay_conversion_rate"`
+	ExpansionMRR             float64   `json:"expansion_mrr"`
+	DowngradeMRR             float64   `json:"downgrade_mrr"`
+	ChurnedMRR               float64   `json:"churned_mrr"`
+	NetRevenueChurn          float64   `json:"net_revenue_churn"`
 	LastUpdated              time.Time `json:"last_updated"`
 }
 
@@ -342,9 +348,13 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 		"growth_rate":           0.0,
 		"new_subscriptions":     newSubs,
 		"churned_subscriptions": metrics.CanceledSubscriptions,
-		"expansion_revenue":     0.0,
-		"contraction_revenue":   0.0,
+		"expansion_revenue":     metrics.ExpansionMRR,
+		"contraction_revenue":   metrics.DowngradeMRR,
 		"net_revenue":           metrics.TotalRevenue,
+		"expansion_mrr":         metrics.ExpansionMRR,
+		"downgrade_mrr":         metrics.DowngradeMRR,
+		"churned_mrr":           metrics.ChurnedMRR,
+		"net_revenue_churn":     metrics.NetRevenueChurn,
 	}
 
 	// Cache the results
@@ -493,6 +503,117 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 	totalTrials := trialingCount + convertedTrials
 	if totalTrials > 0 {
 		metrics.TrialToPayConversionRate = float64(convertedTrials) / float64(totalTrials) * 100
+	}
+
+	// Calculate Expansion MRR, Downgrade MRR, and Churned MRR using invoices
+	// Fetch invoices from last 60 days to compare billing periods
+	sixtyDaysAgo := time.Now().AddDate(0, 0, -60).Unix()
+	invParams := &stripe.InvoiceListParams{}
+	invParams.Limit = stripe.Int64(100)
+	invParams.CreatedRange = &stripe.RangeQueryParams{GreaterThanOrEqual: sixtyDaysAgo}
+
+	// Group invoice amounts by customer+subscription, sorted by date
+	type invoiceRecord struct {
+		Amount    int64
+		Created   int64
+		SubID     string
+	}
+	customerSubInvoices := make(map[string][]invoiceRecord) // key: custID:subID
+
+	invIter := sc.Invoices.List(invParams)
+	for invIter.Next() {
+		inv := invIter.Invoice()
+		if inv.Status != "paid" || inv.Total <= 0 {
+			continue
+		}
+		custID := ""
+		if inv.Customer != nil {
+			custID = inv.Customer.ID
+		}
+		subID := ""
+		if inv.Subscription != nil {
+			subID = inv.Subscription.ID
+		}
+		if custID == "" || subID == "" {
+			continue
+		}
+		key := custID + ":" + subID
+		customerSubInvoices[key] = append(customerSubInvoices[key], invoiceRecord{
+			Amount:  inv.Total,
+			Created: inv.Created,
+			SubID:   subID,
+		})
+	}
+	if err := invIter.Err(); err != nil {
+		log.Printf("Warning: Failed to fetch invoices for MRR movements: %v", err)
+	}
+
+	// Compare most recent vs previous invoice per customer+subscription
+	var expansionCents, downgradeCents int64
+	for _, records := range customerSubInvoices {
+		if len(records) < 2 {
+			continue
+		}
+		// Sort by created date (most recent first) - simple bubble for small slices
+		for i := 0; i < len(records); i++ {
+			for j := i + 1; j < len(records); j++ {
+				if records[j].Created > records[i].Created {
+					records[i], records[j] = records[j], records[i]
+				}
+			}
+		}
+		current := records[0].Amount
+		previous := records[1].Amount
+		diff := current - previous
+		if diff > 0 {
+			expansionCents += diff
+		} else if diff < 0 {
+			downgradeCents += -diff
+		}
+	}
+
+	metrics.ExpansionMRR = float64(expansionCents) / 100
+	metrics.DowngradeMRR = float64(downgradeCents) / 100
+
+	// Churned MRR: sum of monthly amounts from canceled subscriptions
+	// Re-iterate subscriptions to get canceled ones with amounts
+	canceledSubParams := &stripe.SubscriptionListParams{Status: "canceled"}
+	canceledSubParams.Limit = stripe.Int64(100)
+	var churnedCents int64
+	cancelIter := sc.Subscriptions.List(canceledSubParams)
+	for cancelIter.Next() {
+		sub := cancelIter.Subscription()
+		// Only count subscriptions canceled in last 30 days
+		if sub.CanceledAt > 0 && sub.CanceledAt >= thirtyDaysAgo {
+			if len(sub.Items.Data) > 0 {
+				item := sub.Items.Data[0]
+				if item.Price != nil {
+					amount := item.Price.UnitAmount * item.Quantity
+					if item.Price.Recurring != nil {
+						switch item.Price.Recurring.Interval {
+						case stripe.PriceRecurringIntervalYear:
+							amount = amount / 12
+						case stripe.PriceRecurringIntervalWeek:
+							amount = amount * 4
+						case stripe.PriceRecurringIntervalDay:
+							amount = amount * 30
+						}
+					}
+					churnedCents += amount
+				}
+			}
+		}
+	}
+	if err := cancelIter.Err(); err != nil {
+		log.Printf("Warning: Failed to fetch canceled subscriptions: %v", err)
+	}
+
+	metrics.ChurnedMRR = float64(churnedCents) / 100
+
+	// Net Revenue Churn = (ChurnedMRR + DowngradeMRR - ExpansionMRR) / StartingMRR * 100
+	startingMRR := metrics.MRR + metrics.ChurnedMRR + metrics.DowngradeMRR - metrics.ExpansionMRR
+	if startingMRR > 0 {
+		metrics.NetRevenueChurn = (metrics.ChurnedMRR + metrics.DowngradeMRR - metrics.ExpansionMRR) / startingMRR * 100
 	}
 
 	return metrics, nil
@@ -921,13 +1042,86 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 		log.Printf("Warning: failed to fetch customers for time series: %v", err)
 	}
 
-	// ── 4. Build daily time series ──
-	// Sort all customer creation dates to compute cumulative count
-	var allCustomerDays []string
-	for day := range dailyNewCustomers {
-		allCustomerDays = append(allCustomerDays, day)
+	// ── 4. Fetch invoices for MRR movement detection ──
+	type invoiceRecord struct {
+		Amount  int64
+		Created int64
+		Day     string
+		SubID   string
+		CustID  string
+	}
+	// Group invoices by customer:subscription
+	customerSubInvoices := make(map[string][]invoiceRecord)
+
+	invParams := &stripe.InvoiceListParams{}
+	invParams.Limit = stripe.Int64(100)
+	invParams.CreatedRange = &stripe.RangeQueryParams{GreaterThanOrEqual: startUnix}
+
+	invIter := sc.Invoices.List(invParams)
+	for invIter.Next() {
+		inv := invIter.Invoice()
+		if inv.Status != "paid" || inv.Total <= 0 {
+			continue
+		}
+		custID := ""
+		if inv.Customer != nil {
+			custID = inv.Customer.ID
+		}
+		subID := ""
+		if inv.Subscription != nil {
+			subID = inv.Subscription.ID
+		}
+		if custID == "" || subID == "" {
+			continue
+		}
+		key := custID + ":" + subID
+		customerSubInvoices[key] = append(customerSubInvoices[key], invoiceRecord{
+			Amount:  inv.Total,
+			Created: inv.Created,
+			Day:     time.Unix(inv.Created, 0).Format("2006-01-02"),
+			SubID:   subID,
+			CustID:  custID,
+		})
+	}
+	if err := invIter.Err(); err != nil {
+		log.Printf("Warning: failed to fetch invoices for time series: %v", err)
 	}
 
+	// Pre-compute daily expansion and downgrade from invoice comparisons
+	dailyExpansion := make(map[string]int64)
+	dailyDowngrade := make(map[string]int64)
+	for _, records := range customerSubInvoices {
+		if len(records) < 2 {
+			continue
+		}
+		// Sort by created ascending
+		for i := 0; i < len(records); i++ {
+			for j := i + 1; j < len(records); j++ {
+				if records[j].Created < records[i].Created {
+					records[i], records[j] = records[j], records[i]
+				}
+			}
+		}
+		for k := 1; k < len(records); k++ {
+			diff := records[k].Amount - records[k-1].Amount
+			day := records[k].Day
+			if diff > 0 {
+				dailyExpansion[day] += diff
+			} else if diff < 0 {
+				dailyDowngrade[day] += -diff
+			}
+		}
+	}
+
+	// Pre-compute daily churned MRR from canceled subscriptions
+	dailyChurnedMRR := make(map[string]int64)
+	for _, sub := range subs {
+		if sub.isCanceled && sub.canceledDay != "" {
+			dailyChurnedMRR[sub.canceledDay] += sub.monthlyAmt
+		}
+	}
+
+	// ── 5. Build daily time series ──
 	// Count customers created before the time window
 	customersBeforeWindow := 0
 	windowStart := startDate.Format("2006-01-02")
@@ -980,6 +1174,15 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 			arpu = mrr / float64(activeSubs)
 		}
 
+		expansionMRR := float64(dailyExpansion[day]) / 100
+		downgradeMRR := float64(dailyDowngrade[day]) / 100
+		churnedMRR := float64(dailyChurnedMRR[day]) / 100
+
+		netRevChurn := 0.0
+		if mrr+churnedMRR+downgradeMRR-expansionMRR > 0 {
+			netRevChurn = (churnedMRR + downgradeMRR - expansionMRR) / (mrr + churnedMRR + downgradeMRR - expansionMRR) * 100
+		}
+
 		timeSeries = append(timeSeries, map[string]interface{}{
 			"date":                 day,
 			"mrr":                  mrr,
@@ -990,6 +1193,10 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 			"arpu":                 arpu,
 			"new_customers":        dailyNewCustomers[day],
 			"total_customers":      cumulativeCustomers,
+			"expansion_mrr":        expansionMRR,
+			"downgrade_mrr":        downgradeMRR,
+			"churned_mrr":          churnedMRR,
+			"net_revenue_churn":    math.Round(netRevChurn*100) / 100,
 		})
 	}
 
