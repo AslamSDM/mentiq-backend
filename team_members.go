@@ -24,7 +24,7 @@ func (s *Server) listAccountMembersHandler(c *gin.Context) {
 
 	// Get account subscription to return tier limits
 	var subscription AccountSubscription
-	tier := "launch"
+	tier := "starter"
 	if err := s.db.Where("account_id = ?", accountID).First(&subscription).Error; err == nil {
 		tier = subscription.Tier
 	}

@@ -233,10 +233,13 @@ func (e *AutomationExecutor) processChurnPrevention(automation *AutomationSettin
 			continue
 		}
 
-		// Update execution as sent
+		// Update execution as sent — store the full email content
 		now := time.Now()
 		execution.Status = "sent"
 		execution.SentAt = &now
+		execution.EmailSubject = content.Subject
+		execution.EmailHTML = content.HTMLContent
+		execution.EmailPlainText = content.PlainText
 		execution.ExecutionResult = map[string]interface{}{
 			"subject":        content.Subject,
 			"content_length": len(content.HTMLContent),
@@ -371,10 +374,13 @@ func (e *AutomationExecutor) processFeatureAdoption(automation *AutomationSettin
 			continue
 		}
 
-		// Update execution as sent
+		// Update execution as sent — store the full email content
 		now := time.Now()
 		execution.Status = "sent"
 		execution.SentAt = &now
+		execution.EmailSubject = content.Subject
+		execution.EmailHTML = content.HTMLContent
+		execution.EmailPlainText = content.PlainText
 		execution.ExecutionResult = map[string]interface{}{
 			"subject":        content.Subject,
 			"content_length": len(content.HTMLContent),
@@ -512,10 +518,13 @@ func (e *AutomationExecutor) processEngagement(automation *AutomationSettings) {
 			continue
 		}
 
-		// Update execution as sent
+		// Update execution as sent — store the full email content
 		now := time.Now()
 		execution.Status = "sent"
 		execution.SentAt = &now
+		execution.EmailSubject = content.Subject
+		execution.EmailHTML = content.HTMLContent
+		execution.EmailPlainText = content.PlainText
 		execution.ExecutionResult = map[string]interface{}{
 			"subject":        content.Subject,
 			"content_length": len(content.HTMLContent),

@@ -9,20 +9,22 @@ import (
 
 // AutomationRequest represents request payload for creating automation settings
 type AutomationRequest struct {
-	Name        string                 `json:"name" binding:"required"`
-	Description string                 `json:"description"`
-	Type        string                 `json:"type" binding:"required,oneof=churn_prevention feature_adoption engagement"`
-	Config      map[string]interface{} `json:"config"`
-	IsEnabled   bool                   `json:"is_enabled"`
+	Name         string                 `json:"name" binding:"required"`
+	Description  string                 `json:"description"`
+	Type         string                 `json:"type" binding:"required,oneof=churn_prevention feature_adoption engagement"`
+	Config       map[string]interface{} `json:"config"`
+	IsEnabled    bool                   `json:"is_enabled"`
+	CustomPrompt string                 `json:"custom_prompt"`
 }
 
 // AutomationUpdateRequest represents request payload for updating automation settings (all fields optional)
 type AutomationUpdateRequest struct {
-	Name        *string                `json:"name"`
-	Description *string                `json:"description"`
-	Type        *string                `json:"type"`
-	Config      map[string]interface{} `json:"config"`
-	IsEnabled   *bool                  `json:"is_enabled"`
+	Name         *string                `json:"name"`
+	Description  *string                `json:"description"`
+	Type         *string                `json:"type"`
+	Config       map[string]interface{} `json:"config"`
+	IsEnabled    *bool                  `json:"is_enabled"`
+	CustomPrompt *string                `json:"custom_prompt"`
 }
 
 // EmailTemplateRequest represents request payload for email templates
@@ -78,15 +80,16 @@ func (s *Server) createAutomationHandler(c *gin.Context) {
 	}
 
 	automation := &AutomationSettings{
-		ID:          uuid.New().String(),
-		ProjectID:   projectID,
-		Name:        req.Name,
-		Description: req.Description,
-		Type:        req.Type,
-		IsEnabled:   req.IsEnabled,
-		Config:      req.Config,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		ID:           uuid.New().String(),
+		ProjectID:    projectID,
+		Name:         req.Name,
+		Description:  req.Description,
+		Type:         req.Type,
+		IsEnabled:    req.IsEnabled,
+		Config:       req.Config,
+		CustomPrompt: req.CustomPrompt,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
 
 	if err := s.db.Create(automation).Error; err != nil {
@@ -167,6 +170,9 @@ func (s *Server) updateAutomationHandler(c *gin.Context) {
 	}
 	if req.Config != nil {
 		automation.Config = req.Config
+	}
+	if req.CustomPrompt != nil {
+		automation.CustomPrompt = *req.CustomPrompt
 	}
 	automation.UpdatedAt = time.Now()
 
@@ -564,6 +570,9 @@ func (s *Server) testAutomationHandler(c *gin.Context) {
 			},
 		}
 
+		// Use custom prompt from automation if available
+		genReq.CustomPrompt = automation.CustomPrompt
+
 		content, err := s.automationService.GenerateEmailContent(genReq)
 		if err == nil {
 			emailContent = map[string]string{
@@ -571,7 +580,10 @@ func (s *Server) testAutomationHandler(c *gin.Context) {
 				"html":    content.HTMLContent,
 				"text":    content.PlainText,
 			}
-			// Update execution with generated content
+			// Store the full email content on the execution record
+			execution.EmailSubject = content.Subject
+			execution.EmailHTML = content.HTMLContent
+			execution.EmailPlainText = content.PlainText
 			execution.Personalization["generated_subject"] = content.Subject
 			execution.Personalization["generated_body"] = content.HTMLContent
 			s.db.Save(&execution)
@@ -582,5 +594,133 @@ func (s *Server) testAutomationHandler(c *gin.Context) {
 		"message":       "Test execution created",
 		"execution":     execution,
 		"email_content": emailContent,
+	})
+}
+
+// =====================
+// SINGLE EXECUTION & PREVIEW API
+// =====================
+
+// getAutomationExecutionHandler returns a single execution with its stored email content
+func (s *Server) getAutomationExecutionHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	executionID := c.Param("execution_id")
+
+	if projectID == "" || executionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Project ID and Execution ID are required"})
+		return
+	}
+
+	var execution AutomationExecution
+	if err := s.db.Where("id = ? AND project_id = ?", executionID, projectID).
+		Preload("Automation").First(&execution).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Execution not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, execution)
+}
+
+// previewEmailHandler generates a preview email using the automation's prompt (or a custom one)
+// without creating an execution record
+func (s *Server) previewEmailHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+	automationID := c.Param("automation_id")
+
+	if projectID == "" || automationID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Project ID and Automation ID are required"})
+		return
+	}
+
+	var req struct {
+		CustomPrompt string `json:"custom_prompt"`
+		UserName     string `json:"user_name"`
+		UserEmail    string `json:"user_email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var automation AutomationSettings
+	if err := s.db.Where("id = ? AND project_id = ?", automationID, projectID).First(&automation).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Automation not found"})
+		return
+	}
+
+	if s.automationService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI generation not available"})
+		return
+	}
+
+	// Use the provided prompt for preview, fall back to automation's saved prompt
+	promptToUse := req.CustomPrompt
+	if promptToUse == "" {
+		promptToUse = automation.CustomPrompt
+	}
+
+	// Default sample user data
+	userName := req.UserName
+	if userName == "" {
+		userName = "Jane Doe"
+	}
+	userEmail := req.UserEmail
+	if userEmail == "" {
+		userEmail = "jane@example.com"
+	}
+
+	genReq := GenerateEmailContentRequest{
+		TemplateType: automation.Type,
+		UserContext: map[string]interface{}{
+			"name":             userName,
+			"email":            userEmail,
+			"churn_risk_score": 75.0,
+			"last_active_days": 14,
+		},
+		ProductContext: map[string]interface{}{
+			"product_name": "Your Product",
+		},
+		Personalization: map[string]interface{}{
+			"discount_code":    "PREVIEW20",
+			"discount_percent": 20,
+			"user_name":        userName,
+		},
+		PersonalizationVars: []string{"user_name", "discount_code", "discount_percent", "product_name"},
+		CustomPrompt:        promptToUse,
+	}
+
+	content, err := s.automationService.GenerateEmailContent(genReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate preview: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"subject":    content.Subject,
+		"html":       content.HTMLContent,
+		"plain_text": content.PlainText,
+		"prompt_used": promptToUse,
+	})
+}
+
+// getDefaultPromptHandler returns the default system prompt for an automation type
+func (s *Server) getDefaultPromptHandler(c *gin.Context) {
+	automationType := c.Param("type")
+
+	prompts := map[string]string{
+		"churn_prevention": "You are an expert email marketing copywriter specializing in SaaS user engagement.\n\nGoal: Persuade the user to stay by highlighting value and offering assistance.\nTone: Empathetic, supportive, and value-focused.\n\nInclude a special discount offer if a discount code is available.\nFocus on the value the user has already gotten from the product and what they'd miss.\nMake the user feel valued and understood.",
+		"feature_adoption": "You are an expert email marketing copywriter specializing in SaaS user engagement.\n\nGoal: Introduce unused features that would benefit the user based on their usage patterns.\nTone: Helpful, educational, and excited.\n\nHighlight specific features the user hasn't tried yet.\nExplain the benefits in terms of outcomes, not just functionality.\nInclude a clear call-to-action to try the feature.",
+		"engagement":       "You are an expert email marketing copywriter specializing in SaaS user engagement.\n\nGoal: Bring the user back to the product with compelling reasons and social proof.\nTone: Energetic, encouraging, and community-focused.\n\nMention what's new since they were last active.\nUse social proof (e.g., what other users are achieving).\nCreate a sense of excitement about returning.",
+	}
+
+	prompt, ok := prompts[automationType]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Unknown automation type"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"type":           automationType,
+		"default_prompt": prompt,
 	})
 }

@@ -32,6 +32,7 @@ type GenerateEmailContentRequest struct {
 	ProductContext      map[string]interface{} `json:"product_context"`
 	Personalization     map[string]interface{} `json:"personalization"`
 	PersonalizationVars []string               `json:"personalization_vars"`
+	CustomPrompt        string                 `json:"custom_prompt,omitempty"` // User-provided prompt override
 }
 
 // GeneratedEmailContent represents LLM-generated email content
@@ -45,8 +46,13 @@ type GeneratedEmailContent struct {
 
 // GenerateEmailContent generates personalized email content using Claude
 func (s *AutomationService) GenerateEmailContent(req GenerateEmailContentRequest) (*GeneratedEmailContent, error) {
-	// Create prompt based on template type
-	prompt := s.buildEmailPrompt(req)
+	// Use custom prompt if provided, otherwise build default
+	var prompt string
+	if req.CustomPrompt != "" {
+		prompt = s.buildCustomPrompt(req)
+	} else {
+		prompt = s.buildEmailPrompt(req)
+	}
 
 	// Call LLM service
 	llmResponse, err := s.llmService.generateContent(prompt)
@@ -61,6 +67,47 @@ func (s *AutomationService) GenerateEmailContent(req GenerateEmailContentRequest
 	}
 
 	return content, nil
+}
+
+// buildCustomPrompt wraps the user's custom prompt with context and output format requirements
+func (s *AutomationService) buildCustomPrompt(req GenerateEmailContentRequest) string {
+	var prompt strings.Builder
+
+	// Inject user context so the custom prompt can reference it
+	prompt.WriteString("You are generating a personalized email for a SaaS product.\n\n")
+	prompt.WriteString("=== USER CONTEXT ===\n")
+	if userName, ok := req.UserContext["name"].(string); ok && userName != "" {
+		prompt.WriteString(fmt.Sprintf("User Name: %s\n", userName))
+	}
+	if userEmail, ok := req.UserContext["email"].(string); ok && userEmail != "" {
+		prompt.WriteString(fmt.Sprintf("User Email: %s\n", userEmail))
+	}
+	if riskScore, ok := req.UserContext["churn_risk_score"].(float64); ok {
+		prompt.WriteString(fmt.Sprintf("Churn Risk Score: %.0f%%\n", riskScore))
+	}
+	if lastActive, ok := req.UserContext["last_active_days"].(int); ok {
+		prompt.WriteString(fmt.Sprintf("Days Since Last Active: %d\n", lastActive))
+	}
+	if productName, ok := req.ProductContext["product_name"].(string); ok {
+		prompt.WriteString(fmt.Sprintf("Product Name: %s\n", productName))
+	}
+
+	prompt.WriteString("\n=== YOUR INSTRUCTIONS ===\n")
+	prompt.WriteString(req.CustomPrompt)
+
+	// Always append output format requirements
+	prompt.WriteString("\n\n=== OUTPUT FORMAT (REQUIRED) ===\n")
+	prompt.WriteString("1. Subject line (max 60 characters, compelling and personalized)\n")
+	prompt.WriteString("2. HTML email content with proper formatting\n")
+	prompt.WriteString("3. Plain text version\n")
+	if len(req.PersonalizationVars) > 0 {
+		prompt.WriteString(fmt.Sprintf("4. Include personalization placeholders for: %s\n", strings.Join(req.PersonalizationVars, ", ")))
+	}
+	prompt.WriteString("5. Use proper email HTML structure with inline CSS\n")
+	prompt.WriteString("6. Include clear call-to-action button\n")
+	prompt.WriteString("7. Mobile-responsive design\n")
+
+	return prompt.String()
 }
 
 // buildEmailPrompt builds a personalized prompt for Claude based on template type
@@ -321,6 +368,7 @@ func (s *AutomationService) GeneratePersonalizedCampaign(projectID string, autom
 		UserContext:     userContext,
 		ProductContext:  productContext,
 		Personalization: personalization,
+		CustomPrompt:    automation.CustomPrompt,
 	}
 
 	// Add personalization vars from template

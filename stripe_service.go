@@ -3,13 +3,13 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"math"
-
 	"github.com/stripe/stripe-go/v72"
 	"github.com/stripe/stripe-go/v72/client"
 	"github.com/stripe/stripe-go/v72/customer"
@@ -383,6 +383,8 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 	pastDueCount := 0
 	trialingCount := 0
 	activeCustomers := make(map[string]bool)
+	// Track billing interval per subscription for invoice normalization
+	subBillingInterval := make(map[string]stripe.PriceRecurringInterval)
 
 	subIter := sc.Subscriptions.List(subParams)
 	for subIter.Next() {
@@ -391,6 +393,14 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 		custID := ""
 		if sub.Customer != nil {
 			custID = sub.Customer.ID
+		}
+
+		// Capture billing interval for all subscriptions
+		if len(sub.Items.Data) > 0 {
+			item := sub.Items.Data[0]
+			if item.Price != nil && item.Price.Recurring != nil {
+				subBillingInterval[sub.ID] = item.Price.Recurring.Interval
+			}
 		}
 
 		switch sub.Status {
@@ -512,18 +522,17 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 	invParams.Limit = stripe.Int64(100)
 	invParams.CreatedRange = &stripe.RangeQueryParams{GreaterThanOrEqual: sixtyDaysAgo}
 
-	// Group invoice amounts by customer+subscription, sorted by date
+	// Group monthly-normalized invoice amounts by customer+subscription
 	type invoiceRecord struct {
-		Amount    int64
-		Created   int64
-		SubID     string
+		MonthlyAmount int64 // normalized to monthly cents
+		Created       int64
 	}
 	customerSubInvoices := make(map[string][]invoiceRecord) // key: custID:subID
 
 	invIter := sc.Invoices.List(invParams)
 	for invIter.Next() {
 		inv := invIter.Invoice()
-		if inv.Status != "paid" || inv.Total <= 0 {
+		if inv.Status != stripe.InvoiceStatusPaid || inv.Subtotal <= 0 {
 			continue
 		}
 		custID := ""
@@ -537,11 +546,28 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 		if custID == "" || subID == "" {
 			continue
 		}
+
+		// Look up billing interval from pre-fetched subscription data
+		billingInterval, ok := subBillingInterval[subID]
+		if !ok {
+			billingInterval = stripe.PriceRecurringIntervalMonth
+		}
+
+		// Normalize subtotal to monthly amount
+		monthlyAmt := inv.Subtotal
+		switch billingInterval {
+		case stripe.PriceRecurringIntervalYear:
+			monthlyAmt = monthlyAmt / 12
+		case stripe.PriceRecurringIntervalWeek:
+			monthlyAmt = monthlyAmt * 4
+		case stripe.PriceRecurringIntervalDay:
+			monthlyAmt = monthlyAmt * 30
+		}
+
 		key := custID + ":" + subID
 		customerSubInvoices[key] = append(customerSubInvoices[key], invoiceRecord{
-			Amount:  inv.Total,
-			Created: inv.Created,
-			SubID:   subID,
+			MonthlyAmount: monthlyAmt,
+			Created:       inv.Created,
 		})
 	}
 	if err := invIter.Err(); err != nil {
@@ -554,17 +580,11 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 		if len(records) < 2 {
 			continue
 		}
-		// Sort by created date (most recent first) - simple bubble for small slices
-		for i := 0; i < len(records); i++ {
-			for j := i + 1; j < len(records); j++ {
-				if records[j].Created > records[i].Created {
-					records[i], records[j] = records[j], records[i]
-				}
-			}
-		}
-		current := records[0].Amount
-		previous := records[1].Amount
-		diff := current - previous
+		// Sort by created date descending (most recent first)
+		sort.Slice(records, func(i, j int) bool {
+			return records[i].Created > records[j].Created
+		})
+		diff := records[0].MonthlyAmount - records[1].MonthlyAmount
 		if diff > 0 {
 			expansionCents += diff
 		} else if diff < 0 {
@@ -987,6 +1007,8 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 		isCanceled   bool
 	}
 	var subs []subEvent
+	// Track billing interval per subscription for invoice normalization
+	subBillingInterval := make(map[string]stripe.PriceRecurringInterval)
 
 	subParams := &stripe.SubscriptionListParams{Status: "all"}
 	subParams.Limit = stripe.Int64(100)
@@ -998,6 +1020,9 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 		if len(sub.Items.Data) > 0 {
 			item := sub.Items.Data[0]
 			if item.Price != nil {
+				if item.Price.Recurring != nil {
+					subBillingInterval[sub.ID] = item.Price.Recurring.Interval
+				}
 				amount := item.Price.UnitAmount * item.Quantity
 				if item.Price.Recurring != nil {
 					switch item.Price.Recurring.Interval {
@@ -1044,11 +1069,9 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 
 	// ── 4. Fetch invoices for MRR movement detection ──
 	type invoiceRecord struct {
-		Amount  int64
-		Created int64
-		Day     string
-		SubID   string
-		CustID  string
+		MonthlyAmount int64 // normalized to monthly cents
+		Created       int64
+		Day           string
 	}
 	// Group invoices by customer:subscription
 	customerSubInvoices := make(map[string][]invoiceRecord)
@@ -1060,7 +1083,7 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 	invIter := sc.Invoices.List(invParams)
 	for invIter.Next() {
 		inv := invIter.Invoice()
-		if inv.Status != "paid" || inv.Total <= 0 {
+		if inv.Status != stripe.InvoiceStatusPaid || inv.Subtotal <= 0 {
 			continue
 		}
 		custID := ""
@@ -1074,13 +1097,29 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 		if custID == "" || subID == "" {
 			continue
 		}
+
+		// Look up billing interval from pre-fetched subscription data
+		billingInterval, ok := subBillingInterval[subID]
+		if !ok {
+			billingInterval = stripe.PriceRecurringIntervalMonth
+		}
+
+		// Normalize subtotal to monthly amount
+		monthlyAmt := inv.Subtotal
+		switch billingInterval {
+		case stripe.PriceRecurringIntervalYear:
+			monthlyAmt = monthlyAmt / 12
+		case stripe.PriceRecurringIntervalWeek:
+			monthlyAmt = monthlyAmt * 4
+		case stripe.PriceRecurringIntervalDay:
+			monthlyAmt = monthlyAmt * 30
+		}
+
 		key := custID + ":" + subID
 		customerSubInvoices[key] = append(customerSubInvoices[key], invoiceRecord{
-			Amount:  inv.Total,
-			Created: inv.Created,
-			Day:     time.Unix(inv.Created, 0).Format("2006-01-02"),
-			SubID:   subID,
-			CustID:  custID,
+			MonthlyAmount: monthlyAmt,
+			Created:       inv.Created,
+			Day:           time.Unix(inv.Created, 0).Format("2006-01-02"),
 		})
 	}
 	if err := invIter.Err(); err != nil {
@@ -1094,16 +1133,11 @@ func (s *StripeService) fetchTimeSeries(sc *client.API, days int) ([]map[string]
 		if len(records) < 2 {
 			continue
 		}
-		// Sort by created ascending
-		for i := 0; i < len(records); i++ {
-			for j := i + 1; j < len(records); j++ {
-				if records[j].Created < records[i].Created {
-					records[i], records[j] = records[j], records[i]
-				}
-			}
-		}
+		sort.Slice(records, func(i, j int) bool {
+			return records[i].Created < records[j].Created
+		})
 		for k := 1; k < len(records); k++ {
-			diff := records[k].Amount - records[k-1].Amount
+			diff := records[k].MonthlyAmount - records[k-1].MonthlyAmount
 			day := records[k].Day
 			if diff > 0 {
 				dailyExpansion[day] += diff

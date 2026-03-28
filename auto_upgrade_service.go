@@ -13,21 +13,53 @@ import (
 	"gorm.io/gorm"
 )
 
-// PricingTier represents a subscription tier with its limits
+// PricingTier represents a subscription tier with its limits and overage rates
 type PricingTier struct {
 	ID        string
 	Name      string
 	MaxUsers  int
 	BasePrice int64 // in dollars
+
+	// Included limits
+	IncludedPaidUsers       int
+	IncludedSessionReplays  int
+	IncludedAutomatedEmails int
+	IncludedAIGenerations   int
+	IncludedTeamMembers     int // 0 = unlimited
+
+	// Overage rates (in cents)
+	OveragePaidUsersPer100     int64 // cents per 100 extra paid users
+	OverageReplaysPer500       int64 // cents per 500 extra replays
+	OverageEmailsPer10k        int64 // cents per 10k extra emails
+	OverageAIGenerationsPer100 int64 // cents per 100 extra AI generations
 }
 
-// Tier progression order
+// Tier progression order — new 3-tier structure
 var TierOrder = []PricingTier{
-	{ID: "launch", Name: "Launch", MaxUsers: 100, BasePrice: 49},
-	{ID: "traction", Name: "Traction", MaxUsers: 500, BasePrice: 149},
-	{ID: "momentum", Name: "Momentum", MaxUsers: 1000, BasePrice: 299},
-	{ID: "scale", Name: "Scale", MaxUsers: 5000, BasePrice: 699},
-	{ID: "expansion", Name: "Expansion", MaxUsers: 10000, BasePrice: 1499},
+	{
+		ID: "starter", Name: "Starter", MaxUsers: 500, BasePrice: 59,
+		IncludedPaidUsers: 500, IncludedSessionReplays: 250,
+		IncludedAutomatedEmails: 10000, IncludedAIGenerations: 50,
+		IncludedTeamMembers: 3,
+		OveragePaidUsersPer100: 1200, OverageReplaysPer500: 700,
+		OverageEmailsPer10k: 300, OverageAIGenerationsPer100: 500,
+	},
+	{
+		ID: "growth", Name: "Growth", MaxUsers: 2000, BasePrice: 149,
+		IncludedPaidUsers: 2000, IncludedSessionReplays: 700,
+		IncludedAutomatedEmails: 50000, IncludedAIGenerations: 200,
+		IncludedTeamMembers: 10,
+		OveragePaidUsersPer100: 1000, OverageReplaysPer500: 600,
+		OverageEmailsPer10k: 300, OverageAIGenerationsPer100: 400,
+	},
+	{
+		ID: "scale", Name: "Scale", MaxUsers: 7500, BasePrice: 399,
+		IncludedPaidUsers: 7500, IncludedSessionReplays: 2000,
+		IncludedAutomatedEmails: 200000, IncludedAIGenerations: 600,
+		IncludedTeamMembers: 0, // unlimited
+		OveragePaidUsersPer100: 800, OverageReplaysPer500: 500,
+		OverageEmailsPer10k: 200, OverageAIGenerationsPer100: 300,
+	},
 }
 
 // AutoUpgradeService handles automatic subscription upgrades

@@ -440,15 +440,18 @@ func generateSecureToken(length int) (string, error) {
 // getTeamLimitForTier returns the team member limit for a given tier
 func getTeamLimitForTier(tier string) int {
 	limits := map[string]int{
+		"starter": 3,
+		"growth":  10,
+		"scale":   0, // 0 = unlimited
+		// Legacy tiers (for existing accounts during migration)
 		"launch":     2,
 		"traction":   4,
-		"momentum":   0, // 0 = unlimited
-		"scale":      0,
+		"momentum":   0,
 		"expansion":  0,
 		"enterprise": 0,
 	}
 	if limit, ok := limits[tier]; ok {
 		return limit
 	}
-	return 2 // Default to launch tier limit
+	return 3 // Default to starter tier limit
 }

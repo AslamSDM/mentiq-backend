@@ -291,7 +291,7 @@ type AccountSubscription struct {
 	AccountID string `gorm:"uniqueIndex;not null" json:"account_id"` // One subscription per account
 
 	// Subscription details
-	Tier         string `json:"tier" gorm:"index"`                    // launch, traction, momentum, scale, expansion, enterprise
+	Tier         string `json:"tier" gorm:"index"`                    // starter, growth, scale
 	Status       string `json:"status" gorm:"index;default:'active'"` // active, trialing, past_due, canceled, paused
 	UserCount    int    `json:"user_count"`                           // Selected user count
 	MonthlyPrice int64  `json:"monthly_price"`                        // Price in cents
@@ -958,6 +958,9 @@ type AutomationSettings struct {
 	CreatedAt   time.Time              `json:"created_at"`
 	UpdatedAt   time.Time              `json:"updated_at"`
 
+	// Custom prompt for AI email generation — overrides default prompt when set
+	CustomPrompt string `gorm:"type:text" json:"custom_prompt,omitempty"`
+
 	// Relations
 	Project Project `gorm:"foreignKey:ProjectID;references:ID" json:"project,omitempty"`
 }
@@ -1031,6 +1034,11 @@ type AutomationExecution struct {
 	CreatedAt       time.Time              `json:"created_at"`
 	UpdatedAt       time.Time              `json:"updated_at"`
 
+	// Stored email content — persisted for customer viewing and auditing
+	EmailSubject   string `json:"email_subject,omitempty"`
+	EmailHTML      string `gorm:"type:text" json:"email_html,omitempty"`
+	EmailPlainText string `gorm:"type:text" json:"email_plain_text,omitempty"`
+
 	// Relations
 	Automation    AutomationSettings `gorm:"foreignKey:AutomationID;references:ID" json:"automation,omitempty"`
 	EmailTemplate *EmailTemplate     `gorm:"foreignKey:EmailTemplateID;references:ID" json:"email_template,omitempty"`
@@ -1066,4 +1074,52 @@ type EngagementAutomationConfig struct {
 	EmailTemplateID     string `json:"email_template_id"`
 	InactivityDays      int    `json:"inactivity_days"`
 	MinSessionCount     int    `json:"min_session_count"`
+}
+
+// AccountLimits stores the effective limits for an account.
+// Override fields (nullable) take precedence over plan defaults when set by an admin.
+type AccountLimits struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	AccountID string    `gorm:"uniqueIndex;not null" json:"account_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	// Admin overrides — nullable; nil means "use plan default"
+	PaidUsersOverride       *int `json:"paid_users_override"`
+	SessionReplaysOverride  *int `json:"session_replays_override"`
+	AutomatedEmailsOverride *int `json:"automated_emails_override"`
+	AIGenerationsOverride   *int `json:"ai_generations_override"`
+
+	// Relations
+	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+}
+
+func (AccountLimits) TableName() string {
+	return "account_limits"
+}
+
+// AccountUsage tracks resource consumption for the current billing period.
+// Counters are reset at the start of each billing cycle.
+type AccountUsage struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	AccountID string    `gorm:"uniqueIndex;not null" json:"account_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	// Billing period this usage belongs to
+	BillingPeriodStart time.Time `json:"billing_period_start"`
+	BillingPeriodEnd   time.Time `json:"billing_period_end"`
+
+	// Usage counters
+	PaidUsersCount       int `json:"paid_users_count"`
+	SessionReplaysCount  int `json:"session_replays_count"`
+	AutomatedEmailsCount int `json:"automated_emails_count"`
+	AIGenerationsCount   int `json:"ai_generations_count"`
+
+	// Relations
+	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+}
+
+func (AccountUsage) TableName() string {
+	return "account_usage"
 }

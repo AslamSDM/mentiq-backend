@@ -113,6 +113,7 @@ type Server struct {
 	playbookExecutor         *PlaybookExecutor
 	triggerEvaluator         *TriggerEvaluator
 	autoUpgradeService       *AutoUpgradeService
+	usageService             *UsageService
 	integrationsService      *IntegrationsService
 	automationService        *AutomationService
 	automationExecutor       *AutomationExecutor
@@ -174,6 +175,7 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		playbookExecutor:         playbookExecutor,
 		triggerEvaluator:         triggerEvaluator,
 		autoUpgradeService:       NewAutoUpgradeService(db),
+		usageService:             NewUsageService(db),
 		integrationsService:      NewIntegrationsService(db),
 		automationService:        automationService,
 		automationExecutor:       automationExecutor,
@@ -943,12 +945,15 @@ func main() {
 		apiV1.GET("/projects/:project_id/discount-codes", server.getDiscountCodesHandler)
 		apiV1.PUT("/projects/:project_id/discount-codes/:code_id", server.updateDiscountCodeHandler)
 
-		// Automation executions (read-only for now - created by automation engine)
+		// Automation executions
 		apiV1.GET("/projects/:project_id/automation-executions", server.getAutomationExecutionsHandler)
+		apiV1.GET("/projects/:project_id/automation-executions/:execution_id", server.getAutomationExecutionHandler)
 
-		// Automation testing/triggering
+		// Automation testing/triggering/preview
 		apiV1.POST("/projects/:project_id/automations/:automation_id/trigger", server.triggerAutomationHandler)
 		apiV1.POST("/projects/:project_id/automations/:automation_id/test", server.testAutomationHandler)
+		apiV1.POST("/projects/:project_id/automations/:automation_id/preview", server.previewEmailHandler)
+		apiV1.GET("/automations/default-prompt/:type", server.getDefaultPromptHandler)
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)
@@ -986,6 +991,14 @@ func main() {
 		adminAPI.GET("/waitlist", server.getWaitlistHandler)
 		adminAPI.POST("/waitlist/:id/grant-access", server.grantWaitlistAccessHandler)
 		adminAPI.DELETE("/waitlist/:id", server.deleteWaitlistHandler)
+
+		// Admin Usage Limits routes
+		adminAPI.GET("/accounts/:account_id/limits", server.usageService.AdminGetAccountLimitsHandler)
+		adminAPI.PUT("/accounts/:account_id/limits", server.usageService.AdminUpdateAccountLimitsHandler)
+		adminAPI.DELETE("/accounts/:account_id/limits/:resource", server.usageService.AdminResetAccountLimitHandler)
+		adminAPI.GET("/accounts/:account_id/usage", server.usageService.AdminGetAccountUsageHandler)
+		adminAPI.GET("/tiers", AdminGetAllTiersHandler)
+		adminAPI.GET("/tiers/:tier_id/defaults", AdminGetPlanDefaultsHandler)
 	}
 
 	// Setup graceful shutdown
@@ -2801,12 +2814,12 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 		var response []gin.H
 		for _, project := range projects {
 			response = append(response, gin.H{
-				"id":            project.ID,
-				"name":          project.Name,
-				"accountId":     project.AccountID,
-				"createdAt":     project.CreatedAt,
-				"updatedAt":     project.UpdatedAt,
-				"hasStripeKey":  project.StripeAPIKey != "",
+				"id":           project.ID,
+				"name":         project.Name,
+				"accountId":    project.AccountID,
+				"createdAt":    project.CreatedAt,
+				"updatedAt":    project.UpdatedAt,
+				"hasStripeKey": project.StripeAPIKey != "",
 			})
 		}
 		c.JSON(http.StatusOK, response)
@@ -2826,12 +2839,12 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 	var response []gin.H
 	for _, project := range projects {
 		response = append(response, gin.H{
-			"id":            project.ID,
-			"name":          project.Name,
-			"accountId":     project.AccountID,
-			"createdAt":     project.CreatedAt,
-			"updatedAt":     project.UpdatedAt,
-			"hasStripeKey":  project.StripeAPIKey != "",
+			"id":           project.ID,
+			"name":         project.Name,
+			"accountId":    project.AccountID,
+			"createdAt":    project.CreatedAt,
+			"updatedAt":    project.UpdatedAt,
+			"hasStripeKey": project.StripeAPIKey != "",
 		})
 	}
 

@@ -87,6 +87,9 @@ func MigrateDB(db *gorm.DB) error {
 		// Support Tickets
 		&SupportTicket{},
 		&TicketComment{},
+		// Usage limits & tracking
+		&AccountLimits{},
+		&AccountUsage{},
 	)
 
 	if err != nil {
