@@ -104,6 +104,9 @@ type Project struct {
 	Name         string    `json:"name"`
 	Description  string    `json:"description" gorm:"default:''"`
 	StripeAPIKey string    `json:"-" gorm:"column:stripe_api_key"` // Don't expose in JSON for security
+	DodoAPIKey   string    `json:"-" gorm:"column:dodo_api_key"`   // Don't expose in JSON for security
+	PolarAPIKey        string `json:"-" gorm:"column:polar_api_key"`         // Don't expose in JSON for security
+	LemonSqueezyAPIKey string `json:"-" gorm:"column:lemonsqueezy_api_key"` // Don't expose in JSON for security
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 

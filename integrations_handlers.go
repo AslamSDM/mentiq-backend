@@ -1,10 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -275,4 +279,329 @@ func (s *IntegrationsService) GetMailchimpSyncLogsHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"logs": logs})
+}
+
+// ==========================================
+// RESEND HANDLERS
+// ==========================================
+
+type ConnectAPIKeyRequest struct {
+	APIKey    string `json:"api_key" binding:"required"`
+	FromEmail string `json:"from_email"`
+	FromName  string `json:"from_name"`
+}
+
+// ConnectResendHandler saves a Resend API key as an integration
+func (s *IntegrationsService) ConnectResendHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req ConnectAPIKeyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "API key is required"})
+		return
+	}
+
+	// Verify the key works by making a test call
+	sender := NewResendEmailSender(req.APIKey)
+	if sender.client == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid API key"})
+		return
+	}
+
+	// Upsert integration record
+	var integration ProjectIntegration
+	err := s.db.Where("project_id = ? AND provider = ?", projectID, "resend").First(&integration).Error
+
+	settings := map[string]interface{}{
+		"from_email": req.FromEmail,
+		"from_name":  req.FromName,
+	}
+
+	if err == gorm.ErrRecordNotFound {
+		integration = ProjectIntegration{
+			ID:          uuid.New().String(),
+			ProjectID:   projectID,
+			Provider:    "resend",
+			AccessToken: req.APIKey,
+			IsActive:    true,
+			Settings:    settings,
+			SyncStatus:  "idle",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		}
+		if err := s.db.Create(&integration).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save integration"})
+			return
+		}
+	} else if err == nil {
+		integration.AccessToken = req.APIKey
+		integration.IsActive = true
+		integration.Settings = settings
+		integration.UpdatedAt = time.Now()
+		s.db.Save(&integration)
+	} else {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+
+	log.Printf("Resend connected for project %s", projectID)
+	c.JSON(http.StatusOK, integration)
+}
+
+// DisconnectResendHandler removes the Resend integration
+func (s *IntegrationsService) DisconnectResendHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	result := s.db.Where("project_id = ? AND provider = ?", projectID, "resend").Delete(&ProjectIntegration{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disconnect Resend"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Resend disconnected successfully"})
+}
+
+// UpdateResendSettingsHandler updates Resend integration settings
+func (s *IntegrationsService) UpdateResendSettingsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req struct {
+		APIKey    string `json:"api_key"`
+		FromEmail string `json:"from_email"`
+		FromName  string `json:"from_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	var integration ProjectIntegration
+	err := s.db.Where("project_id = ? AND provider = ?", projectID, "resend").First(&integration).Error
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Resend integration not found"})
+		return
+	}
+
+	if req.APIKey != "" {
+		integration.AccessToken = req.APIKey
+	}
+	if integration.Settings == nil {
+		integration.Settings = make(map[string]interface{})
+	}
+	if req.FromEmail != "" {
+		integration.Settings["from_email"] = req.FromEmail
+	}
+	if req.FromName != "" {
+		integration.Settings["from_name"] = req.FromName
+	}
+	integration.UpdatedAt = time.Now()
+	s.db.Save(&integration)
+
+	c.JSON(http.StatusOK, integration)
+}
+
+// TestResendHandler sends a test email to verify the integration
+func (s *IntegrationsService) TestResendHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req struct {
+		ToEmail string `json:"to_email" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "to_email is required"})
+		return
+	}
+
+	var integration ProjectIntegration
+	err := s.db.Where("project_id = ? AND provider = ?", projectID, "resend").First(&integration).Error
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Resend integration not found"})
+		return
+	}
+
+	apiKey := integration.AccessToken
+	if apiKey == "" {
+		apiKey = os.Getenv("RESEND_API_KEY")
+	}
+
+	sender := NewResendEmailSender(apiKey)
+	fromEmail, _ := integration.Settings["from_email"].(string)
+	fromName, _ := integration.Settings["from_name"].(string)
+	if fromEmail == "" {
+		fromEmail = "noreply@yourcompany.com"
+	}
+	if fromName == "" {
+		fromName = "Mentiq"
+	}
+
+	result, err := sender.SendEmail(AutomationEmailRequest{
+		To:          req.ToEmail,
+		From:        fromEmail,
+		FromName:    fromName,
+		Subject:     "Mentiq - Resend Integration Test",
+		HTMLContent: "<h2>It works!</h2><p>Your Resend integration with Mentiq is configured correctly.</p>",
+		PlainText:   "It works! Your Resend integration with Mentiq is configured correctly.",
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Test email failed: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Test email sent", "message_id": result.MessageID})
+}
+
+// ==========================================
+// SENDGRID HANDLERS
+// ==========================================
+
+// ConnectSendGridHandler saves a SendGrid API key as an integration
+func (s *IntegrationsService) ConnectSendGridHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req ConnectAPIKeyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "API key is required"})
+		return
+	}
+
+	// Upsert integration record
+	var integration ProjectIntegration
+	err := s.db.Where("project_id = ? AND provider = ?", projectID, "sendgrid").First(&integration).Error
+
+	settings := map[string]interface{}{
+		"from_email": req.FromEmail,
+		"from_name":  req.FromName,
+	}
+
+	if err == gorm.ErrRecordNotFound {
+		integration = ProjectIntegration{
+			ID:          uuid.New().String(),
+			ProjectID:   projectID,
+			Provider:    "sendgrid",
+			AccessToken: req.APIKey,
+			IsActive:    true,
+			Settings:    settings,
+			SyncStatus:  "idle",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		}
+		if err := s.db.Create(&integration).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save integration"})
+			return
+		}
+	} else if err == nil {
+		integration.AccessToken = req.APIKey
+		integration.IsActive = true
+		integration.Settings = settings
+		integration.UpdatedAt = time.Now()
+		s.db.Save(&integration)
+	} else {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+
+	log.Printf("SendGrid connected for project %s", projectID)
+	c.JSON(http.StatusOK, integration)
+}
+
+// DisconnectSendGridHandler removes the SendGrid integration
+func (s *IntegrationsService) DisconnectSendGridHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	result := s.db.Where("project_id = ? AND provider = ?", projectID, "sendgrid").Delete(&ProjectIntegration{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disconnect SendGrid"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "SendGrid disconnected successfully"})
+}
+
+// UpdateSendGridSettingsHandler updates SendGrid integration settings
+func (s *IntegrationsService) UpdateSendGridSettingsHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req struct {
+		APIKey    string `json:"api_key"`
+		FromEmail string `json:"from_email"`
+		FromName  string `json:"from_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	var integration ProjectIntegration
+	err := s.db.Where("project_id = ? AND provider = ?", projectID, "sendgrid").First(&integration).Error
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "SendGrid integration not found"})
+		return
+	}
+
+	if req.APIKey != "" {
+		integration.AccessToken = req.APIKey
+	}
+	if integration.Settings == nil {
+		integration.Settings = make(map[string]interface{})
+	}
+	if req.FromEmail != "" {
+		integration.Settings["from_email"] = req.FromEmail
+	}
+	if req.FromName != "" {
+		integration.Settings["from_name"] = req.FromName
+	}
+	integration.UpdatedAt = time.Now()
+	s.db.Save(&integration)
+
+	c.JSON(http.StatusOK, integration)
+}
+
+// TestSendGridHandler sends a test email to verify the integration
+func (s *IntegrationsService) TestSendGridHandler(c *gin.Context) {
+	projectID := c.Param("project_id")
+
+	var req struct {
+		ToEmail string `json:"to_email" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "to_email is required"})
+		return
+	}
+
+	var integration ProjectIntegration
+	err := s.db.Where("project_id = ? AND provider = ?", projectID, "sendgrid").First(&integration).Error
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "SendGrid integration not found"})
+		return
+	}
+
+	apiKey := integration.AccessToken
+	if apiKey == "" {
+		apiKey = os.Getenv("SENDGRID_API_KEY")
+	}
+
+	sender := NewSendGridEmailSender(apiKey)
+	fromEmail, _ := integration.Settings["from_email"].(string)
+	fromName, _ := integration.Settings["from_name"].(string)
+	if fromEmail == "" {
+		fromEmail = "noreply@yourcompany.com"
+	}
+	if fromName == "" {
+		fromName = "Mentiq"
+	}
+
+	result, err := sender.SendEmail(AutomationEmailRequest{
+		To:          req.ToEmail,
+		From:        fromEmail,
+		FromName:    fromName,
+		Subject:     "Mentiq - SendGrid Integration Test",
+		HTMLContent: "<h2>It works!</h2><p>Your SendGrid integration with Mentiq is configured correctly.</p>",
+		PlainText:   "It works! Your SendGrid integration with Mentiq is configured correctly.",
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Test email failed: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Test email sent", "message_id": result.MessageID})
 }

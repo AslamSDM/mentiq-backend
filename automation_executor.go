@@ -190,42 +190,22 @@ func (e *AutomationExecutor) processChurnPrevention(automation *AutomationSettin
 			continue
 		}
 
-		// Create Mailchimp campaign
-		campaignRequest := &MailchimpCampaignRequest{
-			Type: "regular",
-			Recipients: struct {
-				ListID string `json:"list_id"`
-			}{
-				ListID: getString(automation.Config, "audience_id"),
-			},
-			Settings: struct {
-				SubjectLine string `json:"subject_line"`
-				PreviewText string `json:"preview_text"`
-				Title       string `json:"title"`
-				FromName    string `json:"from_name"`
-				ReplyTo     string `json:"reply_to"`
-			}{
-				SubjectLine: content.Subject,
-				PreviewText: "Special offer just for you",
-				Title:       fmt.Sprintf("Churn Prevention - %s", user.Name),
-				FromName:    "Customer Success Team",
-				ReplyTo:     "support@yourcompany.com",
-			},
-			Tracking: struct {
-				Opens      bool `json:"opens"`
-				HtmlClicks bool `json:"html_clicks"`
-				TextClicks bool `json:"text_clicks"`
-			}{
-				Opens:      true,
-				HtmlClicks: true,
-				TextClicks: true,
-			},
+		// Send email via configured provider
+		sender := GetEmailSenderForAutomation(automation, e.mailchimpService)
+		emailReq := AutomationEmailRequest{
+			To:          user.Email,
+			ToName:      user.Name,
+			From:        getStringOr(automation.Config, "from_email", "noreply@yourcompany.com"),
+			FromName:    getStringOr(automation.Config, "from_name", "Customer Success Team"),
+			ReplyTo:     getStringOr(automation.Config, "reply_to", "support@yourcompany.com"),
+			Subject:     content.Subject,
+			HTMLContent: content.HTMLContent,
+			PlainText:   content.PlainText,
 		}
 
-		// Send campaign
-		_, err = e.mailchimpService.CreateAndSendCampaign(automation.ProjectID, campaignRequest, content.HTMLContent)
+		result, err := sender.SendEmail(emailReq)
 		if err != nil {
-			log.Printf("Error sending campaign for user %s: %v", user.UserID, err)
+			log.Printf("Error sending campaign for user %s via %s: %v", user.UserID, sender.Provider(), err)
 			execution.Status = "failed"
 			execution.FailedAt = &[]time.Time{time.Now()}[0]
 			execution.FailureReason = err.Error()
@@ -241,12 +221,14 @@ func (e *AutomationExecutor) processChurnPrevention(automation *AutomationSettin
 		execution.EmailHTML = content.HTMLContent
 		execution.EmailPlainText = content.PlainText
 		execution.ExecutionResult = map[string]interface{}{
+			"provider":       result.Provider,
+			"message_id":     result.MessageID,
 			"subject":        content.Subject,
 			"content_length": len(content.HTMLContent),
 		}
 		e.db.Save(&execution)
 
-		log.Printf("Sent churn prevention campaign to user %s with risk score %.2f", user.UserID, user.RiskScore)
+		log.Printf("Sent churn prevention campaign to user %s via %s with risk score %.2f", user.UserID, sender.Provider(), user.RiskScore)
 	}
 }
 
@@ -330,42 +312,22 @@ func (e *AutomationExecutor) processFeatureAdoption(automation *AutomationSettin
 			continue
 		}
 
-		// Create Mailchimp campaign for feature adoption
-		campaignRequest := &MailchimpCampaignRequest{
-			Type: "regular",
-			Recipients: struct {
-				ListID string `json:"list_id"`
-			}{
-				ListID: getString(automation.Config, "audience_id"),
-			},
-			Settings: struct {
-				SubjectLine string `json:"subject_line"`
-				PreviewText string `json:"preview_text"`
-				Title       string `json:"title"`
-				FromName    string `json:"from_name"`
-				ReplyTo     string `json:"reply_to"`
-			}{
-				SubjectLine: content.Subject,
-				PreviewText: "Discover powerful features you're missing",
-				Title:       fmt.Sprintf("Feature Adoption - %s", user.Name),
-				FromName:    "Product Team",
-				ReplyTo:     "support@yourcompany.com",
-			},
-			Tracking: struct {
-				Opens      bool `json:"opens"`
-				HtmlClicks bool `json:"html_clicks"`
-				TextClicks bool `json:"text_clicks"`
-			}{
-				Opens:      true,
-				HtmlClicks: true,
-				TextClicks: true,
-			},
+		// Send email via configured provider
+		sender := GetEmailSenderForAutomation(automation, e.mailchimpService)
+		emailReq := AutomationEmailRequest{
+			To:          user.Email,
+			ToName:      user.Name,
+			From:        getStringOr(automation.Config, "from_email", "noreply@yourcompany.com"),
+			FromName:    getStringOr(automation.Config, "from_name", "Product Team"),
+			ReplyTo:     getStringOr(automation.Config, "reply_to", "support@yourcompany.com"),
+			Subject:     content.Subject,
+			HTMLContent: content.HTMLContent,
+			PlainText:   content.PlainText,
 		}
 
-		// Send campaign
-		_, err = e.mailchimpService.CreateAndSendCampaign(automation.ProjectID, campaignRequest, content.HTMLContent)
+		result, err := sender.SendEmail(emailReq)
 		if err != nil {
-			log.Printf("Error sending campaign for user %s: %v", user.UserID, err)
+			log.Printf("Error sending campaign for user %s via %s: %v", user.UserID, sender.Provider(), err)
 			now := time.Now()
 			execution.Status = "failed"
 			execution.FailedAt = &now
@@ -382,13 +344,15 @@ func (e *AutomationExecutor) processFeatureAdoption(automation *AutomationSettin
 		execution.EmailHTML = content.HTMLContent
 		execution.EmailPlainText = content.PlainText
 		execution.ExecutionResult = map[string]interface{}{
+			"provider":       result.Provider,
+			"message_id":     result.MessageID,
 			"subject":        content.Subject,
 			"content_length": len(content.HTMLContent),
 			"features":       user.UnusedFeatures,
 		}
 		e.db.Save(&execution)
 
-		log.Printf("Sent feature adoption campaign to user %s for features: %v", user.UserID, user.UnusedFeatures)
+		log.Printf("Sent feature adoption campaign to user %s via %s for features: %v", user.UserID, sender.Provider(), user.UnusedFeatures)
 	}
 }
 
@@ -474,42 +438,22 @@ func (e *AutomationExecutor) processEngagement(automation *AutomationSettings) {
 			continue
 		}
 
-		// Create Mailchimp campaign for re-engagement
-		campaignRequest := &MailchimpCampaignRequest{
-			Type: "regular",
-			Recipients: struct {
-				ListID string `json:"list_id"`
-			}{
-				ListID: getString(automation.Config, "audience_id"),
-			},
-			Settings: struct {
-				SubjectLine string `json:"subject_line"`
-				PreviewText string `json:"preview_text"`
-				Title       string `json:"title"`
-				FromName    string `json:"from_name"`
-				ReplyTo     string `json:"reply_to"`
-			}{
-				SubjectLine: content.Subject,
-				PreviewText: "We miss you! Here's what's new",
-				Title:       fmt.Sprintf("Re-engagement - %s", user.Name),
-				FromName:    "Customer Success Team",
-				ReplyTo:     "support@yourcompany.com",
-			},
-			Tracking: struct {
-				Opens      bool `json:"opens"`
-				HtmlClicks bool `json:"html_clicks"`
-				TextClicks bool `json:"text_clicks"`
-			}{
-				Opens:      true,
-				HtmlClicks: true,
-				TextClicks: true,
-			},
+		// Send email via configured provider
+		sender := GetEmailSenderForAutomation(automation, e.mailchimpService)
+		emailReq := AutomationEmailRequest{
+			To:          user.Email,
+			ToName:      user.Name,
+			From:        getStringOr(automation.Config, "from_email", "noreply@yourcompany.com"),
+			FromName:    getStringOr(automation.Config, "from_name", "Customer Success Team"),
+			ReplyTo:     getStringOr(automation.Config, "reply_to", "support@yourcompany.com"),
+			Subject:     content.Subject,
+			HTMLContent: content.HTMLContent,
+			PlainText:   content.PlainText,
 		}
 
-		// Send campaign
-		_, err = e.mailchimpService.CreateAndSendCampaign(automation.ProjectID, campaignRequest, content.HTMLContent)
+		result, err := sender.SendEmail(emailReq)
 		if err != nil {
-			log.Printf("Error sending campaign for user %s: %v", user.UserID, err)
+			log.Printf("Error sending campaign for user %s via %s: %v", user.UserID, sender.Provider(), err)
 			now := time.Now()
 			execution.Status = "failed"
 			execution.FailedAt = &now
@@ -526,12 +470,14 @@ func (e *AutomationExecutor) processEngagement(automation *AutomationSettings) {
 		execution.EmailHTML = content.HTMLContent
 		execution.EmailPlainText = content.PlainText
 		execution.ExecutionResult = map[string]interface{}{
+			"provider":       result.Provider,
+			"message_id":     result.MessageID,
 			"subject":        content.Subject,
 			"content_length": len(content.HTMLContent),
 		}
 		e.db.Save(&execution)
 
-		log.Printf("Sent re-engagement campaign to user %s with engagement score %.2f", user.UserID, user.EngagementScore)
+		log.Printf("Sent re-engagement campaign to user %s via %s with engagement score %.2f", user.UserID, sender.Provider(), user.EngagementScore)
 	}
 }
 

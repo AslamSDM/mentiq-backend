@@ -418,6 +418,13 @@ func getInt(m map[string]interface{}, key string) int {
 	return 0
 }
 
+func getStringOr(m map[string]interface{}, key, defaultVal string) string {
+	if v, ok := m[key].(string); ok && v != "" {
+		return v
+	}
+	return defaultVal
+}
+
 func getStringSlice(m map[string]interface{}, key string) []string {
 	if v, ok := m[key].([]interface{}); ok {
 		result := make([]string, len(v))

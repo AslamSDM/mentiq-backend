@@ -106,6 +106,8 @@ type Server struct {
 	db                       *gorm.DB
 	analyticsService         *AnalyticsService
 	stripeService            *StripeService
+	dodoService              *DodoService
+	polarService             *PolarService
 	enhancedAnalyticsService *EnhancedAnalyticsService
 	sessionStorage           *SessionStorageService
 	emailService             *EmailService
@@ -139,6 +141,8 @@ type Server struct {
 
 func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 	stripeService := NewStripeService(db)
+	dodoService := NewDodoService(db)
+	polarService := NewPolarService(db)
 	enhancedAnalyticsService := NewEnhancedAnalyticsService(db)
 	emailService := NewEmailService()
 
@@ -169,6 +173,8 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		db:                       db,
 		analyticsService:         analyticsService,
 		stripeService:            stripeService,
+		dodoService:              dodoService,
+		polarService:             polarService,
 		enhancedAnalyticsService: enhancedAnalyticsService,
 		sessionStorage:           sessionStorage,
 		emailService:             emailService,
@@ -194,6 +200,14 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 	// Give StripeService access to caches for invalidation on key update
 	server.stripeService.projectListCache = server.projectListCache
 	server.stripeService.responseCache = server.responseCache
+
+	// Give DodoService access to caches for invalidation on key update
+	server.dodoService.projectListCache = server.projectListCache
+	server.dodoService.responseCache = server.responseCache
+
+	// Give PolarService access to caches for invalidation on key update
+	server.polarService.projectListCache = server.projectListCache
+	server.polarService.responseCache = server.responseCache
 
 	// Start background workers
 	playbookExecutor.Start()
@@ -791,6 +805,24 @@ func main() {
 		apiV1.GET("/projects/:project_id/stripe/customers", server.stripeService.GetCustomerAnalyticsHandler)
 
 		// ========================================
+		// DodoPayments Revenue Analytics routes (CACHED)
+		// ========================================
+		apiV1.PUT("/projects/:project_id/dodo-key", server.dodoService.UpdateDodoAPIKeyHandler)
+		apiV1.POST("/projects/:project_id/dodo/sync", server.dodoService.SyncDodoDataHandler)
+		apiV1.GET("/projects/:project_id/dodo/metrics", server.dodoService.GetRevenueMetricsHandler)
+		apiV1.GET("/projects/:project_id/dodo/analytics", server.dodoService.GetRevenueAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/dodo/customers", server.dodoService.GetCustomerAnalyticsHandler)
+
+		// ========================================
+		// Polar Revenue Analytics Routes
+		// ========================================
+		apiV1.PUT("/projects/:project_id/polar-key", server.polarService.UpdatePolarAPIKeyHandler)
+		apiV1.POST("/projects/:project_id/polar/sync", server.polarService.SyncPolarDataHandler)
+		apiV1.GET("/projects/:project_id/polar/metrics", server.polarService.GetRevenueMetricsHandler)
+		apiV1.GET("/projects/:project_id/polar/analytics", server.polarService.GetRevenueAnalyticsHandler)
+		apiV1.GET("/projects/:project_id/polar/customers", server.polarService.GetCustomerAnalyticsHandler)
+
+		// ========================================
 		// Session Recording routes (CACHED)
 		// ========================================
 		apiV1.POST("/sessions/:session_id/recordings", server.ingestRecordingHandler)
@@ -923,6 +955,18 @@ func main() {
 		apiV1.PUT("/projects/:project_id/integrations/mailchimp/settings", server.integrationsService.UpdateMailchimpSettingsHandler)
 		apiV1.POST("/projects/:project_id/integrations/mailchimp/sync", server.integrationsService.TriggerMailchimpSyncHandler)
 		apiV1.GET("/projects/:project_id/integrations/mailchimp/logs", server.integrationsService.GetMailchimpSyncLogsHandler)
+
+		// Resend-specific routes
+		apiV1.POST("/projects/:project_id/integrations/resend/connect", server.integrationsService.ConnectResendHandler)
+		apiV1.DELETE("/projects/:project_id/integrations/resend", server.integrationsService.DisconnectResendHandler)
+		apiV1.PUT("/projects/:project_id/integrations/resend/settings", server.integrationsService.UpdateResendSettingsHandler)
+		apiV1.POST("/projects/:project_id/integrations/resend/test", server.integrationsService.TestResendHandler)
+
+		// SendGrid-specific routes
+		apiV1.POST("/projects/:project_id/integrations/sendgrid/connect", server.integrationsService.ConnectSendGridHandler)
+		apiV1.DELETE("/projects/:project_id/integrations/sendgrid", server.integrationsService.DisconnectSendGridHandler)
+		apiV1.PUT("/projects/:project_id/integrations/sendgrid/settings", server.integrationsService.UpdateSendGridSettingsHandler)
+		apiV1.POST("/projects/:project_id/integrations/sendgrid/test", server.integrationsService.TestSendGridHandler)
 
 		// ========================================
 		// Automation routes
@@ -2820,6 +2864,8 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 				"createdAt":    project.CreatedAt,
 				"updatedAt":    project.UpdatedAt,
 				"hasStripeKey": project.StripeAPIKey != "",
+				"hasDodoKey":   project.DodoAPIKey != "",
+				"hasPolarKey":  project.PolarAPIKey != "",
 			})
 		}
 		c.JSON(http.StatusOK, response)
@@ -2845,6 +2891,8 @@ func (s *Server) listProjectsHandler(c *gin.Context) {
 			"createdAt":    project.CreatedAt,
 			"updatedAt":    project.UpdatedAt,
 			"hasStripeKey": project.StripeAPIKey != "",
+			"hasDodoKey":   project.DodoAPIKey != "",
+			"hasPolarKey":  project.PolarAPIKey != "",
 		})
 	}
 
