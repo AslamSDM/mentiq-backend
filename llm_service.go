@@ -397,7 +397,7 @@ func (s *LLMService) GeneratePlaybook(projectID string, req GeneratePlaybookLLMR
 		InputContext: req.ContextData,
 		PromptUsed:   prompt,
 		Status:       "generating",
-		ModelUsed:    "claude-3-5-sonnet-20241022",
+		ModelUsed:    "claude-haiku-4-5-20251001",
 		CreatedAt:    time.Now(),
 	}
 
@@ -407,7 +407,7 @@ func (s *LLMService) GeneratePlaybook(projectID string, req GeneratePlaybookLLMR
 
 	// Call Claude API
 	claudeReq := ClaudeRequest{
-		Model:     "claude-3-5-sonnet-20241022",
+		Model:     "claude-haiku-4-5-20251001",
 		MaxTokens: 4096,
 		Messages: []ClaudeMessage{
 			{
@@ -767,7 +767,7 @@ func (s *LLMService) generateContent(prompt string) (string, error) {
 	}
 
 	claudeReq := ClaudeRequest{
-		Model:     "claude-3-5-sonnet-20241022",
+		Model:     "claude-haiku-4-5-20251001",
 		MaxTokens: 4096,
 		Messages: []ClaudeMessage{
 			{

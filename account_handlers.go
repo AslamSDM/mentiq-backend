@@ -14,6 +14,15 @@ type UpdateProfileRequest struct {
 	AvatarURL string `json:"avatar_url"`
 }
 
+// validatePassword checks password strength beyond the min=8 binding constraint.
+// It rejects passwords that match the user's email address (case-insensitive).
+func validatePassword(password, email string) string {
+	if strings.EqualFold(password, email) {
+		return "Password cannot be the same as your email address"
+	}
+	return ""
+}
+
 // ChangePasswordRequest represents a request to change password
 type ChangePasswordRequest struct {
 	CurrentPassword string `json:"current_password" binding:"required"`
@@ -115,6 +124,12 @@ func (s *Server) changePasswordHandler(c *gin.Context) {
 	// Check if account was created via Google OAuth (no password set)
 	if account.Password == "" && account.GoogleID != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "This account uses Google sign-in. Password changes are not available."})
+		return
+	}
+
+	// Validate new password
+	if msg := validatePassword(req.NewPassword, account.Email); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
 

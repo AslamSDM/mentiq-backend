@@ -668,9 +668,9 @@ func main() {
 	}
 
 	// Run migrations
-	// if err := MigrateDB(database); err != nil {
-	// 	log.Fatalf("Failed to run migrations: %v", err)
-	// }
+	if err := MigrateDB(database); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -706,6 +706,13 @@ func main() {
 	config.AllowHeaders = []string{"*"}
 	config.AllowCredentials = true
 	router.Use(cors.New(config))
+
+	// Security headers to prevent clickjacking
+	router.Use(func(c *gin.Context) {
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Content-Security-Policy", "frame-ancestors 'none'")
+		c.Next()
+	})
 
 	// Public routes (auth routes have stricter IP-based rate limiting)
 	authRL := IPRateLimitMiddleware(server.authLimiter)
@@ -2053,6 +2060,12 @@ func (s *Server) signupHandler(c *gin.Context) {
 	// Normalize email
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
+	// Validate password
+	if msg := validatePassword(req.Password, req.Email); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		return
+	}
+
 	// Check if account already exists
 	var existingAccount Account
 	if err := s.db.Where("email = ?", req.Email).First(&existingAccount).Error; err == nil {
@@ -2418,6 +2431,12 @@ func (s *Server) resetPasswordHandler(c *gin.Context) {
 	// Check if token is expired
 	if account.ResetPasswordExpires != nil && time.Now().After(*account.ResetPasswordExpires) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Reset token has expired. Please request a new one."})
+		return
+	}
+
+	// Validate new password
+	if msg := validatePassword(req.NewPassword, account.Email); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
 

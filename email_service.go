@@ -87,32 +87,32 @@ func (es *EmailService) SendInvitationEmail(toEmail, toName, inviterName, accoun
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #000000; color: #ffffff;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #000000;">
+<body style="margin: 0; padding: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #FAFAF8; color: #0f172a;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #FAFAF8;">
         <tr>
             <td align="center" style="padding: 40px 0;">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #111111; border-radius: 12px; border: 1px solid #333333; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #f1f5f9; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);">
                     <!-- Header -->
                     <tr>
-                        <td style="padding: 40px 40px 30px; text-align: center; border-bottom: 1px solid #222222;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;">Mentiq</h1>
+                        <td style="padding: 40px 40px 30px; text-align: center;">
+                            <img src="https://backend.trymentiq.com/logo.png" alt="Mentiq" height="32" style="display:block; margin: 0 auto;"/>
                         </td>
                     </tr>
 
                     <!-- Body -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <h2 style="margin: 0 0 20px; color: #ffffff; font-size: 24px; font-weight: 600;">You're Invited!</h2>
+                        <td style="padding: 0 40px 40px;">
+                            <h2 style="margin: 0 0 20px; color: #0f172a; font-size: 24px; font-weight: 600; text-align: center;">You're Invited!</h2>
                             
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 Hi%s,
                             </p>
 
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 <strong>%s</strong> has invited you to join their team on <strong>Mentiq</strong>, the platform for analyzing, optimizing, and retaining your users.
                             </p>
 
-                            <p style="margin: 0 0 30px; color: #999999; font-size: 14px; line-height: 1.6;">
+                            <p style="margin: 0 0 30px; color: #64748b; font-size: 15px; line-height: 1.6; text-align: center;">
                                 Click the button below to accept the invitation and set up your account.
                             </p>
 
@@ -120,7 +120,7 @@ func (es *EmailService) SendInvitationEmail(toEmail, toName, inviterName, accoun
                             <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0">
                                 <tr>
                                     <td align="center" style="padding: 10px 0 30px;">
-                                        <a href="%s" style="display: inline-block; background: linear-gradient(135deg, #7c3aed 0%%, #4f46e5 100%%); color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 8px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);">
+                                        <a href="%s" style="display: inline-block; background-color: #3B5BDB; color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 12px; font-size: 16px; font-weight: 500;">
                                             Accept Invitation
                                         </a>
                                     </td>
@@ -128,13 +128,13 @@ func (es *EmailService) SendInvitationEmail(toEmail, toName, inviterName, accoun
                             </table>
 
                             <!-- Alternative Link -->
-                            <p style="margin: 20px 0 0; padding: 15px; background-color: #1a1a1a; border-radius: 6px; color: #888888; font-size: 12px; line-height: 1.6; border: 1px solid #333333;">
+                            <p style="margin: 20px 0 0; padding: 15px; background-color: #f8fafc; border-radius: 8px; color: #64748b; font-size: 13px; line-height: 1.6; border: 1px solid #f1f5f9; text-align: center;">
                                 <strong>Or copy and paste this link:</strong><br>
-                                <a href="%s" style="color: #a78bfa; word-break: break-all; text-decoration: none;">%s</a>
+                                <a href="%s" style="color: #3B5BDB; word-break: break-all; text-decoration: none;">%s</a>
                             </p>
 
                             <!-- Expiration Notice -->
-                            <p style="margin: 30px 0 0; color: #666666; font-size: 13px; line-height: 1.6; text-align: center; border-top: 1px solid #222222; padding-top: 20px;">
+                            <p style="margin: 30px 0 0; color: #94a3b8; font-size: 13px; line-height: 1.6; text-align: center; border-top: 1px solid #f1f5f9; padding-top: 20px;">
                                 This invitation expires in 7 days.
                             </p>
                         </td>
@@ -142,8 +142,8 @@ func (es *EmailService) SendInvitationEmail(toEmail, toName, inviterName, accoun
 
                     <!-- Footer -->
                     <tr>
-                        <td style="padding: 30px; text-align: center; background-color: #0a0a0a; border-radius: 0 0 12px 12px; border-top: 1px solid #222222;">
-                            <p style="margin: 0; color: #555555; font-size: 12px;">
+                        <td style="padding: 30px; text-align: center; background-color: #f8fafc; border-radius: 0 0 16px 16px; border-top: 1px solid #f1f5f9;">
+                            <p style="margin: 0; color: #94a3b8; font-size: 13px;">
                                 © 2025 Mentiq. All rights reserved.<br>
                                 If you didn't expect this invitation, you can safely ignore this email.
                             </p>
@@ -204,32 +204,32 @@ func (es *EmailService) SendVerificationEmail(toEmail, toName, token string) err
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #000000; color: #ffffff;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #000000;">
+<body style="margin: 0; padding: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #FAFAF8; color: #0f172a;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #FAFAF8;">
         <tr>
             <td align="center" style="padding: 40px 0;">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #111111; border-radius: 12px; border: 1px solid #333333; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #f1f5f9; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);">
                     <!-- Header -->
                     <tr>
-                        <td style="padding: 40px 40px 30px; text-align: center; border-bottom: 1px solid #222222;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;">Mentiq</h1>
+                        <td style="padding: 40px 40px 30px; text-align: center;">
+                            <img src="https://backend.trymentiq.com/logo.png" alt="Mentiq" height="32" style="display:block; margin: 0 auto;"/>
                         </td>
                     </tr>
 
                     <!-- Body -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <h2 style="margin: 0 0 20px; color: #ffffff; font-size: 24px; font-weight: 600;">Verify Your Email</h2>
+                        <td style="padding: 0 40px 40px;">
+                            <h2 style="margin: 0 0 20px; color: #0f172a; font-size: 24px; font-weight: 600; text-align: center;">Verify Your Email</h2>
                             
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 Hi%s,
                             </p>
 
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 Thanks for signing up for <strong>Mentiq</strong>! Please verify your email address to activate your account and start analyzing, optimizing, and retaining your users.
                             </p>
 
-                            <p style="margin: 0 0 30px; color: #999999; font-size: 14px; line-height: 1.6;">
+                            <p style="margin: 0 0 30px; color: #64748b; font-size: 15px; line-height: 1.6; text-align: center;">
                                 Click the button below to verify your email address.
                             </p>
 
@@ -237,7 +237,7 @@ func (es *EmailService) SendVerificationEmail(toEmail, toName, token string) err
                             <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0">
                                 <tr>
                                     <td align="center" style="padding: 10px 0 30px;">
-                                        <a href="%s" style="display: inline-block; background: linear-gradient(135deg, #7c3aed 0%%, #4f46e5 100%%); color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 8px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);">
+                                        <a href="%s" style="display: inline-block; background-color: #3B5BDB; color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 12px; font-size: 16px; font-weight: 500;">
                                             Verify Email Address
                                         </a>
                                     </td>
@@ -245,13 +245,13 @@ func (es *EmailService) SendVerificationEmail(toEmail, toName, token string) err
                             </table>
 
                             <!-- Alternative Link -->
-                            <p style="margin: 20px 0 0; padding: 15px; background-color: #1a1a1a; border-radius: 6px; color: #888888; font-size: 12px; line-height: 1.6; border: 1px solid #333333;">
+                            <p style="margin: 20px 0 0; padding: 15px; background-color: #f8fafc; border-radius: 8px; color: #64748b; font-size: 13px; line-height: 1.6; border: 1px solid #f1f5f9; text-align: center;">
                                 <strong>Or copy and paste this link:</strong><br>
-                                <a href="%s" style="color: #a78bfa; word-break: break-all; text-decoration: none;">%s</a>
+                                <a href="%s" style="color: #3B5BDB; word-break: break-all; text-decoration: none;">%s</a>
                             </p>
 
                             <!-- Expiration Notice -->
-                            <p style="margin: 30px 0 0; color: #666666; font-size: 13px; line-height: 1.6; text-align: center; border-top: 1px solid #222222; padding-top: 20px;">
+                            <p style="margin: 30px 0 0; color: #94a3b8; font-size: 13px; line-height: 1.6; text-align: center; border-top: 1px solid #f1f5f9; padding-top: 20px;">
                                 This link expires in 24 hours.
                             </p>
                         </td>
@@ -259,8 +259,8 @@ func (es *EmailService) SendVerificationEmail(toEmail, toName, token string) err
 
                     <!-- Footer -->
                     <tr>
-                        <td style="padding: 30px; text-align: center; background-color: #0a0a0a; border-radius: 0 0 12px 12px; border-top: 1px solid #222222;">
-                            <p style="margin: 0; color: #555555; font-size: 12px;">
+                        <td style="padding: 30px; text-align: center; background-color: #f8fafc; border-radius: 0 0 16px 16px; border-top: 1px solid #f1f5f9;">
+                            <p style="margin: 0; color: #94a3b8; font-size: 13px;">
                                 © 2025 Mentiq. All rights reserved.<br>
                                 If you didn't create an account, you can safely ignore this email.
                             </p>
@@ -313,32 +313,32 @@ func (es *EmailService) SendPasswordResetEmail(toEmail, toName, token string) er
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #000000; color: #ffffff;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #000000;">
+<body style="margin: 0; padding: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #FAFAF8; color: #0f172a;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #FAFAF8;">
         <tr>
             <td align="center" style="padding: 40px 0;">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #111111; border-radius: 12px; border: 1px solid #333333; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #f1f5f9; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);">
                     <!-- Header -->
                     <tr>
-                        <td style="padding: 40px 40px 30px; text-align: center; border-bottom: 1px solid #222222;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;">Mentiq</h1>
+                        <td style="padding: 40px 40px 30px; text-align: center;">
+                            <img src="https://backend.trymentiq.com/logo.png" alt="Mentiq" height="32" style="display:block; margin: 0 auto;"/>
                         </td>
                     </tr>
 
                     <!-- Body -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <h2 style="margin: 0 0 20px; color: #ffffff; font-size: 24px; font-weight: 600;">Reset Your Password</h2>
+                        <td style="padding: 0 40px 40px;">
+                            <h2 style="margin: 0 0 20px; color: #0f172a; font-size: 24px; font-weight: 600; text-align: center;">Reset Your Password</h2>
                             
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 Hi%s,
                             </p>
 
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 We received a request to reset your password for your <strong>Mentiq</strong> account. Click the button below to create a new password.
                             </p>
 
-                            <p style="margin: 0 0 30px; color: #999999; font-size: 14px; line-height: 1.6;">
+                            <p style="margin: 0 0 30px; color: #64748b; font-size: 15px; line-height: 1.6; text-align: center;">
                                 If you didn't request a password reset, you can safely ignore this email.
                             </p>
 
@@ -346,7 +346,7 @@ func (es *EmailService) SendPasswordResetEmail(toEmail, toName, token string) er
                             <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0">
                                 <tr>
                                     <td align="center" style="padding: 10px 0 30px;">
-                                        <a href="%s" style="display: inline-block; background: linear-gradient(135deg, #7c3aed 0%%, #4f46e5 100%%); color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 8px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);">
+                                        <a href="%s" style="display: inline-block; background-color: #3B5BDB; color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 12px; font-size: 16px; font-weight: 500;">
                                             Reset Password
                                         </a>
                                     </td>
@@ -354,13 +354,13 @@ func (es *EmailService) SendPasswordResetEmail(toEmail, toName, token string) er
                             </table>
 
                             <!-- Alternative Link -->
-                            <p style="margin: 20px 0 0; padding: 15px; background-color: #1a1a1a; border-radius: 6px; color: #888888; font-size: 12px; line-height: 1.6; border: 1px solid #333333;">
+                            <p style="margin: 20px 0 0; padding: 15px; background-color: #f8fafc; border-radius: 8px; color: #64748b; font-size: 13px; line-height: 1.6; border: 1px solid #f1f5f9; text-align: center;">
                                 <strong>Or copy and paste this link:</strong><br>
-                                <a href="%s" style="color: #a78bfa; word-break: break-all; text-decoration: none;">%s</a>
+                                <a href="%s" style="color: #3B5BDB; word-break: break-all; text-decoration: none;">%s</a>
                             </p>
 
                             <!-- Expiration Notice -->
-                            <p style="margin: 30px 0 0; color: #666666; font-size: 13px; line-height: 1.6; text-align: center; border-top: 1px solid #222222; padding-top: 20px;">
+                            <p style="margin: 30px 0 0; color: #94a3b8; font-size: 13px; line-height: 1.6; text-align: center; border-top: 1px solid #f1f5f9; padding-top: 20px;">
                                 This link expires in 1 hour for security reasons.
                             </p>
                         </td>
@@ -368,8 +368,8 @@ func (es *EmailService) SendPasswordResetEmail(toEmail, toName, token string) er
 
                     <!-- Footer -->
                     <tr>
-                        <td style="padding: 30px; text-align: center; background-color: #0a0a0a; border-radius: 0 0 12px 12px; border-top: 1px solid #222222;">
-                            <p style="margin: 0; color: #555555; font-size: 12px;">
+                        <td style="padding: 30px; text-align: center; background-color: #f8fafc; border-radius: 0 0 16px 16px; border-top: 1px solid #f1f5f9;">
+                            <p style="margin: 0; color: #94a3b8; font-size: 13px;">
                                 © 2025 Mentiq. All rights reserved.<br>
                                 If you didn't request this password reset, please ignore this email.
                             </p>
@@ -518,32 +518,32 @@ func (es *EmailService) SendWaitlistAccessGrantedEmail(toEmail, toName string) e
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #000000; color: #ffffff;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #000000;">
+<body style="margin: 0; padding: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #FAFAF8; color: #0f172a;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0" style="background-color: #FAFAF8;">
         <tr>
             <td align="center" style="padding: 40px 0;">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #111111; border-radius: 12px; border: 1px solid #333333; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #f1f5f9; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);">
                     <!-- Header -->
                     <tr>
-                        <td style="padding: 40px 40px 30px; text-align: center; border-bottom: 1px solid #222222;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;">Mentiq</h1>
+                        <td style="padding: 40px 40px 30px; text-align: center;">
+                            <img src="https://backend.trymentiq.com/logo.png" alt="Mentiq" height="32" style="display:block; margin: 0 auto;"/>
                         </td>
                     </tr>
 
                     <!-- Body -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <h2 style="margin: 0 0 20px; color: #ffffff; font-size: 24px; font-weight: 600;">You're In! 🎉</h2>
+                        <td style="padding: 0 40px 40px;">
+                            <h2 style="margin: 0 0 20px; color: #0f172a; font-size: 24px; font-weight: 600; text-align: center;">You're In! 🎉</h2>
                             
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 Hi%s,
                             </p>
 
-                            <p style="margin: 0 0 20px; color: #cccccc; font-size: 16px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px; color: #64748b; font-size: 16px; line-height: 1.6; text-align: center;">
                                 Great news! Your access to <strong>Mentiq</strong> has been approved. You can now create your account and start analyzing, optimizing, and retaining your users.
                             </p>
 
-                            <p style="margin: 0 0 30px; color: #999999; font-size: 14px; line-height: 1.6;">
+                            <p style="margin: 0 0 30px; color: #64748b; font-size: 15px; line-height: 1.6; text-align: center;">
                                 Click the button below to set up your account and get started.
                             </p>
 
@@ -551,7 +551,7 @@ func (es *EmailService) SendWaitlistAccessGrantedEmail(toEmail, toName string) e
                             <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" border="0">
                                 <tr>
                                     <td align="center" style="padding: 10px 0 30px;">
-                                        <a href="%s" style="display: inline-block; background: linear-gradient(135deg, #7c3aed 0%%, #4f46e5 100%%); color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 8px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);">
+                                        <a href="%s" style="display: inline-block; background-color: #3B5BDB; color: #ffffff; text-decoration: none; padding: 14px 40px; border-radius: 12px; font-size: 16px; font-weight: 500;">
                                             Create Your Account
                                         </a>
                                     </td>
@@ -559,9 +559,9 @@ func (es *EmailService) SendWaitlistAccessGrantedEmail(toEmail, toName string) e
                             </table>
 
                             <!-- What's included -->
-                            <div style="background-color: #1a1a1a; border-radius: 8px; padding: 20px; margin-top: 20px; border: 1px solid #333333;">
-                                <h3 style="margin: 0 0 12px; color: #a78bfa; font-size: 16px; font-weight: 600;">What you get:</h3>
-                                <ul style="margin: 0; padding: 0 0 0 20px; color: #999999; font-size: 14px; line-height: 1.8;">
+                            <div style="background-color: #f8fafc; border-radius: 8px; padding: 20px; margin-top: 20px; border: 1px solid #f1f5f9;">
+                                <h3 style="margin: 0 0 12px; color: #0f172a; font-size: 16px; font-weight: 600;">What you get:</h3>
+                                <ul style="margin: 0; padding: 0 0 0 20px; color: #64748b; font-size: 14px; line-height: 1.8;">
                                     <li>Churn prediction & prevention tools</li>
                                     <li>User behavior analytics</li>
                                     <li>Automated playbooks</li>
@@ -570,17 +570,17 @@ func (es *EmailService) SendWaitlistAccessGrantedEmail(toEmail, toName string) e
                             </div>
 
                             <!-- Alternative Link -->
-                            <p style="margin: 20px 0 0; padding: 15px; background-color: #1a1a1a; border-radius: 6px; color: #888888; font-size: 12px; line-height: 1.6; border: 1px solid #333333;">
+                            <p style="margin: 20px 0 0; padding: 15px; background-color: #f8fafc; border-radius: 8px; color: #64748b; font-size: 13px; line-height: 1.6; border: 1px solid #f1f5f9; text-align: center;">
                                 <strong>Or copy and paste this link:</strong><br>
-                                <a href="%s" style="color: #a78bfa; word-break: break-all; text-decoration: none;">%s</a>
+                                <a href="%s" style="color: #3B5BDB; word-break: break-all; text-decoration: none;">%s</a>
                             </p>
                         </td>
                     </tr>
 
                     <!-- Footer -->
                     <tr>
-                        <td style="padding: 30px; text-align: center; background-color: #0a0a0a; border-radius: 0 0 12px 12px; border-top: 1px solid #222222;">
-                            <p style="margin: 0; color: #555555; font-size: 12px;">
+                        <td style="padding: 30px; text-align: center; background-color: #f8fafc; border-radius: 0 0 16px 16px; border-top: 1px solid #f1f5f9;">
+                            <p style="margin: 0; color: #94a3b8; font-size: 13px;">
                                 © %d Mentiq. All rights reserved.<br>
                                 Questions? Just reply to this email.
                             </p>
