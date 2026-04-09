@@ -193,12 +193,14 @@ func (eas *EnhancedAnalyticsService) ChurnRiskHandler(c *gin.Context) {
 		return
 	}
 
+	churnStats := churnData["churn_stats"].(map[string]interface{})
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data": gin.H{
 			"at_risk_users": churnData["at_risk_users"],
-			"total_at_risk": churnData["churn_stats"].(map[string]interface{})["at_risk_users"],
-			"churn_rate":    churnData["churn_stats"].(map[string]interface{})["churn_rate_30d"],
+			"total_at_risk": churnStats["at_risk_users"],
+			"total_users":   churnStats["total_users"],
+			"churn_rate":    churnStats["churn_rate_30d"],
 		},
 	})
 }

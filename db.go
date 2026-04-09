@@ -90,6 +90,8 @@ func MigrateDB(db *gorm.DB) error {
 		// Usage limits & tracking
 		&AccountLimits{},
 		&AccountUsage{},
+		&UsageHistory{},
+		&UsageAuditLog{},
 	)
 
 	if err != nil {

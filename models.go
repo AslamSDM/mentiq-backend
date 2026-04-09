@@ -1092,6 +1092,7 @@ type AccountLimits struct {
 	SessionReplaysOverride  *int `json:"session_replays_override"`
 	AutomatedEmailsOverride *int `json:"automated_emails_override"`
 	AIGenerationsOverride   *int `json:"ai_generations_override"`
+	TeamMembersOverride     *int `json:"team_members_override"`
 
 	// Relations
 	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
@@ -1118,6 +1119,7 @@ type AccountUsage struct {
 	SessionReplaysCount  int `json:"session_replays_count"`
 	AutomatedEmailsCount int `json:"automated_emails_count"`
 	AIGenerationsCount   int `json:"ai_generations_count"`
+	TeamMembersCount     int `json:"team_members_count"` // peak count during billing period
 
 	// Relations
 	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
@@ -1125,4 +1127,52 @@ type AccountUsage struct {
 
 func (AccountUsage) TableName() string {
 	return "account_usage"
+}
+
+// UsageHistory stores a snapshot of usage at the end of each billing period.
+type UsageHistory struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	AccountID string    `gorm:"not null;uniqueIndex:idx_usage_history_account_period" json:"account_id"`
+	CreatedAt time.Time `json:"created_at"`
+
+	// Billing period this snapshot covers
+	BillingPeriodStart time.Time `gorm:"not null;uniqueIndex:idx_usage_history_account_period" json:"billing_period_start"`
+	BillingPeriodEnd   time.Time `json:"billing_period_end"`
+	Tier               string    `json:"tier"`
+
+	// Final usage counts
+	PaidUsersCount       int `json:"paid_users_count"`
+	SessionReplaysCount  int `json:"session_replays_count"`
+	AutomatedEmailsCount int `json:"automated_emails_count"`
+	AIGenerationsCount   int `json:"ai_generations_count"`
+	TeamMembersCount     int `json:"team_members_count"`
+
+	// Calculated overages and costs (cents)
+	TotalOverageCost int64 `json:"total_overage_cost"`
+	ProjectedBill    int64 `json:"projected_bill"`
+
+	// Relations
+	Account Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`
+}
+
+func (UsageHistory) TableName() string {
+	return "usage_history"
+}
+
+// UsageAuditLog records individual usage change events for debugging and support.
+type UsageAuditLog struct {
+	ID        string    `gorm:"primaryKey" json:"id"`
+	AccountID string    `gorm:"index;not null" json:"account_id"`
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
+
+	Resource  string `json:"resource"`   // e.g. "paid_users", "session_replays"
+	Action    string `json:"action"`     // "increment", "set", "reset"
+	Amount    int    `json:"amount"`     // delta or absolute value
+	NewTotal  int    `json:"new_total"`  // counter value after this change
+	Source    string `json:"source"`     // what triggered the change, e.g. "api", "webhook", "cron"
+	Detail    string `json:"detail"`     // optional extra context
+}
+
+func (UsageAuditLog) TableName() string {
+	return "usage_audit_log"
 }

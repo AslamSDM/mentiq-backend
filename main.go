@@ -668,9 +668,9 @@ func main() {
 	}
 
 	// Run migrations
-	if err := MigrateDB(database); err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
-	}
+	// if err := MigrateDB(database); err != nil {
+	// 	log.Fatalf("Failed to run migrations: %v", err)
+	// }
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -755,6 +755,10 @@ func main() {
 	{
 		// User endpoints
 		apiV1.GET("/me", server.getMeHandler)
+
+		// Usage & billing (user-facing)
+		apiV1.GET("/usage", server.usageService.GetUsageSummaryHandler)
+		apiV1.GET("/usage/history", server.usageService.GetUsageHistoryHandler)
 
 		// Event ingestion routes use a higher rate limit
 		eventRL := AccountRateLimitMiddleware(server.eventLimiter)

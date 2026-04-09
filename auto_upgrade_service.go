@@ -32,33 +32,28 @@ type PricingTier struct {
 	OverageReplaysPer500       int64 // cents per 500 extra replays
 	OverageEmailsPer10k        int64 // cents per 10k extra emails
 	OverageAIGenerationsPer100 int64 // cents per 100 extra AI generations
+	OverageTeamMembersPer1     int64 // cents per 1 extra team member
 }
 
-// Tier progression order — new 3-tier structure
+// Tier progression order — new 2-tier structure
 var TierOrder = []PricingTier{
 	{
 		ID: "starter", Name: "Starter", MaxUsers: 500, BasePrice: 59,
-		IncludedPaidUsers: 500, IncludedSessionReplays: 250,
-		IncludedAutomatedEmails: 10000, IncludedAIGenerations: 50,
-		IncludedTeamMembers: 3,
-		OveragePaidUsersPer100: 1200, OverageReplaysPer500: 700,
-		OverageEmailsPer10k: 300, OverageAIGenerationsPer100: 500,
+		IncludedPaidUsers: 150, IncludedSessionReplays: 100,
+		IncludedAutomatedEmails: 5000, IncludedAIGenerations: 25,
+		IncludedTeamMembers: 1,
+		OveragePaidUsersPer100: 1500, OverageReplaysPer500: 1000,
+		OverageEmailsPer10k: 400, OverageAIGenerationsPer100: 800,
+		OverageTeamMembersPer1: 800,
 	},
 	{
-		ID: "growth", Name: "Growth", MaxUsers: 2000, BasePrice: 149,
-		IncludedPaidUsers: 2000, IncludedSessionReplays: 700,
-		IncludedAutomatedEmails: 50000, IncludedAIGenerations: 200,
-		IncludedTeamMembers: 10,
-		OveragePaidUsersPer100: 1000, OverageReplaysPer500: 600,
-		OverageEmailsPer10k: 300, OverageAIGenerationsPer100: 400,
-	},
-	{
-		ID: "scale", Name: "Scale", MaxUsers: 7500, BasePrice: 399,
-		IncludedPaidUsers: 7500, IncludedSessionReplays: 2000,
-		IncludedAutomatedEmails: 200000, IncludedAIGenerations: 600,
-		IncludedTeamMembers: 0, // unlimited
-		OveragePaidUsersPer100: 800, OverageReplaysPer500: 500,
-		OverageEmailsPer10k: 200, OverageAIGenerationsPer100: 300,
+		ID: "growth", Name: "Growth", MaxUsers: 5000, BasePrice: 149,
+		IncludedPaidUsers: 2000, IncludedSessionReplays: 750,
+		IncludedAutomatedEmails: 50000, IncludedAIGenerations: 250,
+		IncludedTeamMembers: 5,
+		OveragePaidUsersPer100: 1200, OverageReplaysPer500: 800,
+		OverageEmailsPer10k: 300, OverageAIGenerationsPer100: 600,
+		OverageTeamMembersPer1: 600,
 	},
 }
 
