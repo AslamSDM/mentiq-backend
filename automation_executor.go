@@ -199,7 +199,7 @@ func (e *AutomationExecutor) processChurnPrevention(automation *AutomationSettin
 			FromName:    getStringOr(automation.Config, "from_name", "Customer Success Team"),
 			ReplyTo:     getStringOr(automation.Config, "reply_to", "support@yourcompany.com"),
 			Subject:     content.Subject,
-			HTMLContent: content.HTMLContent,
+			HTMLContent: EnforceEmailCharLimit(e.db, automation.ProjectID, content.HTMLContent),
 			PlainText:   content.PlainText,
 		}
 
@@ -321,7 +321,7 @@ func (e *AutomationExecutor) processFeatureAdoption(automation *AutomationSettin
 			FromName:    getStringOr(automation.Config, "from_name", "Product Team"),
 			ReplyTo:     getStringOr(automation.Config, "reply_to", "support@yourcompany.com"),
 			Subject:     content.Subject,
-			HTMLContent: content.HTMLContent,
+			HTMLContent: EnforceEmailCharLimit(e.db, automation.ProjectID, content.HTMLContent),
 			PlainText:   content.PlainText,
 		}
 
@@ -447,7 +447,7 @@ func (e *AutomationExecutor) processEngagement(automation *AutomationSettings) {
 			FromName:    getStringOr(automation.Config, "from_name", "Customer Success Team"),
 			ReplyTo:     getStringOr(automation.Config, "reply_to", "support@yourcompany.com"),
 			Subject:     content.Subject,
-			HTMLContent: content.HTMLContent,
+			HTMLContent: EnforceEmailCharLimit(e.db, automation.ProjectID, content.HTMLContent),
 			PlainText:   content.PlainText,
 		}
 

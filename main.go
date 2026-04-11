@@ -117,6 +117,7 @@ type Server struct {
 	autoUpgradeService       *AutoUpgradeService
 	usageService             *UsageService
 	integrationsService      *IntegrationsService
+	lifetimeService          *LifetimeService
 	automationService        *AutomationService
 	automationExecutor       *AutomationExecutor
 
@@ -182,6 +183,7 @@ func NewServer(db *gorm.DB, analyticsService *AnalyticsService) *Server {
 		triggerEvaluator:         triggerEvaluator,
 		autoUpgradeService:       NewAutoUpgradeService(db),
 		usageService:             NewUsageService(db),
+		lifetimeService:          NewLifetimeService(db, emailService),
 		integrationsService:      NewIntegrationsService(db),
 		automationService:        automationService,
 		automationExecutor:       automationExecutor,
@@ -760,6 +762,12 @@ func main() {
 		apiV1.GET("/usage", server.usageService.GetUsageSummaryHandler)
 		apiV1.GET("/usage/history", server.usageService.GetUsageHistoryHandler)
 
+		// Subscription & billing
+		apiV1.GET("/subscription", server.lifetimeService.GetSubscriptionHandler)
+		apiV1.POST("/subscription/cancel", server.lifetimeService.RequestCancelHandler)
+		apiV1.POST("/subscription/unpause", server.lifetimeService.UnpauseUsageHandler)
+		apiV1.POST("/lifetime/redeem", server.lifetimeService.RedeemKeyHandler)
+
 		// Event ingestion routes use a higher rate limit
 		eventRL := AccountRateLimitMiddleware(server.eventLimiter)
 		apiV1.POST("/events", eventRL, server.analyticsService.ingestEventHandler)
@@ -798,6 +806,10 @@ func main() {
 		apiV1.PUT("/projects/:project_id/apikeys/:key_id", server.updateApiKeyHandler)
 		apiV1.DELETE("/projects/:project_id/apikeys/:key_id", server.deleteApiKeyHandler)
 		apiV1.PUT("/projects/:project_id/stripe-key", server.stripeService.UpdateStripeAPIKeyHandler)
+
+		// Project settings (email char limit, etc.)
+		apiV1.GET("/projects/:project_id/settings", GetProjectSettingsHandler(server.db))
+		apiV1.PUT("/projects/:project_id/settings", UpdateProjectSettingsHandler(server.db))
 
 		// Project Member management
 		apiV1.POST("/projects/:project_id/members", server.addProjectMemberHandler)
@@ -1046,6 +1058,10 @@ func main() {
 		adminAPI.GET("/waitlist", server.getWaitlistHandler)
 		adminAPI.POST("/waitlist/:id/grant-access", server.grantWaitlistAccessHandler)
 		adminAPI.DELETE("/waitlist/:id", server.deleteWaitlistHandler)
+
+		// Admin Lifetime Key routes
+		adminAPI.POST("/lifetime-keys", server.lifetimeService.AdminGenerateKeysHandler)
+		adminAPI.GET("/lifetime-keys", server.lifetimeService.AdminListKeysHandler)
 
 		// Admin Usage Limits routes
 		adminAPI.GET("/accounts/:account_id/limits", server.usageService.AdminGetAccountLimitsHandler)

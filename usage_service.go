@@ -185,8 +185,20 @@ func (s *UsageService) archiveExpiredUsage(accountID string, newPeriodStart time
 	}
 }
 
-// IncrementUsage increments a usage counter for the current billing period
+// ErrUsagePaused is returned when a lifetime account has exceeded limits without a payment method
+var ErrUsagePaused = errors.New("usage paused: limit reached and no payment method on file")
+
+// IncrementUsage increments a usage counter for the current billing period.
+// For lifetime accounts that exceed limits without a payment method, returns ErrUsagePaused.
 func (s *UsageService) IncrementUsage(accountID string, resource ResourceType, amount int) error {
+	// Check if this is a paused lifetime account
+	var sub AccountSubscription
+	if err := s.db.Where("account_id = ?", accountID).First(&sub).Error; err == nil {
+		if sub.UsagePaused {
+			return ErrUsagePaused
+		}
+	}
+
 	usage, err := s.GetOrCreateUsage(accountID)
 	if err != nil {
 		return err

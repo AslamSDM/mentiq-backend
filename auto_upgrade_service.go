@@ -35,7 +35,7 @@ type PricingTier struct {
 	OverageTeamMembersPer1     int64 // cents per 1 extra team member
 }
 
-// Tier progression order — new 2-tier structure
+// Tier progression order — recurring tiers
 var TierOrder = []PricingTier{
 	{
 		ID: "starter", Name: "Starter", MaxUsers: 500, BasePrice: 59,
@@ -57,6 +57,24 @@ var TierOrder = []PricingTier{
 	},
 }
 
+// LifetimeTier is the one-time purchase lifetime plan. It is NOT in TierOrder
+// because it is not part of the recurring upgrade path. Activated via license keys only.
+var LifetimeTier = PricingTier{
+	ID: "lifetime", Name: "Lifetime", MaxUsers: 10000, BasePrice: 0,
+	IncludedPaidUsers: 1000, IncludedSessionReplays: 500,
+	IncludedAutomatedEmails: 25000, IncludedAIGenerations: 150,
+	IncludedTeamMembers: 5,
+	// Overage rates apply only when a payment method is on file
+	OveragePaidUsersPer100: 1000, OverageReplaysPer500: 600,
+	OverageEmailsPer10k: 250, OverageAIGenerationsPer100: 500,
+	OverageTeamMembersPer1: 500,
+}
+
+// IsLifetimeTier returns true if the tier is the lifetime plan
+func IsLifetimeTier(tierID string) bool {
+	return tierID == "lifetime"
+}
+
 // AutoUpgradeService handles automatic subscription upgrades
 type AutoUpgradeService struct {
 	db *gorm.DB
@@ -67,8 +85,11 @@ func NewAutoUpgradeService(db *gorm.DB) *AutoUpgradeService {
 	return &AutoUpgradeService{db: db}
 }
 
-// GetTierByID returns a tier by its ID
+// GetTierByID returns a tier by its ID (includes lifetime tier)
 func GetTierByID(tierID string) *PricingTier {
+	if tierID == LifetimeTier.ID {
+		return &LifetimeTier
+	}
 	for _, tier := range TierOrder {
 		if tier.ID == tierID {
 			return &tier
@@ -111,9 +132,12 @@ func (s *AutoUpgradeService) CheckAndUpgradeAccount(accountID string, actualUser
 		return &UpgradeResult{Upgraded: false, Reason: "subscription not active"}, nil
 	}
 
-	// Skip if developer tier (free)
+	// Skip if developer tier (free) or lifetime
 	if subscription.Tier == "developer" {
 		return &UpgradeResult{Upgraded: false, Reason: "developer tier"}, nil
+	}
+	if IsLifetimeTier(subscription.Tier) {
+		return &UpgradeResult{Upgraded: false, Reason: "lifetime tier"}, nil
 	}
 
 	// Get current tier limits

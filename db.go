@@ -92,6 +92,10 @@ func MigrateDB(db *gorm.DB) error {
 		&AccountUsage{},
 		&UsageHistory{},
 		&UsageAuditLog{},
+		// Lifetime keys
+		&LifetimeKey{},
+		// Project settings
+		&ProjectSettings{},
 	)
 
 	if err != nil {

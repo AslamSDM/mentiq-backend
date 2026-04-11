@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/resend/resend-go/v3"
+	"gorm.io/gorm"
 )
 
 // AutomationEmailSender is the interface for sending automation emails
@@ -245,6 +246,24 @@ func (s *MailchimpEmailSender) SendEmail(req AutomationEmailRequest) (*Automatio
 		MessageID: campaignID,
 		Status:    "sent",
 	}, nil
+}
+
+// =====================
+// EMAIL CHARACTER LIMIT
+// =====================
+
+// EnforceEmailCharLimit truncates HTML content to the configured max character limit for a project.
+// Returns the (possibly truncated) content. If limit is 0, no truncation is applied.
+func EnforceEmailCharLimit(db *gorm.DB, projectID string, htmlContent string) string {
+	settings, err := GetOrCreateProjectSettings(db, projectID)
+	if err != nil || settings.MaxEmailCharacters <= 0 {
+		return htmlContent
+	}
+
+	if len(htmlContent) > settings.MaxEmailCharacters {
+		return htmlContent[:settings.MaxEmailCharacters]
+	}
+	return htmlContent
 }
 
 // =====================
