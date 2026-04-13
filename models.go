@@ -50,6 +50,11 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
+	// Password reset (for team members whose password lives in the User table)
+	ResetPasswordToken   string     `json:"-"`
+	ResetPasswordSentAt  *time.Time `json:"-"`
+	ResetPasswordExpires *time.Time `json:"-"`
+
 	// Foreign keys
 	AccountID string  `json:"account_id" gorm:"index"`
 	Account   Account `gorm:"foreignKey:AccountID;references:ID" json:"account,omitempty"`

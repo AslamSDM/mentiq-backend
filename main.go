@@ -2378,7 +2378,16 @@ func (s *Server) googleAuthHandler(c *gin.Context) {
 	})
 }
 
-// forgotPasswordHandler handles password reset requests
+// forgotPasswordHandler handles password reset requests.
+//
+// A given email may resolve to either:
+//   - a team member in the User table (password stored there), or
+//   - an account owner in the Account table (password stored there).
+//
+// Owners can also have a matching User row (created at invite time). In that
+// case the password still lives in Account — mirror the precedence rules used
+// by loginHandler so that we always write the reset token to the row that
+// actually holds the password.
 func (s *Server) forgotPasswordHandler(c *gin.Context) {
 	var req struct {
 		Email string `json:"email" binding:"required,email"`
@@ -2391,26 +2400,55 @@ func (s *Server) forgotPasswordHandler(c *gin.Context) {
 	// Normalize email
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
-	// Find account (don't reveal if email exists for security)
-	var account Account
-	if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
-		// Don't reveal if email exists
-		c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a password reset link has been sent."})
-		return
-	}
+	// Generic response — used for every "not found / can't reset" branch so we
+	// don't leak which emails exist.
+	genericResponse := gin.H{"message": "If an account exists with this email, a password reset link has been sent."}
 
-	// Check if this is a Google-only account (no password)
-	if account.Password == "" && account.GoogleID != "" {
-		c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a password reset link has been sent."})
-		return
-	}
-
-	// Generate reset token
 	resetToken := uuid.New().String()
 	now := time.Now()
-	expiresAt := now.Add(1 * time.Hour) // 1 hour expiry
+	expiresAt := now.Add(1 * time.Hour)
 
-	// Update account with reset token
+	sendEmail := func(toEmail, toName string) {
+		go func() {
+			if err := s.emailService.SendPasswordResetEmail(toEmail, toName, resetToken); err != nil {
+				log.Printf("Failed to send password reset email to %s: %v", toEmail, err)
+			}
+		}()
+	}
+
+	// Try to find an active team member first.
+	var user User
+	userFound := s.db.Where("email = ? AND is_active = ?", req.Email, true).First(&user).Error == nil
+
+	if userFound && user.Role != "owner" && user.Password != "" {
+		// Team member with a password in the User table — reset there.
+		if err := s.db.Model(&user).Updates(map[string]interface{}{
+			"reset_password_token":   resetToken,
+			"reset_password_sent_at": now,
+			"reset_password_expires": expiresAt,
+		}).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate reset token"})
+			return
+		}
+		sendEmail(user.Email, user.FullName)
+		c.JSON(http.StatusOK, genericResponse)
+		return
+	}
+
+	// Otherwise look up the Account row. This covers: account owners, owners
+	// that also have a User shell row, and emails that don't exist at all.
+	var account Account
+	if err := s.db.Where("email = ?", req.Email).First(&account).Error; err != nil {
+		c.JSON(http.StatusOK, genericResponse)
+		return
+	}
+
+	// Google-only accounts have no password to reset.
+	if account.Password == "" && account.GoogleID != "" {
+		c.JSON(http.StatusOK, genericResponse)
+		return
+	}
+
 	if err := s.db.Model(&account).Updates(map[string]interface{}{
 		"reset_password_token":   resetToken,
 		"reset_password_sent_at": now,
@@ -2420,17 +2458,13 @@ func (s *Server) forgotPasswordHandler(c *gin.Context) {
 		return
 	}
 
-	// Send password reset email (non-blocking)
-	go func() {
-		if err := s.emailService.SendPasswordResetEmail(account.Email, account.Name, resetToken); err != nil {
-			log.Printf("Failed to send password reset email to %s: %v", account.Email, err)
-		}
-	}()
-
-	c.JSON(http.StatusOK, gin.H{"message": "If an account exists with this email, a password reset link has been sent."})
+	sendEmail(account.Email, account.Name)
+	c.JSON(http.StatusOK, genericResponse)
 }
 
-// resetPasswordHandler handles password reset with token
+// resetPasswordHandler handles password reset with token. The token may have
+// been issued against a User row (team member) or an Account row (owner), so
+// we look in both places.
 func (s *Server) resetPasswordHandler(c *gin.Context) {
 	var req struct {
 		Token       string `json:"token" binding:"required"`
@@ -2441,33 +2475,57 @@ func (s *Server) resetPasswordHandler(c *gin.Context) {
 		return
 	}
 
-	// Find account with this reset token
+	// Try team member (User) first.
+	var user User
+	if err := s.db.Where("reset_password_token = ?", req.Token).First(&user).Error; err == nil {
+		if user.ResetPasswordExpires != nil && time.Now().After(*user.ResetPasswordExpires) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Reset token has expired. Please request a new one."})
+			return
+		}
+		if msg := validatePassword(req.NewPassword, user.Email); msg != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+			return
+		}
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			return
+		}
+		if err := s.db.Model(&user).Updates(map[string]interface{}{
+			"password":               string(hashedPassword),
+			"reset_password_token":   "",
+			"reset_password_expires": nil,
+		}).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update password"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully. You can now sign in with your new password."})
+		return
+	}
+
+	// Fall back to account owner (Account).
 	var account Account
 	if err := s.db.Where("reset_password_token = ?", req.Token).First(&account).Error; err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired reset token"})
 		return
 	}
 
-	// Check if token is expired
 	if account.ResetPasswordExpires != nil && time.Now().After(*account.ResetPasswordExpires) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Reset token has expired. Please request a new one."})
 		return
 	}
 
-	// Validate new password
 	if msg := validatePassword(req.NewPassword, account.Email); msg != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
 
-	// Hash new password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 		return
 	}
 
-	// Update password and clear reset token
 	if err := s.db.Model(&account).Updates(map[string]interface{}{
 		"password":               string(hashedPassword),
 		"reset_password_token":   "",

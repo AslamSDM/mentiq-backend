@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/resend/resend-go/v3"
@@ -34,8 +35,10 @@ func NewEmailService() *EmailService {
 		apiKey:    apiKey,
 		fromEmail: os.Getenv("EMAIL_FROM_ADDRESS"),
 		fromName:  os.Getenv("EMAIL_FROM_NAME"),
-		baseURL:   os.Getenv("FRONTEND_URL"),
-		client:    client,
+		// Strip any trailing slashes so URL building with fmt.Sprintf("%s/path", baseURL)
+		// never produces "https://example.com//path" (which Next.js treats as schemeless and 404s).
+		baseURL: strings.TrimRight(os.Getenv("FRONTEND_URL"), "/"),
+		client:  client,
 	}
 }
 
