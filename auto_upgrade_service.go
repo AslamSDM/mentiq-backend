@@ -38,7 +38,7 @@ type PricingTier struct {
 // Tier progression order — recurring tiers
 var TierOrder = []PricingTier{
 	{
-		ID: "starter", Name: "Starter", MaxUsers: 500, BasePrice: 59,
+		ID: "starter", Name: "Starter", MaxUsers: 500, BasePrice: 21,
 		IncludedPaidUsers: 150, IncludedSessionReplays: 100,
 		IncludedAutomatedEmails: 5000, IncludedAIGenerations: 25,
 		IncludedTeamMembers: 1,
@@ -47,7 +47,7 @@ var TierOrder = []PricingTier{
 		OverageTeamMembersPer1: 800,
 	},
 	{
-		ID: "growth", Name: "Growth", MaxUsers: 5000, BasePrice: 149,
+		ID: "growth", Name: "Growth", MaxUsers: 5000, BasePrice: 199,
 		IncludedPaidUsers: 2000, IncludedSessionReplays: 750,
 		IncludedAutomatedEmails: 50000, IncludedAIGenerations: 250,
 		IncludedTeamMembers: 5,
