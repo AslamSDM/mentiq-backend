@@ -935,6 +935,9 @@ func main() {
 		apiV1.POST("/payments", server.createPaymentHandler)
 		apiV1.GET("/payments/:account_id", server.listPaymentsHandler)
 
+		// Stripe checkout session (for pricing page + signup flow)
+		apiV1.POST("/stripe/checkout", server.createCheckoutSessionHandler)
+
 		// Auto-upgrade routes
 		apiV1.POST("/subscriptions/check-upgrades", server.autoUpgradeService.CheckUpgradesHandler)
 		apiV1.POST("/subscriptions/:account_id/check-upgrade", server.autoUpgradeService.CheckSingleAccountUpgradeHandler)
