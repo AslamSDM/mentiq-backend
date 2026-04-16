@@ -300,7 +300,7 @@ type AccountSubscription struct {
 	AccountID string `gorm:"uniqueIndex;not null" json:"account_id"` // One subscription per account
 
 	// Subscription details
-	Tier         string `json:"tier" gorm:"index"`                    // starter, growth, scale
+	Tier         string `json:"tier" gorm:"index"`                    // starter, growth, enterprise, lifetime
 	Status       string `json:"status" gorm:"index;default:'active'"` // active, trialing, past_due, canceled, paused
 	UserCount    int    `json:"user_count"`                           // Selected user count
 	MonthlyPrice int64  `json:"monthly_price"`                        // Price in cents

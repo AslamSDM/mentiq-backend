@@ -60,14 +60,14 @@ var TierOrder = []PricingTier{
 // LifetimeTier is the one-time purchase lifetime plan. It is NOT in TierOrder
 // because it is not part of the recurring upgrade path. Activated via license keys only.
 var LifetimeTier = PricingTier{
-	ID: "lifetime", Name: "Lifetime", MaxUsers: 10000, BasePrice: 0,
-	IncludedPaidUsers: 1000, IncludedSessionReplays: 500,
-	IncludedAutomatedEmails: 25000, IncludedAIGenerations: 150,
-	IncludedTeamMembers: 5,
-	// Overage rates apply only when a payment method is on file
-	OveragePaidUsersPer100: 1000, OverageReplaysPer500: 600,
-	OverageEmailsPer10k: 250, OverageAIGenerationsPer100: 500,
-	OverageTeamMembersPer1: 500,
+	ID: "lifetime", Name: "Lifetime", MaxUsers: 150, BasePrice: 0,
+	IncludedPaidUsers: 150, IncludedSessionReplays: 100,
+	IncludedAutomatedEmails: 5000, IncludedAIGenerations: 25,
+	IncludedTeamMembers: 1,
+	// Overage rates apply only when a payment method is on file (matches Starter)
+	OveragePaidUsersPer100: 1500, OverageReplaysPer500: 1000,
+	OverageEmailsPer10k: 400, OverageAIGenerationsPer100: 800,
+	OverageTeamMembersPer1: 800,
 }
 
 // IsLifetimeTier returns true if the tier is the lifetime plan
