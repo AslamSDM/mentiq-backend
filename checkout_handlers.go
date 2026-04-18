@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 
@@ -152,7 +153,8 @@ func (s *Server) createCheckoutSessionHandler(c *gin.Context) {
 
 	sess, err := session.New(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("Stripe checkout error for account %s: %v", accountID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create checkout session"})
 		return
 	}
 

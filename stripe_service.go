@@ -126,6 +126,7 @@ type StripeMetrics struct {
 	TrialingSubscriptions    int       `json:"trialing_subscriptions"`
 	TotalCustomers           int       `json:"total_customers"`
 	ActiveCustomers          int       `json:"active_customers"`
+	FailedPayments           int       `json:"failed_payments"`
 	ChurnRate                float64   `json:"churn_rate"`
 	ARPU                     float64   `json:"arpu"`
 	TrialToPayConversionRate float64   `json:"trial_to_pay_conversion_rate"`
@@ -333,6 +334,7 @@ func (s *StripeService) GetRevenueMetricsHandler(c *gin.Context) {
 		"active_subscriptions":         metrics.ActiveSubscriptions,
 		"canceled_subscriptions":       metrics.CanceledSubscriptions,
 		"past_due_subscriptions":       metrics.PastDueSubscriptions,
+		"failed_payments":              metrics.FailedPayments,
 		"trialing_subscriptions":       metrics.TrialingSubscriptions,
 		"total_customers":              metrics.TotalCustomers,
 		"active_customers":             metrics.ActiveCustomers,
@@ -473,11 +475,15 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 	chargeParams.CreatedRange = &stripe.RangeQueryParams{GreaterThanOrEqual: thirtyDaysAgo}
 
 	var totalRevenue int64 = 0
+	failedPayments := 0
 	chargeIter := sc.Charges.List(chargeParams)
 	for chargeIter.Next() {
 		charge := chargeIter.Charge()
 		if charge.Paid && !charge.Refunded {
 			totalRevenue += charge.Amount - charge.AmountRefunded
+		}
+		if charge.Status == "failed" {
+			failedPayments++
 		}
 	}
 
@@ -493,6 +499,7 @@ func (s *StripeService) fetchLiveMetrics(sc *client.API) (*StripeMetrics, error)
 	metrics.ActiveSubscriptions = activeCount
 	metrics.CanceledSubscriptions = canceledCount
 	metrics.PastDueSubscriptions = pastDueCount
+	metrics.FailedPayments = failedPayments
 	metrics.TrialingSubscriptions = trialingCount
 	metrics.TotalCustomers = totalCustomers
 	metrics.ActiveCustomers = len(activeCustomers)

@@ -482,6 +482,7 @@ type DodoMetrics struct {
 	ActiveCustomers       int       `json:"active_customers"`
 	ChurnRate             float64   `json:"churn_rate"`
 	ARPU                  float64   `json:"arpu"`
+	ChurnedMRR            float64   `json:"churned_mrr"`
 	RefundedAmount        float64   `json:"refunded_amount"`
 	DisputeCount          int       `json:"dispute_count"`
 	LastUpdated           time.Time `json:"last_updated"`
@@ -548,6 +549,19 @@ func (s *DodoService) calculateMetrics(payments []DodoPayment, subscriptions []D
 		}
 	}
 	metrics.RefundedAmount = float64(refundedCents) / 100
+
+	// Churned MRR: sum of recurring amounts from subs canceled in last 30 days
+	var churnedCents int64
+	for _, sub := range subscriptions {
+		if sub.Status == "cancelled" {
+			updatedAt := parseTime(sub.UpdatedAt)
+			if updatedAt.After(thirtyDaysAgo) {
+				churnedCents += sub.RecurringAmount
+			}
+		}
+	}
+
+	metrics.ChurnedMRR = float64(churnedCents) / 100
 
 	// Churn rate
 	totalSubs := metrics.ActiveSubscriptions + metrics.CanceledSubscriptions
@@ -688,7 +702,7 @@ func (s *DodoService) GetRevenueMetricsHandler(c *gin.Context) {
 		"net_revenue":           metrics.TotalRevenue - metrics.RefundedAmount,
 		"expansion_mrr":         0.0,
 		"downgrade_mrr":         0.0,
-		"churned_mrr":           0.0,
+		"churned_mrr":           metrics.ChurnedMRR,
 		"net_revenue_churn":     0.0,
 		// Stripe-compatible fields for frontend reuse
 		"past_due_subscriptions":       metrics.OnHoldSubscriptions,
@@ -738,6 +752,14 @@ func (s *DodoService) buildTimeSeries(payments []DodoPayment, subscriptions []Do
 			ev.canceledDay = parseTime(sub.UpdatedAt).Format("2006-01-02")
 		}
 		subs = append(subs, ev)
+	}
+
+	// Daily churned MRR from canceled subscriptions
+	dailyChurnedMRR := make(map[string]int64)
+	for _, sub := range subs {
+		if sub.isCanceled && sub.canceledDay != "" {
+			dailyChurnedMRR[sub.canceledDay] += sub.monthlyAmt
+		}
 	}
 
 	// Customer count by creation date
@@ -802,7 +824,7 @@ func (s *DodoService) buildTimeSeries(payments []DodoPayment, subscriptions []Do
 			"total_customers":      cumulativeCustomers,
 			"expansion_mrr":        0.0,
 			"downgrade_mrr":        0.0,
-			"churned_mrr":          0.0,
+			"churned_mrr":          float64(dailyChurnedMRR[day]) / 100,
 			"net_revenue_churn":    0.0,
 		})
 	}

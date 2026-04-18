@@ -670,9 +670,9 @@ func main() {
 	}
 
 	// Run migrations
-	// if err := MigrateDB(database); err != nil {
-	// 	log.Fatalf("Failed to run migrations: %v", err)
-	// }
+	if err := MigrateDB(database); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -1024,6 +1024,9 @@ func main() {
 		apiV1.POST("/projects/:project_id/automations/:automation_id/test", server.testAutomationHandler)
 		apiV1.POST("/projects/:project_id/automations/:automation_id/preview", server.previewEmailHandler)
 		apiV1.GET("/automations/default-prompt/:type", server.getDefaultPromptHandler)
+
+		// Brand Profile
+		apiV1.POST("/brand-profile/crawl", server.crawlBrandProfileHandler)
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)

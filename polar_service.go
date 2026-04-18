@@ -242,6 +242,7 @@ type PolarMetrics struct {
 	DowngradeMRR             float64 `json:"downgrade_mrr"`
 	ChurnedMRR               float64 `json:"churned_mrr"`
 	NetRevenueChurn          float64 `json:"net_revenue_churn"`
+	PastDueSubscriptions     int     `json:"past_due_subscriptions"`
 	ChurnRate                float64 `json:"churn_rate"`
 	GrowthRate               float64 `json:"growth_rate"`
 	ARPU                     float64 `json:"arpu"`
@@ -464,7 +465,7 @@ func (s *PolarService) computeMetrics(orders []PolarOrder, subscriptions []Polar
 	}
 
 	// Count subscription states
-	var activeSubs, canceledSubs, trialSubs, newSubsThisMonth int
+	var activeSubs, canceledSubs, trialSubs, pastDueSubs, newSubsThisMonth int
 	var totalMRR float64
 
 	thirtyDaysAgo := now.AddDate(0, 0, -30)
@@ -484,6 +485,8 @@ func (s *PolarService) computeMetrics(orders []PolarOrder, subscriptions []Polar
 			canceledSubs++
 		case "trialing":
 			trialSubs++
+		case "past_due", "unpaid":
+			pastDueSubs++
 		}
 
 		createdAt, err := time.Parse(time.RFC3339, sub.CreatedAt)
@@ -496,6 +499,7 @@ func (s *PolarService) computeMetrics(orders []PolarOrder, subscriptions []Polar
 	metrics.ARR = totalMRR * 12
 	metrics.ActiveSubscriptions = activeSubs
 	metrics.CanceledSubscriptions = canceledSubs
+	metrics.PastDueSubscriptions = pastDueSubs
 	metrics.NewSubscriptions = newSubsThisMonth
 
 	// Calculate total revenue from orders
@@ -541,6 +545,23 @@ func (s *PolarService) computeMetrics(orders []PolarOrder, subscriptions []Polar
 		}
 	}
 	metrics.ChurnedSubscriptions = churnedThisMonth
+
+	// Churned MRR: sum of monthly amounts from subs canceled in last 30 days
+	var churnedMRR float64
+	for _, sub := range subscriptions {
+		if sub.CanceledAt != nil {
+			canceledAt, err := time.Parse(time.RFC3339, *sub.CanceledAt)
+			if err == nil && canceledAt.After(thirtyDaysAgo) {
+				amount := float64(sub.Amount) / 100.0
+				if sub.RecurringInterval == "year" {
+					churnedMRR += amount / 12.0
+				} else {
+					churnedMRR += amount
+				}
+			}
+		}
+	}
+	metrics.ChurnedMRR = churnedMRR
 
 	totalAtStart := activeSubs + churnedThisMonth
 	if totalAtStart > 0 {
@@ -601,20 +622,51 @@ type PolarTimeSeriesPoint struct {
 func (s *PolarService) buildTimeSeries(orders []PolarOrder, subscriptions []PolarSubscription, customers []PolarCustomer, startDate, endDate time.Time) []PolarTimeSeriesPoint {
 	var points []PolarTimeSeriesPoint
 
+	// Pre-compute daily revenue from orders
+	dailyRevenue := make(map[string]float64)
+	for _, order := range orders {
+		if order.Status != "paid" {
+			continue
+		}
+		orderDate, err := time.Parse(time.RFC3339, order.CreatedAt)
+		if err != nil {
+			continue
+		}
+		dailyRevenue[orderDate.Format("2006-01-02")] += float64(order.Amount) / 100.0
+	}
+
+	// Pre-compute daily churned MRR and cancel counts
+	type churnEntry struct {
+		mrr   float64
+		count int
+	}
+	dailyChurn := make(map[string]*churnEntry)
+	for _, sub := range subscriptions {
+		if sub.CanceledAt == nil {
+			continue
+		}
+		canceledAt, err := time.Parse(time.RFC3339, *sub.CanceledAt)
+		if err != nil {
+			continue
+		}
+		day := canceledAt.Format("2006-01-02")
+		if dailyChurn[day] == nil {
+			dailyChurn[day] = &churnEntry{}
+		}
+		dailyChurn[day].count++
+		amount := float64(sub.Amount) / 100.0
+		if sub.RecurringInterval == "year" {
+			dailyChurn[day].mrr += amount / 12.0
+		} else {
+			dailyChurn[day].mrr += amount
+		}
+	}
+
 	for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
 		dateStr := d.Format("2006-01-02")
 		point := PolarTimeSeriesPoint{Date: dateStr}
 
-		// Revenue for this day
-		for _, order := range orders {
-			orderDate, err := time.Parse(time.RFC3339, order.CreatedAt)
-			if err != nil {
-				continue
-			}
-			if orderDate.Format("2006-01-02") == dateStr && order.Status == "paid" {
-				point.Revenue += float64(order.Amount) / 100.0
-			}
-		}
+		point.Revenue = dailyRevenue[dateStr]
 
 		// Active subscriptions and MRR as of this day
 		var activeSubs int
@@ -650,9 +702,22 @@ func (s *PolarService) buildTimeSeries(orders []PolarOrder, subscriptions []Pola
 			}
 		}
 
+		churn := dailyChurn[dateStr]
+		canceledOnDay := 0
+		churnedMRRDay := 0.0
+		if churn != nil {
+			canceledOnDay = churn.count
+			churnedMRRDay = churn.mrr
+		}
+
 		point.ActiveSubscriptions = activeSubs
 		point.MRR = math.Round(mrr*100) / 100
 		point.ARR = math.Round(mrr*12*100) / 100
+		point.ChurnedMRR = math.Round(churnedMRRDay*100) / 100
+
+		if activeSubs+canceledOnDay > 0 {
+			point.ChurnRate = math.Round(float64(canceledOnDay)/float64(activeSubs+canceledOnDay)*10000) / 100
+		}
 
 		// ARPU
 		if activeSubs > 0 {
@@ -834,6 +899,7 @@ func (s *PolarService) GetRevenueMetricsHandler(c *gin.Context) {
 		"total_revenue":               metrics.TotalRevenue,
 		"active_subscriptions":        metrics.ActiveSubscriptions,
 		"canceled_subscriptions":      metrics.CanceledSubscriptions,
+		"past_due_subscriptions":      metrics.PastDueSubscriptions,
 		"new_subscriptions":           metrics.NewSubscriptions,
 		"churned_subscriptions":       metrics.ChurnedSubscriptions,
 		"expansion_revenue":           metrics.ExpansionRevenue,
