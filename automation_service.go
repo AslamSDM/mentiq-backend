@@ -96,6 +96,9 @@ func (s *AutomationService) buildCustomPrompt(req GenerateEmailContentRequest) s
 	prompt.WriteString(req.CustomPrompt)
 
 	// Always append output format requirements
+	// Add brand settings if available
+	s.appendBrandContext(&prompt, req)
+
 	prompt.WriteString("\n\n=== OUTPUT FORMAT (REQUIRED) ===\n")
 	prompt.WriteString("1. Subject line (max 60 characters, compelling and personalized)\n")
 	prompt.WriteString("2. HTML email content with proper formatting\n")
@@ -174,6 +177,9 @@ func (s *AutomationService) buildEmailPrompt(req GenerateEmailContentRequest) st
 			prompt.WriteString(fmt.Sprintf("Discount Percentage: %d%%\n", discountPercent))
 		}
 	}
+
+	// Add brand settings if available
+	s.appendBrandContext(&prompt, req)
 
 	// Output requirements
 	prompt.WriteString(fmt.Sprintf("\nOutput Format:\n"))
@@ -317,6 +323,11 @@ func (s *AutomationService) GeneratePersonalizedCampaign(projectID string, autom
 		"product_name":      getString(userInfo, "product_name"),
 		"features":          getStringSlice(userInfo, "features"),
 		"subscription_type": getString(userInfo, "subscription_type"),
+	}
+
+	// Include brand settings from automation config if available
+	if brandSettings, ok := automation.Config["brand_settings"]; ok {
+		productContext["brand_settings"] = brandSettings
 	}
 
 	// Prepare personalization data
@@ -478,6 +489,38 @@ func (s *AutomationService) createDefaultTemplate(templateType string) EmailTemp
 			PersonalizationVars: []string{"user_name", "product_name"},
 			IsActive:            true,
 		}
+	}
+}
+
+// appendBrandContext adds brand profile info to the prompt if available in ProductContext
+func (s *AutomationService) appendBrandContext(prompt *strings.Builder, req GenerateEmailContentRequest) {
+	brand, ok := req.ProductContext["brand_settings"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	prompt.WriteString("\n=== BRAND GUIDELINES ===\n")
+
+	if profile, ok := brand["brand_profile"].(map[string]interface{}); ok {
+		if name, ok := profile["company_name"].(string); ok && name != "" {
+			prompt.WriteString(fmt.Sprintf("Company: %s\n", name))
+		}
+		if desc, ok := profile["description"].(string); ok && desc != "" {
+			prompt.WriteString(fmt.Sprintf("Brand Description: %s\n", desc))
+		}
+		if industry, ok := profile["industry"].(string); ok && industry != "" {
+			prompt.WriteString(fmt.Sprintf("Industry: %s\n", industry))
+		}
+	}
+
+	if tone, ok := brand["tone"].(string); ok && tone != "" {
+		prompt.WriteString(fmt.Sprintf("Tone: %s\n", tone))
+	}
+	if style, ok := brand["style"].(string); ok && style != "" {
+		prompt.WriteString(fmt.Sprintf("Style: %s\n", style))
+	}
+	if avoid, ok := brand["words_to_avoid"].(string); ok && avoid != "" {
+		prompt.WriteString(fmt.Sprintf("Words/phrases to NEVER use: %s\n", avoid))
 	}
 }
 

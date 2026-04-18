@@ -677,9 +677,13 @@ func (s *Server) previewEmailHandler(c *gin.Context) {
 			"churn_risk_score": 75.0,
 			"last_active_days": 14,
 		},
-		ProductContext: map[string]interface{}{
-			"product_name": "Your Product",
-		},
+		ProductContext: func() map[string]interface{} {
+			ctx := map[string]interface{}{"product_name": "Your Product"}
+			if brandSettings, ok := automation.Config["brand_settings"]; ok {
+				ctx["brand_settings"] = brandSettings
+			}
+			return ctx
+		}(),
 		Personalization: map[string]interface{}{
 			"discount_code":    "PREVIEW20",
 			"discount_percent": 20,
