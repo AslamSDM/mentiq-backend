@@ -96,6 +96,8 @@ func MigrateDB(db *gorm.DB) error {
 		&LifetimeKey{},
 		// Project settings
 		&ProjectSettings{},
+		// Contact sales requests
+		&ContactRequest{},
 	)
 
 	if err != nil {

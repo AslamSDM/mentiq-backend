@@ -733,6 +733,9 @@ func main() {
 	router.POST("/api/v1/waitlist", server.joinWaitlistHandler)
 	router.GET("/api/v1/unsubscribe", server.unsubscribeHandler)
 
+	// Contact Sales (public, no auth required)
+	router.POST("/api/v1/contact-sales", server.createContactRequestHandler)
+
 	// Webhook routes (no authentication - secured by signature validation)
 	webhookRoutes := router.Group("/webhook")
 	{
@@ -1027,6 +1030,7 @@ func main() {
 
 		// Brand Profile
 		apiV1.POST("/brand-profile/crawl", server.crawlBrandProfileHandler)
+
 	}
 
 	// Test/Debug routes - No authentication (disable in production!)
@@ -1072,6 +1076,10 @@ func main() {
 		// Admin Usage Limits routes
 		adminAPI.GET("/accounts/:account_id/limits", server.usageService.AdminGetAccountLimitsHandler)
 		adminAPI.PUT("/accounts/:account_id/limits", server.usageService.AdminUpdateAccountLimitsHandler)
+
+		// Admin Contact Sales routes
+		adminAPI.GET("/contact-requests", server.adminListContactRequestsHandler)
+		adminAPI.PUT("/contact-requests/:id", server.adminUpdateContactRequestHandler)
 		adminAPI.DELETE("/accounts/:account_id/limits/:resource", server.usageService.AdminResetAccountLimitHandler)
 		adminAPI.GET("/accounts/:account_id/usage", server.usageService.AdminGetAccountUsageHandler)
 		adminAPI.GET("/tiers", AdminGetAllTiersHandler)
